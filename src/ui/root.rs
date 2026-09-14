@@ -104,6 +104,7 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         Theme::sync(self.state.read(cx).settings.appearance, window.appearance());
+        Theme::sync_font_size(self.state.read(cx).settings.font_size);
         let state = self.state.clone();
         let state_new = self.state.clone();
         let state_settings = self.state.clone();
@@ -142,7 +143,7 @@ impl Render for RootView {
                     }))
                     .child(
                         div()
-                            .text_size(px(15.0))
+                            .text_size(Theme::text_px(15.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::accent())
                             .child("Van-Goal"),
@@ -205,14 +206,14 @@ impl Render for RootView {
                     .child(div().size(px(7.0)).rounded_full().bg(pill_color))
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::text_secondary())
                             .child(connection_label),
                     )
                     .child(div().flex_1())
                     .children(last_error.map(|error| {
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::warn())
                             .max_w(px(720.0))
                             .text_ellipsis()
@@ -232,7 +233,7 @@ fn toolbar_button(
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(11.0))
+        .text_size(Theme::text_px(11.0))
         .text_color(Theme::text_secondary())
         .cursor_pointer()
         .hover(|style| style.bg(Theme::surface_hover()).text_color(Theme::text()))

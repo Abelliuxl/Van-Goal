@@ -1,4 +1,5 @@
 use crate::markdown::{InlineStyle, MarkdownBlock};
+use crate::ui::theme::Theme;
 use gpui::{
     combine_highlights, div, prelude::*, px, relative, AnyElement, Div, FontStyle, FontWeight,
     HighlightStyle, InteractiveText, ParentElement, StrikethroughStyle, Styled, StyledText,
@@ -7,6 +8,18 @@ use gpui::{
 
 const MAX_TABLE_COLUMNS: usize = 8;
 const MAX_TABLE_ROWS: usize = 80;
+
+/// Room above a heading, on top of the uniform gap between blocks. Headings are
+/// what a reader navigates by, so they need more air before them than the
+/// paragraphs they introduce.
+const HEADING_SPACE_BEFORE: f32 = 16.0;
+/// Room below a heading. Smaller than the space above it, which is what ties a
+/// heading to the text it belongs to instead of letting it float between two
+/// sections.
+const HEADING_SPACE_AFTER: f32 = 4.0;
+/// Extra breathing room around a paragraph. Paragraphs are the bulk of a reply,
+/// and at the plain block gap two of them read as one wall of text.
+const PARAGRAPH_SPACE: f32 = 4.0;
 
 /// Render parsed markdown blocks as div-based layout. Strings wrap natively;
 /// code blocks scroll horizontally and tables get a simple grid.
@@ -23,29 +36,40 @@ pub fn render_blocks(blocks: &[MarkdownBlock]) -> Div {
                 .w_full()
                 .min_w(px(0.0))
                 .debug_selector(move || format!("markdown-block-{seed}"))
-                .child(render_block(block, seed))
+                .child(render_block(block, seed, index == 0))
         }))
 }
 
-fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
+/// `is_first` suppresses the space a block would leave above itself. A reply
+/// that opens with a heading should not start with a hole at the top of its
+/// bubble; the gap only exists to separate blocks from each other.
+fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement {
     match block {
         MarkdownBlock::Heading(level, text) => {
+            // Sized against the 13px body text: a heading has to read as a
+            // heading at a glance, and the old 18/16/14 steps were close enough
+            // to body size to look like bold paragraphs.
             let (size, weight) = match level {
-                1 => (px(18.0), gpui::FontWeight::BOLD),
-                2 => (px(16.0), gpui::FontWeight::SEMIBOLD),
-                _ => (px(14.0), gpui::FontWeight::SEMIBOLD),
+                1 => (24.0, gpui::FontWeight::BOLD),
+                2 => (20.0, gpui::FontWeight::SEMIBOLD),
+                _ => (17.0, gpui::FontWeight::SEMIBOLD),
             };
             div()
+                .when(!is_first, |this| {
+                    this.mt(Theme::text_px(HEADING_SPACE_BEFORE))
+                })
+                .mb(Theme::text_px(HEADING_SPACE_AFTER))
                 .font_weight(weight)
-                .text_size(size)
-                .text_color(crate::ui::theme::Theme::text())
+                .text_size(Theme::text_px(size))
+                .text_color(Theme::text())
                 .child(render_inline(text, seed))
                 .into_any()
         }
         MarkdownBlock::Paragraph(text) => div()
             .min_w(px(0.0))
-            .text_size(px(13.0))
-            .text_color(crate::ui::theme::Theme::text())
+            .my(Theme::text_px(PARAGRAPH_SPACE))
+            .text_size(Theme::text_px(13.0))
+            .text_color(Theme::text())
             .child(render_inline(text, seed))
             .into_any(),
         MarkdownBlock::Bullet(text) => div()
@@ -55,13 +79,13 @@ fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(Theme::text_px(13.0))
                     .text_color(crate::ui::theme::Theme::text_secondary())
                     .child("•"),
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(Theme::text_px(13.0))
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
@@ -75,14 +99,14 @@ fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(Theme::text_px(13.0))
                     .text_color(crate::ui::theme::Theme::text_secondary())
                     .min_w(px(18.0))
                     .child(format!("{number}.")),
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(Theme::text_px(13.0))
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
@@ -94,7 +118,7 @@ fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
             .border_l_2()
             .border_color(crate::ui::theme::Theme::quote_bar())
             .pl_2()
-            .text_size(px(13.0))
+            .text_size(Theme::text_px(13.0))
             .text_color(crate::ui::theme::Theme::text_secondary())
             .child(render_inline(text, seed))
             .into_any(),
@@ -113,7 +137,7 @@ fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
                 div()
                     .p_2()
                     .font_family("Menlo")
-                    .text_size(px(12.0))
+                    .text_size(Theme::text_px(12.0))
                     .text_color(crate::ui::theme::Theme::text())
                     .child(text.clone()),
             )
@@ -122,6 +146,7 @@ fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
         MarkdownBlock::Separator => div()
             .h(px(1.0))
             .w_full()
+            .my(Theme::text_px(8.0))
             .bg(crate::ui::theme::Theme::border())
             .into_any(),
     }
@@ -261,7 +286,7 @@ fn render_table(headers: &[String], rows: &[Vec<String>], seed: u64) -> AnyEleme
             div()
                 .px_2()
                 .py_1()
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .text_color(crate::ui::theme::Theme::text_secondary())
                 .child(format!("{hidden_rows} more row(s) hidden")),
         );
@@ -335,7 +360,7 @@ fn table_cell(
         .overflow_hidden()
         .px_2()
         .py_1()
-        .text_size(px(12.0))
+        .text_size(Theme::text_px(12.0))
         .whitespace_normal()
         .border_color(crate::ui::theme::Theme::border())
         .text_color(if is_header {

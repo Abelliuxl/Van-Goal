@@ -7,9 +7,9 @@ use crate::ui::editor::{Editor, EditorEvent};
 use crate::ui::markdown_view::render_blocks;
 use crate::ui::theme::Theme;
 use gpui::{
-    div, list, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight,
-    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
+    div, list, point, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight,
+    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
 };
 use std::time::Duration;
 
@@ -28,55 +28,72 @@ const USER_BUBBLE_PADDING_X: f32 = 14.0;
 /// The width left for text inside a full-width bubble. Capping the text keeps
 /// the bubble's intrinsic height equal to its final wrapped height.
 const USER_BUBBLE_TEXT_MAX_WIDTH: f32 = USER_BUBBLE_MAX_WIDTH - USER_BUBBLE_PADDING_X * 2.0;
-/// Upper bound on how many messages the visibility probe walks per frame.
-const MAX_VISIBLE_PROBE: usize = 64;
+/// Far past the end of any transcript. Scrolling there makes the list clamp to
+/// its own maximum, which is also what puts a bottom-aligned list back into
+/// "follow the newest message" mode — see [`ChatView::scroll_to_latest`].
+const SCROLL_TO_END: f32 = 1_000_000.0;
 
-/// What the transcript currently shows, expressed in *messages* rather than
-/// pixels: the list only measures the items it renders, so pixel totals are
-/// unreliable until the user has scrolled through everything.
+/// Where the transcript sits, measured in pixels rather than in messages.
+///
+/// This used to be derived from how many *messages* were on screen against how
+/// many existed, probed out of the list's rendered items. Both halves of that
+/// were unusable. A one-line prompt and a fifty-line code block each count as
+/// one message, so the ratio said nothing about how much of the transcript was
+/// visible; and the list measures items lazily, so the number of items it could
+/// report changed from frame to frame as measurement caught up. That is why the
+/// thumb grew and shrank while scrolling.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct TranscriptWindow {
-    /// Index of the first message inside the viewport.
-    first_visible: usize,
-    /// How many messages fit in the viewport right now.
-    visible_count: usize,
-    total: usize,
-    /// The newest message is on screen, so new content can be followed.
+struct ScrollGeometry {
+    /// Thumb top and height as fractions of the scrollbar track.
+    thumb_top: f32,
+    thumb_height: f32,
+    /// How far the content can scroll, in pixels.
+    travel: f32,
+    /// There is more content than the viewport can show.
+    is_scrollable: bool,
+    /// The newest message is on screen, so new content may be followed.
     pinned_to_latest: bool,
 }
 
-impl TranscriptWindow {
-    /// Thumb geometry as fractions of the scrollbar track: (top, height).
-    fn thumb(&self) -> (f32, f32) {
-        let total = self.total.max(1) as f32;
-        let visible = self.visible_count.max(1) as f32;
-        let height = (visible / total).clamp(MIN_THUMB_FRACTION.min(1.0), 1.0);
-        let travel = 1.0 - height;
-        let scrollable_messages = self.total.saturating_sub(self.visible_count.max(1));
-        let progress = if scrollable_messages == 0 {
-            0.0
-        } else {
-            self.first_visible.min(scrollable_messages) as f32 / scrollable_messages as f32
-        };
-        (progress * travel, height)
-    }
-
-    /// Inverse of [`Self::thumb`]: the message that should end up at the top of
-    /// the viewport when the thumb is dragged to `thumb_top`.
-    fn message_for_thumb_top(&self, thumb_top: f32) -> usize {
-        let (_, height) = self.thumb();
-        let travel = 1.0 - height;
-        if travel <= 0.0 {
-            return 0;
+impl ScrollGeometry {
+    /// Geometry for a `viewport`-tall list showing `travel` pixels of scrollable
+    /// content and scrolled `offset` pixels down. The content is
+    /// `viewport + travel` tall, which is what makes the thumb proportional to
+    /// the transcript rather than to how many messages happen to be measured.
+    fn new(viewport: f32, travel: f32, offset: f32) -> Self {
+        // The finiteness test comes first on purpose: a NaN compares false
+        // against everything, so it would slip past both range checks below and
+        // poison the thumb geometry.
+        if !viewport.is_finite() || !travel.is_finite() || viewport <= 0.0 || travel <= 0.0 {
+            return Self {
+                thumb_top: 0.0,
+                thumb_height: 1.0,
+                travel: 0.0,
+                is_scrollable: false,
+                pinned_to_latest: true,
+            };
         }
-        let progress = (thumb_top / travel).clamp(0.0, 1.0);
-        let scrollable_messages = self.total.saturating_sub(self.visible_count.max(1));
-        (progress * scrollable_messages as f32).round() as usize
+        let thumb_height = (viewport / (viewport + travel)).clamp(MIN_THUMB_FRACTION, 1.0);
+        let offset = offset.clamp(0.0, travel);
+        Self {
+            thumb_top: (offset / travel) * (1.0 - thumb_height),
+            thumb_height,
+            travel,
+            is_scrollable: true,
+            pinned_to_latest: travel - offset <= BOTTOM_SLACK,
+        }
     }
 
-    /// There is more transcript than the viewport can show.
-    fn is_scrollable(&self) -> bool {
-        self.total > self.visible_count.max(1)
+    /// The offset that puts the thumb's top at `thumb_top` (a fraction of the
+    /// track). Inverse of the mapping in [`Self::new`], and what dragging uses.
+    /// The clamp is measured against the *clamped* thumb height that was
+    /// actually drawn, so dragging round-trips instead of drifting.
+    fn offset_for_thumb_top(&self, thumb_top: f32) -> f32 {
+        let room = 1.0 - self.thumb_height;
+        if room <= 0.0 {
+            return 0.0;
+        }
+        (thumb_top / room).clamp(0.0, 1.0) * self.travel
     }
 }
 
@@ -98,10 +115,10 @@ pub struct ChatView {
     scrollbar_target: f32,
     fade_generation: u64,
     list_hovered: bool,
-    /// How far inside the thumb the user grabbed it, in pixels.
+    /// How far inside the thumb the user grabbed it, as a fraction of the
+    /// track. Recorded on mouse-down so the thumb does not jump under the
+    /// pointer for the rest of the drag.
     scrollbar_grab: Option<f32>,
-    /// Bumped on every programmatic scroll so stale next-frame callbacks bail.
-    scroll_epoch: u64,
     /// Message the pointer is over, which is what reveals its copy button. It
     /// stays set briefly after the pointer leaves so the button can be reached.
     hovered_message: Option<String>,
@@ -163,7 +180,13 @@ impl ChatView {
         Self {
             state,
             editor,
-            list_state: ListState::new(0, ListAlignment::Top, px(500.0)),
+            // A chat log reads bottom-up: `ListAlignment::Bottom` keeps the
+            // newest message in view as the reply streams in, and leaves the
+            // view where it is once the user scrolls back to read. `measure_all`
+            // costs one full pass over the session when it is opened, and buys a
+            // scrollbar whose thumb is sized from the real content height rather
+            // than from the handful of items the list happens to have measured.
+            list_state: ListState::new(0, ListAlignment::Bottom, px(500.0)).measure_all(),
             last_list_count: 0,
             last_scroll_signature: 0,
             last_list_identity: None,
@@ -176,7 +199,6 @@ impl ChatView {
             fade_generation: 0,
             list_hovered: false,
             scrollbar_grab: None,
-            scroll_epoch: 0,
             hovered_message: None,
             copy_hide_task: None,
             copied_message: None,
@@ -262,57 +284,18 @@ impl ChatView {
         signature
     }
 
-    /// What the transcript currently shows. Derived from the rendered items,
-    /// which is the only trustworthy source while the list measures lazily.
-    fn transcript_window(&self) -> TranscriptWindow {
-        let total = self.list_state.item_count();
-        let first_visible = self.list_state.logical_scroll_top().item_ix.min(total);
-        let viewport = self.list_state.viewport_bounds();
-        let viewport_bottom = f32::from(viewport.origin.y) + f32::from(viewport.size.height);
-        let mut visible_count = 0usize;
-        for index in first_visible..total {
-            let Some(bounds) = self.list_state.bounds_for_item(index) else {
-                break;
-            };
-            if f32::from(bounds.origin.y) >= viewport_bottom {
-                break;
-            }
-            visible_count += 1;
-            if visible_count >= MAX_VISIBLE_PROBE {
-                break;
-            }
-        }
-        TranscriptWindow {
-            first_visible,
-            visible_count: visible_count.max(1),
-            total,
-            pinned_to_latest: self.pinned_to_latest(total),
-        }
+    /// Where the transcript sits, from the list's own pixel bookkeeping.
+    fn scroll_geometry(&self) -> ScrollGeometry {
+        ScrollGeometry::new(
+            f32::from(self.list_state.viewport_bounds().size.height),
+            f32::from(self.list_state.max_offset_for_scrollbar().height),
+            self.scroll_offset(),
+        )
     }
 
-    /// True when the newest message sits inside the viewport: new content may be
-    /// followed. A transcript the user scrolled away from reports false.
-    fn pinned_to_latest(&self, total: usize) -> bool {
-        if total == 0 {
-            return true;
-        }
-        let Some(bounds) = self.list_state.bounds_for_item(total - 1) else {
-            return false;
-        };
-        let viewport = self.list_state.viewport_bounds();
-        let viewport_bottom = f32::from(viewport.origin.y) + f32::from(viewport.size.height);
-        f32::from(bounds.origin.y) + f32::from(bounds.size.height) <= viewport_bottom + BOTTOM_SLACK
-    }
-
-    fn scroll_to_message(&self, index: usize) {
-        let total = self.list_state.item_count();
-        if total == 0 {
-            return;
-        }
-        self.list_state.scroll_to(ListOffset {
-            item_ix: index.min(total - 1),
-            offset_in_item: px(0.0),
-        });
+    /// How far the transcript has been scrolled, in pixels.
+    fn scroll_offset(&self) -> f32 {
+        -f32::from(self.list_state.scroll_px_offset_for_scrollbar().y)
     }
 
     /// Height of the scrollbar track: the transcript viewport.
@@ -327,37 +310,31 @@ impl ChatView {
         ((f32::from(position.y) - f32::from(track.origin.y)) / height).clamp(0.0, 1.0)
     }
 
-    /// Move the view to the newest message. This is index based on purpose:
-    /// item heights are only known once an item has been rendered, so a
-    /// height-based reveal can stop short of messages that were never measured.
-    /// The list renders forward from the index and fills the viewport upwards,
-    /// which lands on the newest screenful every time.
-    fn scroll_to_latest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.state.read(cx).messages.len();
-        if count == 0 {
-            return;
-        }
-        self.scroll_epoch = self.scroll_epoch.wrapping_add(1);
-        let epoch = self.scroll_epoch;
-        let visible = self.transcript_window().visible_count.max(1);
-        self.scroll_to_message(count.saturating_sub(visible));
-        // Polish on the next frame, once the newest items have been measured:
-        // revealing the last one puts it flush with the bottom of the viewport.
-        let list_state = self.list_state.clone();
-        let chat = cx.entity();
-        window.on_next_frame(move |_window, cx| {
-            chat.update(cx, |chat, cx| {
-                if chat.scroll_epoch != epoch {
-                    return;
-                }
-                let count = chat.state.read(cx).messages.len();
-                if count == 0 {
-                    return;
-                }
-                list_state.scroll_to_reveal_item(count - 1);
-                cx.notify();
-            });
-        });
+    /// Put the thumb's top at `thumb_top`, a fraction of the track. The list
+    /// owns the mapping from pixels to items, so this only has to hand back the
+    /// scroll offset the drag is asking for.
+    fn set_thumb_top(&mut self, thumb_top: f32) {
+        let offset = self.scroll_geometry().offset_for_thumb_top(thumb_top);
+        self.list_state
+            .set_offset_from_scrollbar(point(px(0.0), px(-offset)));
+    }
+
+    /// Put the transcript back on the newest message.
+    ///
+    /// A bottom-aligned list follows new content only while it is showing the
+    /// bottom, and it leaves that mode the moment the user scrolls. Scrolling
+    /// past the end is what re-enters it: the list clamps the offset it is given
+    /// to its own maximum, and recognising that maximum is what clears the
+    /// pinned scroll position. A merely *near*-bottom offset would not, and the
+    /// next streamed paragraph would push itself out of view.
+    ///
+    /// Nothing here has to know how tall the transcript is, which is the point:
+    /// the previous version guessed a target from the number of messages it
+    /// could see and jumped there, so it landed in a different place every time
+    /// the guess changed.
+    fn scroll_to_latest(&mut self) {
+        self.list_state
+            .set_offset_from_scrollbar(point(px(0.0), px(-SCROLL_TO_END)));
     }
 
     fn set_list_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
@@ -372,7 +349,7 @@ impl ChatView {
     /// fades it back out.
     fn refresh_scrollbar_target(&mut self, cx: &mut Context<Self>) {
         let visible = (self.list_hovered || self.scrollbar_grab.is_some())
-            && self.transcript_window().is_scrollable();
+            && self.scroll_geometry().is_scrollable;
         let target = if visible { 1.0 } else { 0.0 };
         if (self.scrollbar_target - target).abs() < f32::EPSILON {
             return;
@@ -418,23 +395,27 @@ impl ChatView {
         .detach();
     }
 
-    /// Mouse down on the track: grabs the thumb, or jumps the view to the
-    /// message under the cursor first.
+    /// Mouse down on the track: grabs the thumb, or centres the thumb under the
+    /// cursor and starts dragging from there.
     fn begin_scrollbar_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let window = self.transcript_window();
-        if !window.is_scrollable() {
+        // Snapshot the content height first: until the drag ends, the list
+        // reports the height it had when the drag started, so measurements
+        // arriving mid-drag cannot move the thumb out from under the pointer.
+        self.list_state.scrollbar_drag_started();
+        let geometry = self.scroll_geometry();
+        if !geometry.is_scrollable {
+            self.list_state.scrollbar_drag_ended();
             return;
         }
         let pointer = self.pointer_fraction(event.position);
-        let (thumb_top, thumb_height) = window.thumb();
-        if pointer < thumb_top || pointer > thumb_top + thumb_height {
-            self.scroll_to_message(window.message_for_thumb_top(pointer - thumb_height / 2.0));
-            let (thumb_top, _) = self.transcript_window().thumb();
-            self.scrollbar_grab = Some((pointer - thumb_top).clamp(0.0, thumb_height));
-        } else {
-            self.scrollbar_grab = Some((pointer - thumb_top).clamp(0.0, thumb_height));
+        let on_thumb =
+            pointer >= geometry.thumb_top && pointer <= geometry.thumb_top + geometry.thumb_height;
+        if !on_thumb {
+            self.set_thumb_top(pointer - geometry.thumb_height / 2.0);
         }
-        self.list_state.scrollbar_drag_started();
+        let geometry = self.scroll_geometry();
+        self.scrollbar_grab =
+            Some((pointer - geometry.thumb_top).clamp(0.0, geometry.thumb_height));
         self.refresh_scrollbar_target(cx);
         cx.notify();
     }
@@ -446,12 +427,8 @@ impl ChatView {
         if event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let window = self.transcript_window();
-        if !window.is_scrollable() {
-            return;
-        }
         let pointer = self.pointer_fraction(event.position);
-        self.scroll_to_message(window.message_for_thumb_top(pointer - grab));
+        self.set_thumb_top(pointer - grab);
         cx.notify();
     }
 
@@ -490,15 +467,17 @@ impl Render for ChatView {
         };
 
         // Keep the variable-height list measurements in sync with the message
-        // vec, and follow the streaming bubble while a turn is running.
+        // vec. Following the streaming bubble is not done here: a bottom-aligned
+        // list keeps the newest message in view by itself, and only stops doing
+        // so once the user scrolls away.
         let mut scroll_to_latest = false;
         if identity != self.last_list_identity {
-            // Different session: rebuild the list and land on its newest message.
+            // Different session: rebuild the list. Bottom alignment already
+            // opens on its newest message, so this needs no follow-up scroll.
             self.last_list_identity = identity;
             self.last_list_count = message_count;
             self.list_state.reset(message_count);
             self.last_scroll_signature = signature;
-            scroll_to_latest = message_count > 0;
         } else if message_count != self.last_list_count {
             let old_count = self.last_list_count;
             self.last_list_count = message_count;
@@ -519,13 +498,15 @@ impl Render for ChatView {
                 self.list_state.splice(0..old_count, message_count);
             }
         } else if signature != self.last_scroll_signature && is_streaming && message_count > 0 {
+            // The bubble is still growing, so the height the list recorded for
+            // it is stale. Re-splicing the last item is what re-measures it;
+            // doing it on every delta is why the view has to be re-pinned too,
+            // and with bottom alignment there is nothing to re-pin.
             self.list_state.splice(message_count - 1..message_count, 1);
-            // Follow the stream only while the newest message is on screen.
-            scroll_to_latest = self.pinned_to_latest(message_count);
         }
         self.last_scroll_signature = signature;
         if scroll_to_latest {
-            self.scroll_to_latest(window, cx);
+            self.scroll_to_latest();
         }
 
         div()
@@ -563,14 +544,14 @@ impl ChatView {
                         .gap_2()
                         .child(
                             div()
-                                .text_size(px(20.0))
+                                .text_size(Theme::text_px(20.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(Theme::text())
                                 .child("Ready"),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(Theme::text_px(13.0))
                                 .text_color(Theme::text_secondary())
                                 .child(format!(
                                     "Van-Goal is ready to use {backend_name}. Send a message or resume a session from the sidebar."
@@ -614,7 +595,7 @@ impl ChatView {
         .flex_1()
         .min_h_0();
 
-        let transcript = self.transcript_window();
+        let transcript = self.scroll_geometry();
         let chat_track = chat.clone();
         let chat_move = chat.clone();
         let chat_up = chat.clone();
@@ -638,9 +619,9 @@ impl ChatView {
 
         // Overlay scrollbar: hidden until the pointer is over the transcript,
         // then faded in; it fades back out once the pointer leaves.
-        if transcript.is_scrollable() {
+        if transcript.is_scrollable {
             let track_height = self.scrollbar_track_height();
-            let (thumb_top, thumb_height) = transcript.thumb();
+            let (thumb_top, thumb_height) = (transcript.thumb_top, transcript.thumb_height);
             let thumb_color = if dragging {
                 Theme::scrollbar_thumb_active()
             } else {
@@ -681,7 +662,7 @@ impl ChatView {
         }
 
         // "Jump to the newest message" pill, shown while the view is scrolled up.
-        if transcript.is_scrollable() && !transcript.pinned_to_latest {
+        if transcript.is_scrollable && !transcript.pinned_to_latest {
             container = container.child(
                 div()
                     .id("chat-jump-to-latest")
@@ -700,12 +681,15 @@ impl ChatView {
                     .justify_center()
                     .cursor_pointer()
                     .hover(|style| style.bg(Theme::surface_hover()))
-                    .on_click(move |_event, window, cx| {
-                        chat_jump.update(cx, |chat, cx| chat.scroll_to_latest(window, cx));
+                    .on_click(move |_event, _window, cx| {
+                        chat_jump.update(cx, |chat, cx| {
+                            chat.scroll_to_latest();
+                            cx.notify();
+                        });
                     })
                     .child(
                         div()
-                            .text_size(px(14.0))
+                            .text_size(Theme::text_px(14.0))
                             .text_color(Theme::text_secondary())
                             .child("↓"),
                     ),
@@ -744,7 +728,7 @@ impl ChatView {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text_secondary())
                             .child(format!("{backend_name} needs your confirmation")),
@@ -753,7 +737,7 @@ impl ChatView {
                     .child(
                         div()
                             .id("clarify-dismiss")
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::text_secondary())
                             .cursor_pointer()
                             .hover(|style| style.text_color(Theme::text()))
@@ -765,7 +749,7 @@ impl ChatView {
             )
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(Theme::text_px(13.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(Theme::text())
                     .child(clarify.question.clone()),
@@ -799,13 +783,13 @@ impl ChatView {
                     })
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::text_secondary())
                             .child(format!("{}", index + 1)),
                     )
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(Theme::text_px(13.0))
                             .text_color(Theme::text())
                             .child(choice.clone()),
                     ),
@@ -819,7 +803,7 @@ impl ChatView {
         };
         card = card.child(
             div()
-                .text_size(px(10.0))
+                .text_size(Theme::text_px(10.0))
                 .text_color(Theme::text_tertiary())
                 .child(hint),
         );
@@ -895,7 +879,7 @@ impl ChatView {
                         .border_color(Theme::border())
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::text())
                                 .max_w(px(140.0))
                                 .text_ellipsis()
@@ -903,7 +887,7 @@ impl ChatView {
                         )
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(Theme::text_px(10.0))
                                 .text_color(Theme::text_tertiary())
                                 .child(attachment.kind_label()),
                         )
@@ -913,7 +897,7 @@ impl ChatView {
                                     "attachment-remove".into(),
                                     crate::ui::hash_id(&id),
                                 ))
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::text_secondary())
                                 .cursor_pointer()
                                 .hover(|style| style.text_color(Theme::danger()))
@@ -939,7 +923,7 @@ impl ChatView {
                 .border_color(Theme::border())
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(Theme::text_px(10.0))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(Theme::text_secondary())
                         .child(format!("Queued ({})", queued.len())),
@@ -980,7 +964,7 @@ impl ChatView {
                         .bg(Theme::input_bg())
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::text_secondary())
                                 .flex_1()
                                 .child(preview),
@@ -988,7 +972,7 @@ impl ChatView {
                         .child(
                             div()
                                 .id(gpui::ElementId::NamedInteger("queue-send".into(), id_hash))
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::accent())
                                 .cursor_pointer()
                                 .on_click(move |_event, _window, cx| {
@@ -1001,7 +985,7 @@ impl ChatView {
                         .child(
                             div()
                                 .id(gpui::ElementId::NamedInteger("queue-edit".into(), id_hash))
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::text_secondary())
                                 .cursor_pointer()
                                 .on_click(move |_event, _window, cx| {
@@ -1016,7 +1000,7 @@ impl ChatView {
                                     "queue-cancel".into(),
                                     id_hash,
                                 ))
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(Theme::text_secondary())
                                 .cursor_pointer()
                                 .hover(|style| style.text_color(Theme::danger()))
@@ -1063,7 +1047,7 @@ impl ChatView {
                         .child(
                             div()
                                 .id("add-attachment")
-                                .text_size(px(14.0))
+                                .text_size(Theme::text_px(14.0))
                                 .text_color(Theme::text_secondary())
                                 .cursor_pointer()
                                 .hover(|style| style.text_color(Theme::text()))
@@ -1209,7 +1193,7 @@ fn render_menu_button(
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(11.0))
+        .text_size(Theme::text_px(11.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .cursor_pointer()
@@ -1247,7 +1231,7 @@ fn render_permission_menu(
                 .items_center()
                 .px_3()
                 .py_1()
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .text_color(Theme::text())
                 .cursor_pointer()
                 .hover(|style| style.bg(Theme::surface_hover()))
@@ -1292,7 +1276,7 @@ fn render_model_menu(
             div()
                 .px_3()
                 .py_1()
-                .text_size(px(10.0))
+                .text_size(Theme::text_px(10.0))
                 .text_color(Theme::text_tertiary())
                 .child("Models"),
         );
@@ -1302,7 +1286,7 @@ fn render_model_menu(
             div()
                 .px_3()
                 .pt_1()
-                .text_size(px(10.0))
+                .text_size(Theme::text_px(10.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(Theme::text_secondary())
                 .child(provider.clone()),
@@ -1326,7 +1310,7 @@ fn render_model_menu(
                     .items_center()
                     .px_3()
                     .py_1()
-                    .text_size(px(11.0))
+                    .text_size(Theme::text_px(11.0))
                     .text_color(Theme::text())
                     .cursor_pointer()
                     .hover(|style| style.bg(Theme::surface_hover()))
@@ -1396,7 +1380,7 @@ fn copy_icon() -> AnyElement {
 
 fn copied_icon() -> AnyElement {
     div()
-        .text_size(px(12.0))
+        .text_size(Theme::text_px(12.0))
         .text_color(Theme::ok())
         .child("✓")
         .into_any()
@@ -1477,7 +1461,7 @@ fn render_message_bubble(
                     .gap_1()
                     .children(message.attachments.iter().map(|attachment| {
                         div()
-                            .text_size(px(10.0))
+                            .text_size(Theme::text_px(10.0))
                             .text_color(Theme::text_secondary())
                             .child(format!("@{}", attachment.name()))
                     }))
@@ -1496,7 +1480,7 @@ fn render_message_bubble(
                             // message. Capping the text as well means the
                             // intrinsic pass already sees the final line count.
                             .max_w(px(USER_BUBBLE_TEXT_MAX_WIDTH))
-                            .text_size(px(13.0))
+                            .text_size(Theme::text_px(13.0))
                             .text_color(Theme::text())
                             .child(render_blocks(&markdown::parse(&message.content))),
                     ),
@@ -1540,7 +1524,7 @@ fn render_message_bubble(
                         let slug = author.to_lowercase().replace(' ', "-");
                         div()
                             .debug_selector(move || format!("message-author-{slug}"))
-                            .text_size(px(10.0))
+                            .text_size(Theme::text_px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text_secondary())
                             .child(author.to_string())
@@ -1548,7 +1532,7 @@ fn render_message_bubble(
                     .when(message.is_streaming, |this| {
                         this.child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(Theme::text_px(10.0))
                                 .text_color(Theme::accent())
                                 .child("streaming…"),
                         )
@@ -1590,7 +1574,7 @@ fn render_message_bubble(
         _ => div()
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(Theme::text_px(11.0))
                     .text_color(Theme::text_secondary())
                     .child(message.content.clone()),
             )
@@ -1643,7 +1627,7 @@ fn render_activity(
             .py_1()
             .rounded_md()
             .bg(Theme::tool_bg())
-            .text_size(px(11.0))
+            .text_size(Theme::text_px(11.0))
             .text_color(Theme::text_secondary())
             .child(thinking_label),
     );
@@ -1657,7 +1641,7 @@ fn render_activity(
                 .py_1()
                 .rounded_md()
                 .bg(Theme::tool_bg())
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .text_color(Theme::text_secondary())
                 .cursor_pointer()
                 .hover(|style| style.bg(Theme::surface_hover()))
@@ -1700,7 +1684,7 @@ fn render_activity(
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text())
                             .child(format!(
@@ -1713,7 +1697,7 @@ fn render_activity(
                     .child(
                         div()
                             .font_family("Menlo")
-                            .text_size(px(10.0))
+                            .text_size(Theme::text_px(10.0))
                             .text_color(Theme::text_secondary())
                             .child(detail),
                     ),
@@ -1723,7 +1707,7 @@ fn render_activity(
             container = container.child(
                 div()
                     .ml_2()
-                    .text_size(px(10.0))
+                    .text_size(Theme::text_px(10.0))
                     .text_color(Theme::text_tertiary())
                     .child(format!(
                         "{} more tool event(s) hidden",
@@ -1765,7 +1749,7 @@ fn render_context_ring(usage: ContextUsage) -> AnyElement {
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(Theme::text_px(10.0))
                 .text_color(Theme::text_tertiary())
                 .child(format!(
                     "{}% · {}/{}",
@@ -1800,7 +1784,7 @@ fn render_send_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(12.0))
+        .text_size(Theme::text_px(12.0))
         .text_color(gpui::white())
         .cursor_pointer()
         .when(!enabled, |this| this.opacity(0.5))
@@ -1822,7 +1806,7 @@ fn render_send_button(
 mod chat_view_render_tests {
     use super::*;
     use crate::models::ChatMessage;
-    use gpui::{AppContext, TestAppContext, VisualTestContext};
+    use gpui::{AppContext, ListOffset, TestAppContext, VisualTestContext};
 
     /// A box to lay the transcript out in: the test platform's window has no
     /// intrinsic size.
@@ -1859,14 +1843,17 @@ mod chat_view_render_tests {
     fn long_transcript_lays_out_scrollbar_and_jump_button(cx: &mut TestAppContext) {
         let state = cx.new(|cx| AppState::new(cx));
         state.update(cx, |state, _cx| {
-            // Deterministic: no cached session means the list starts at the top.
             state.selected_session = None;
             state.messages = transcript_of(40);
         });
         let (host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
         let view = host.read_with(cx, |host, _cx| host.0.clone());
-        cx.run_until_parked();
+        // The list measures its items during the first layout pass, so it only
+        // knows how tall the transcript is — and only draws a thumb — from the
+        // frame after that.
+        let opened = settled_geometry(cx, &view);
+        assert!(opened.is_scrollable, "long transcript is not scrollable");
 
         let area = cx
             .debug_bounds("chat-message-scroll-area")
@@ -1894,15 +1881,17 @@ mod chat_view_render_tests {
         // also what decides whether the stream keeps being followed).
         cx.update(|_window, cx| {
             view.update(cx, |chat, cx| {
-                chat.scroll_to_message(0);
+                chat.list_state.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.0),
+                });
                 cx.notify();
             });
         });
-        cx.run_until_parked();
-        let window = cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.transcript_window()));
-        assert!(window.is_scrollable(), "long transcript is not scrollable");
+        let parked = settled_geometry(cx, &view);
+        assert!(parked.is_scrollable, "long transcript is not scrollable");
         assert!(
-            !window.pinned_to_latest,
+            !parked.pinned_to_latest,
             "top of the transcript claims to be at the newest message"
         );
         // `debug_bounds` keeps whatever was inserted by any frame, so this only
@@ -1912,18 +1901,18 @@ mod chat_view_render_tests {
             "no jump button while reading old messages"
         );
 
-        // Scrolling back to the newest message flips that predicate.
-        let total =
-            cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.list_state.item_count()));
+        // Returning to the newest message flips that predicate.
         cx.update(|_window, cx| {
             view.update(cx, |chat, cx| {
-                chat.scroll_to_message(total.saturating_sub(1));
+                chat.scroll_to_latest();
                 cx.notify();
             });
         });
-        cx.run_until_parked();
-        let settled = settle_until_pinned(cx, &view);
-        assert!(settled, "never reported being at the newest message");
+        let settled = settled_geometry(cx, &view);
+        assert!(
+            settled.pinned_to_latest,
+            "never reported being at the newest message: {settled:?}"
+        );
     }
 
     /// Sending a prompt appends the user message plus the assistant
@@ -1945,13 +1934,18 @@ mod chat_view_render_tests {
         // Park the view at the top, as if the user scrolled up to read.
         cx.update(|_window, cx| {
             view.update(cx, |chat, cx| {
-                chat.scroll_to_message(0);
+                chat.list_state.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.0),
+                });
                 cx.notify();
             });
         });
-        cx.run_until_parked();
-        let parked = cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.transcript_window()));
-        assert_eq!(parked.first_visible, 0, "did not park at the top");
+        let parked = settled_geometry(cx, &view);
+        assert!(
+            !parked.pinned_to_latest,
+            "did not park away from the newest message: {parked:?}"
+        );
 
         // A send appends the prompt and the streaming placeholder.
         state.update(cx, |state, cx| {
@@ -1964,126 +1958,216 @@ mod chat_view_render_tests {
                 .push(ChatMessage::streaming(MessageRole::Assistant));
             cx.notify();
         });
-        cx.run_until_parked();
-        cx.update(|window, _cx| window.refresh());
-        cx.run_until_parked();
 
-        for round in 0..4 {
-            cx.update(|window, _cx| window.refresh());
-            cx.run_until_parked();
-            let probe = cx.update(|_window, cx| {
-                view.update(cx, |chat, _cx| {
-                    (
-                        chat.transcript_window(),
-                        chat.scroll_epoch,
-                        chat.list_state.logical_scroll_top().item_ix,
-                    )
-                })
-            });
-            println!("[round {round}] {probe:?}");
-        }
-        let after_send =
-            cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.transcript_window()));
-        assert_eq!(after_send.total, 42, "the sent messages were not appended");
+        let after_send = settled_geometry(cx, &view);
+        assert_eq!(
+            cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.list_state.item_count())),
+            42,
+            "the sent messages were not appended"
+        );
         assert!(
-            after_send.first_visible > 20,
-            "view stayed at the top after sending: {after_send:?}"
+            after_send.pinned_to_latest,
+            "view stayed where it was after sending: {after_send:?}"
         );
     }
 
-    /// The rendered state lags one frame behind the scroll position, and the
-    /// test platform only draws while the executor has work, so poll a few
-    /// frames before deciding.
-    fn settle_until_pinned(cx: &mut VisualTestContext, view: &Entity<ChatView>) -> bool {
+    /// Let the list lay itself out again, then report what the view says about
+    /// its own scroll position.
+    fn settled_geometry(cx: &mut VisualTestContext, view: &Entity<ChatView>) -> ScrollGeometry {
         for _ in 0..4 {
             cx.update(|window, _cx| window.refresh());
             cx.run_until_parked();
-            let pinned = cx.update(|_window, cx| {
-                view.update(cx, |chat, _cx| {
-                    let total = chat.list_state.item_count();
-                    chat.pinned_to_latest(total)
-                })
-            });
-            if pinned {
-                return true;
-            }
         }
-        false
+        cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.scroll_geometry()))
+    }
+
+    /// The thumb is the share of the transcript the viewport shows, so moving
+    /// through the transcript must not resize it. It used to be sized from how
+    /// many *messages* the list had managed to measure, which is a different
+    /// number on every frame of a scroll — the thumb grew and shrank as it was
+    /// dragged.
+    #[gpui::test]
+    fn the_thumb_does_not_change_length_while_scrolling(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.messages = transcript_of(40);
+        });
+        let (host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        let view = host.read_with(cx, |host, _cx| host.0.clone());
+
+        let opened = settled_geometry(cx, &view);
+        assert!(opened.is_scrollable, "transcript is not scrollable");
+
+        // Walk the thumb down the track, as a drag would.
+        for step in 0..=4 {
+            let fraction = step as f32 / 4.0;
+            cx.update(|_window, cx| {
+                view.update(cx, |chat, cx| {
+                    let geometry = chat.scroll_geometry();
+                    chat.set_thumb_top((1.0 - geometry.thumb_height) * fraction);
+                    cx.notify();
+                });
+            });
+            let moved = settled_geometry(cx, &view);
+            assert!(
+                (moved.thumb_height - opened.thumb_height).abs() < 0.001,
+                "step {step}: thumb changed length from {} to {}",
+                opened.thumb_height,
+                moved.thumb_height
+            );
+        }
+    }
+
+    /// A reply streaming in must not drag the view back down while the reader is
+    /// further up the transcript.
+    #[gpui::test]
+    fn a_streaming_reply_does_not_drag_the_reader_back(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.messages = transcript_of(40);
+        });
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            SizedChat(cx.new(|cx| ChatView::new(state.clone(), cx)))
+        });
+        let view = host.read_with(cx, |host, _cx| host.0.clone());
+
+        // Read from the top of the transcript.
+        cx.update(|_window, cx| {
+            view.update(cx, |chat, cx| {
+                chat.list_state.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
+            });
+        });
+        let parked = settled_geometry(cx, &view);
+        assert!(
+            !parked.pinned_to_latest,
+            "did not park away from the newest message"
+        );
+        let offset = cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.scroll_offset()));
+
+        // A reply arrives and streams in over several frames.
+        state.update(cx, |state, cx| {
+            state
+                .messages
+                .push(ChatMessage::streaming(MessageRole::Assistant));
+            cx.notify();
+        });
+        for chunk in 0..5 {
+            state.update(cx, |state, cx| {
+                if let Some(last) = state.messages.last_mut() {
+                    last.content.push_str(&format!("streamed line {chunk}\n\n"));
+                }
+                cx.notify();
+            });
+            settled_geometry(cx, &view);
+            let now = cx.update(|_window, cx| view.update(cx, |chat, _cx| chat.scroll_offset()));
+            assert!(
+                (now - offset).abs() < 1.0,
+                "chunk {chunk}: the reader was moved from {offset} to {now}"
+            );
+        }
     }
 }
 
 #[cfg(test)]
-mod transcript_window_tests {
+mod scroll_geometry_tests {
     use super::*;
 
-    fn window(first_visible: usize, visible_count: usize, total: usize) -> TranscriptWindow {
-        TranscriptWindow {
-            first_visible,
-            visible_count,
-            total,
-            pinned_to_latest: false,
-        }
+    /// A viewport showing `travel` pixels of scrollable content.
+    fn geometry(viewport: f32, travel: f32, offset: f32) -> ScrollGeometry {
+        ScrollGeometry::new(viewport, travel, offset)
     }
 
     #[test]
     fn nothing_to_scroll_when_the_transcript_fits() {
-        let fits = window(0, 5, 5);
-        assert!(!fits.is_scrollable());
-        let (top, height) = fits.thumb();
-        assert_eq!(top, 0.0);
-        assert_eq!(height, 1.0);
-        assert_eq!(fits.message_for_thumb_top(0.5), 0);
+        let fits = geometry(600.0, 0.0, 0.0);
+        assert!(!fits.is_scrollable);
+        assert_eq!(fits.thumb_top, 0.0);
+        assert_eq!(fits.thumb_height, 1.0);
+        assert!(fits.pinned_to_latest);
+        assert_eq!(fits.offset_for_thumb_top(0.5), 0.0);
+    }
+
+    /// The thumb is the share of the content the viewport shows, so it is sized
+    /// from pixels. Sizing it from a count of *messages* is what made it change
+    /// length while scrolling: one line and fifty lines both count as one
+    /// message, and the list only reports the ones it has measured so far.
+    #[test]
+    fn thumb_is_proportional_to_the_content() {
+        let at_top = geometry(600.0, 3000.0, 0.0);
+        assert_eq!(at_top.thumb_top, 0.0);
+        assert!(
+            (at_top.thumb_height - 600.0 / 3600.0).abs() < 0.001,
+            "height {}",
+            at_top.thumb_height
+        );
+
+        let at_bottom = geometry(600.0, 3000.0, 3000.0);
+        assert!(
+            (at_bottom.thumb_top - (1.0 - at_bottom.thumb_height)).abs() < 0.001,
+            "top {}",
+            at_bottom.thumb_top
+        );
+        assert!(at_bottom.pinned_to_latest);
     }
 
     #[test]
-    fn thumb_sits_at_the_top_and_the_bottom_of_the_track() {
-        let at_top = window(0, 5, 35);
-        let (top, height) = at_top.thumb();
-        assert_eq!(top, 0.0);
-        assert!((height - 5.0 / 35.0).abs() < 0.001, "height {height}");
-
-        let at_bottom = window(30, 5, 35);
-        let (top, _) = at_bottom.thumb();
-        assert!((top - (1.0 - 5.0 / 35.0)).abs() < 0.001, "top {top}");
-    }
-
-    #[test]
-    fn dragging_the_thumb_round_trips_to_the_same_message() {
-        let w = window(0, 6, 60);
-        let (_, height) = w.thumb();
-        let travel = 1.0 - height;
+    fn dragging_the_thumb_round_trips_to_the_same_offset() {
+        let start = geometry(600.0, 3000.0, 0.0);
+        let room = 1.0 - start.thumb_height;
         for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            let index = w.message_for_thumb_top(travel * fraction);
-            let moved = TranscriptWindow {
-                first_visible: index,
-                ..w
-            };
-            let (top, _) = moved.thumb();
+            let offset = start.offset_for_thumb_top(room * fraction);
+            let moved = geometry(600.0, 3000.0, offset);
             assert!(
-                (top - travel * fraction).abs() < 0.02,
-                "fraction {fraction}: thumb landed at {top}"
+                (moved.thumb_top - room * fraction).abs() < 0.001,
+                "fraction {fraction}: thumb landed at {}",
+                moved.thumb_top
             );
         }
     }
 
     #[test]
     fn thumb_keeps_a_minimum_size_on_very_long_transcripts() {
-        let w = window(0, 1, 4000);
-        let (_, height) = w.thumb();
+        let long = geometry(600.0, 600_000.0, 0.0);
         assert!(
-            (height - MIN_THUMB_FRACTION).abs() < f32::EPSILON,
-            "height {height}"
+            (long.thumb_height - MIN_THUMB_FRACTION).abs() < f32::EPSILON,
+            "height {}",
+            long.thumb_height
         );
     }
 
     #[test]
     fn a_single_message_never_divides_by_zero() {
-        let w = window(0, 1, 1);
-        assert!(!w.is_scrollable());
-        let (top, height) = w.thumb();
-        assert_eq!(top, 0.0);
-        assert_eq!(height, 1.0);
-        assert_eq!(w.message_for_thumb_top(0.9), 0);
+        let one = geometry(600.0, 0.0, 0.0);
+        assert!(!one.is_scrollable);
+        assert_eq!(one.thumb_top, 0.0);
+        assert_eq!(one.thumb_height, 1.0);
+        assert_eq!(one.offset_for_thumb_top(0.9), 0.0);
+
+        // Not laid out yet, so there is no viewport to divide by.
+        let unlaid = geometry(0.0, 0.0, 0.0);
+        assert!(!unlaid.is_scrollable);
+        assert_eq!(unlaid.thumb_height, 1.0);
+    }
+
+    /// An offset past either end must not push the thumb off the track. The list
+    /// clamps its own offset, but the geometry is also fed offsets it computes
+    /// before the list has re-laid out.
+    #[test]
+    fn an_out_of_range_offset_stays_on_the_track() {
+        let past_the_end = geometry(600.0, 3000.0, 9_999.0);
+        assert!(past_the_end.pinned_to_latest);
+        assert!(past_the_end.thumb_top <= 1.0 - past_the_end.thumb_height + f32::EPSILON);
+
+        let before_the_start = geometry(600.0, 3000.0, -500.0);
+        assert_eq!(before_the_start.thumb_top, 0.0);
+        assert!(!before_the_start.pinned_to_latest);
     }
 }
 

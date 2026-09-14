@@ -19,6 +19,7 @@ Van-Goal is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit) (S
 - **Model switcher** — pick any provider/model your Hermes config exposes, with a context-window meter.
 - **Permission modes** — Full access / Ask first / Restricted tools, applied through `hermes config set`.
 - **One switch per backend** — each backend has its own on/off switch in Settings. Switching one on connects it and switches the others off; switching it off disconnects it and keeps it off after a restart. The backend you were last using is the one that comes back on launch.
+- **Text size** — Small / Default / Large / Extra Large in Settings scales every font in the app at once: transcript, markdown, sidebar, composer and the settings window itself.
 - **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
 
 ## Build
@@ -89,6 +90,7 @@ Van-Goal is deliberately a thin frontend — all agent capability lives in the b
 | `ui/` | GPUI views: root shell, sidebar, chat, composer, editor, settings |
 | `editor.rs` | Multi-line text editor element built on GPUI text shaping |
 | `markdown.rs` | Block-level markdown parser shared with the renderer |
+| `ui/theme.rs` | Adaptive palette plus the app-wide text scale every font size is multiplied by |
 | `cache.rs` / `secret_store.rs` / `settings.rs` | On-disk cache, local credentials, persisted settings |
 
 ### Threading model
@@ -98,6 +100,7 @@ GPUI owns the main-thread UI executor. A multi-threaded tokio runtime is install
 ## Differences from the SwiftUI Hermit
 
 - System, light, and dark appearance modes are available in Settings.
+- A text-size preference scales the whole interface; the SwiftUI version ships a fixed type scale.
 - Backends are managed with per-backend switches rather than a single connect action.
 - File attachments are added via the native open panel (the `+` button); drag-and-drop is not wired yet.
 - Inline markdown (bold/links) is not styled per-span yet; block-level structure is.

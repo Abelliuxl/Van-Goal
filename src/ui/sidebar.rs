@@ -1,12 +1,15 @@
 use crate::models::{AgentSession, ConnectionState};
 use crate::state::AppState;
+use crate::ui::theme::Theme;
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FontWeight, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 
-/// Session list width. Wide enough for a model name under a truncated title,
-/// narrow enough to leave the transcript the bulk of the window.
+/// Session list width at the default text size. Wide enough for a model name
+/// under a truncated title, narrow enough to leave the transcript the bulk of
+/// the window. The sidebar is sized around its text, so the width follows the
+/// text-size preference too — a bigger font in a fixed pane would just clip.
 const SIDEBAR_WIDTH: f32 = 244.0;
 
 /// Sidebar: status pill, batch actions, and the session list.
@@ -53,7 +56,7 @@ impl Render for SidebarView {
             .flex()
             .flex_col()
             .h_full()
-            .w(gpui::px(SIDEBAR_WIDTH))
+            .w(gpui::px(SIDEBAR_WIDTH * Theme::font_scale()))
             .debug_selector(|| "session-sidebar".into())
             .bg(crate::ui::theme::Theme::sidebar_bg())
             .border_r_1()
@@ -79,7 +82,7 @@ impl Render for SidebarView {
                             .child(div().size(px(7.0)).rounded_full().bg(pill_color))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(Theme::text_px(11.0))
                                     .text_color(crate::ui::theme::Theme::text_secondary())
                                     .child(connection_label),
                             ),
@@ -162,14 +165,14 @@ impl SidebarView {
             .gap_2()
             .child(
                 div()
-                    .text_sm()
+                    .text_size(Theme::text_px(14.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(crate::ui::theme::Theme::text())
                     .child(title),
             )
             .child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(Theme::text_px(11.0))
                     .text_color(crate::ui::theme::Theme::text_secondary())
                     .child(body),
             )
@@ -237,7 +240,7 @@ impl SidebarView {
         if sessions.is_empty() {
             return div()
                 .p_4()
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .text_color(crate::ui::theme::Theme::text_tertiary())
                 .child("No sessions yet. Send a message to start one.")
                 .into_any();
@@ -285,7 +288,7 @@ impl SidebarView {
                     .when(!session.subtitle().is_empty(), |this| {
                         this.child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(Theme::text_px(11.0))
                                 .text_color(crate::ui::theme::Theme::text_tertiary())
                                 .max_w_full()
                                 .text_ellipsis()
@@ -302,7 +305,7 @@ impl SidebarView {
                                 .flex_row()
                                 .items_center()
                                 .gap_2()
-                                .text_size(px(10.0))
+                                .text_size(Theme::text_px(10.0))
                                 .text_color(crate::ui::theme::Theme::text_tertiary())
                                 .children(
                                     session
@@ -392,7 +395,7 @@ where
         .px(px(6.0))
         .py(px(2.0))
         .rounded_sm()
-        .text_size(px(10.0))
+        .text_size(Theme::text_px(10.0))
         .text_color(crate::ui::theme::Theme::text_secondary())
         .bg(crate::ui::theme::Theme::surface())
         .border_1()
@@ -416,7 +419,7 @@ fn render_row_title(session: &AgentSession) -> gpui::AnyElement {
         .gap_1()
         .child(
             div()
-                .text_sm()
+                .text_size(Theme::text_px(14.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(crate::ui::theme::Theme::text())
                 .max_w_full()
@@ -440,7 +443,7 @@ fn header_button(label: &'static str, enabled: bool) -> Stateful<gpui::Div> {
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(11.0))
+        .text_size(Theme::text_px(11.0))
         .cursor_pointer();
     if enabled {
         base.text_color(crate::ui::theme::Theme::text_secondary())
@@ -461,7 +464,7 @@ fn small_button(label: &'static str, color: Hsla) -> Stateful<gpui::Div> {
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(11.0))
+        .text_size(Theme::text_px(11.0))
         .text_color(crate::ui::theme::Theme::label_on(color))
         .bg(color)
         .cursor_pointer()

@@ -183,6 +183,7 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.state.read(cx).settings.clone();
         Theme::sync(settings.appearance, window.appearance());
+        Theme::sync_font_size(settings.font_size);
         let (status_label, status_error, cache_summary, log_path, last_server_message) = {
             let state = self.state.read(cx);
             (
@@ -258,9 +259,19 @@ impl Render for SettingsView {
                 },
             ));
         }
-        root = root.child(section("Appearance").child(appearance_options).child(hint(
-            "System follows the current macOS light or dark appearance.",
-        )));
+
+        root = root.child(
+            section("Appearance")
+                .child(appearance_options)
+                .child(hint(
+                    "System follows the current macOS light or dark appearance.",
+                ))
+                .child(row_label("Font size"))
+                .child(font_size_row(&settings, state.clone()))
+                .child(hint(
+                    "Scales every font in the app: the transcript, the sidebar, the composer and these settings.",
+                )),
+        );
 
         // Connection section
         let mut connection = section("Connection");
@@ -300,7 +311,7 @@ impl Render for SettingsView {
         let active_enabled = settings.is_backend_enabled(active_backend);
         connection = connection.child(
             div()
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .text_color(Theme::text_secondary())
                 .child(active_backend.description()),
         );
@@ -426,7 +437,7 @@ impl Render for SettingsView {
                 section("Cache")
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::text_secondary())
                             .child(cache_summary),
                     )
@@ -446,13 +457,13 @@ impl Render for SettingsView {
                 section("Status")
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::text_secondary())
                             .child(format!("Connection: {status_label}")),
                     )
                     .children(status_error.map(|error| {
                         div()
-                            .text_size(px(11.0))
+                            .text_size(Theme::text_px(11.0))
                             .text_color(Theme::warn())
                             .child(error)
                     })),
@@ -476,7 +487,7 @@ fn section(title: &'static str) -> gpui::Div {
         .border_color(Theme::border())
         .child(
             div()
-                .text_size(px(11.0))
+                .text_size(Theme::text_px(11.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(Theme::text_secondary())
                 .child(title),
@@ -485,9 +496,20 @@ fn section(title: &'static str) -> gpui::Div {
 
 fn hint(text: &str) -> AnyElement {
     div()
-        .text_size(px(10.0))
+        .text_size(Theme::text_px(10.0))
         .text_color(Theme::text_tertiary())
         .child(text.to_string())
+        .into_any()
+}
+
+/// Names a control that sits under a section heading, where `field_row`'s
+/// left-hand label column would be too wide.
+fn row_label(text: &'static str) -> AnyElement {
+    div()
+        .text_size(Theme::text_px(12.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(Theme::text())
+        .child(text)
         .into_any()
 }
 
@@ -499,8 +521,8 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
         .gap_2()
         .child(
             div()
-                .w(px(140.0))
-                .text_size(px(12.0))
+                .w(px(140.0 * Theme::font_scale()))
+                .text_size(Theme::text_px(12.0))
                 .text_color(Theme::text())
                 .child(label),
         )
@@ -513,7 +535,7 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
                 .bg(Theme::surface())
                 .border_1()
                 .border_color(Theme::border())
-                .text_size(px(12.0))
+                .text_size(Theme::text_px(12.0))
                 .child(editor),
         )
         .into_any()
@@ -551,13 +573,13 @@ fn backend_row(
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(Theme::text_px(12.0))
                         .text_color(Theme::text())
                         .child(kind.display_name()),
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(Theme::text_px(10.0))
                         .text_color(if is_enabled {
                             Theme::ok()
                         } else {
@@ -600,7 +622,7 @@ where
         .on_click(on_click)
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(Theme::text_px(10.0))
                 .text_color(if is_on {
                     Theme::ok()
                 } else {
@@ -643,14 +665,14 @@ fn credential_field(
                 .items_center()
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(Theme::text_px(12.0))
                         .text_color(Theme::text())
                         .child(label),
                 )
                 .child(div().flex_1())
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(Theme::text_px(10.0))
                         .text_color(if stored.is_stored() {
                             Theme::ok()
                         } else {
@@ -674,13 +696,13 @@ fn credential_field(
                 .bg(Theme::surface())
                 .border_1()
                 .border_color(Theme::border())
-                .text_size(px(12.0))
+                .text_size(Theme::text_px(12.0))
                 .child(editor),
         )
         .when(stored.device_token_characters > 0, |this| {
             this.child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(Theme::text_px(10.0))
                     .text_color(Theme::text_tertiary())
                     .child(format!(
                         "Van-Goal also holds a paired-device token for this gateway ({} characters), and that is what it connects with — this field can stay empty.",
@@ -710,7 +732,7 @@ where
         })
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(Theme::text_px(12.0))
                 .text_color(Theme::text())
                 .child(label),
         )
@@ -748,7 +770,7 @@ where
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(11.0))
+        .text_size(Theme::text_px(11.0))
         .text_color(Theme::label_on(color))
         .bg(color)
         .cursor_pointer()
@@ -772,7 +794,7 @@ where
         .px_2()
         .py_1()
         .rounded_md()
-        .text_size(px(12.0))
+        .text_size(Theme::text_px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color)
         .bg(Theme::surface())
@@ -783,6 +805,44 @@ where
         .on_click(on_click)
         .child(label)
         .into_any()
+}
+
+/// The text-size choices. Every font in the interface is a design-time size
+/// multiplied by the picked scale, so one click resizes the whole app — the
+/// transcript, the sidebar, the composer and this window at once.
+fn font_size_row(settings: &crate::settings::Settings, state: Entity<AppState>) -> AnyElement {
+    let mut row = div().flex().flex_row().gap_2();
+    for size in crate::settings::FontSize::ALL {
+        let selected = settings.font_size == size;
+        let state = state.clone();
+        row = row.child(
+            div()
+                .debug_selector(move || format!("font-size-{}", size.id()))
+                .flex()
+                .child(render_menu_button(
+                    format!("font-size-button-{}", size.id()),
+                    if selected {
+                        format!("✓ {}", size.display_name())
+                    } else {
+                        size.display_name().to_string()
+                    },
+                    if selected {
+                        Theme::accent()
+                    } else {
+                        Theme::text_secondary()
+                    },
+                    move |_event, window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.settings.font_size = size;
+                            state.settings.save();
+                            cx.notify();
+                        });
+                        window.refresh();
+                    },
+                )),
+        );
+    }
+    row.into_any()
 }
 
 fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
@@ -880,6 +940,39 @@ mod tests {
                         <= f32::from(row.origin.x) + f32::from(row.size.width) + 1.0,
                 "{} switch escaped its row",
                 kind.id()
+            );
+        }
+    }
+
+    /// `debug_bounds` takes a `&'static str`, so the selectors are spelled out
+    /// rather than formatted from the id.
+    fn font_size_selector(size: crate::settings::FontSize) -> &'static str {
+        match size {
+            crate::settings::FontSize::Small => "font-size-small",
+            crate::settings::FontSize::Default => "font-size-default",
+            crate::settings::FontSize::Large => "font-size-large",
+            crate::settings::FontSize::ExtraLarge => "font-size-extra-large",
+        }
+    }
+
+    /// Every text-size step needs a button of its own. Four labels sharing one
+    /// row is exactly where a squeezed or collapsed button would show up.
+    #[gpui::test]
+    fn every_font_size_gets_its_own_button(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        let settings = state.update(cx, |state, _cx| state.settings.clone());
+        let row = font_size_row(&settings, state.clone());
+        let (_host, cx) = cx.add_window_view(|_window, _cx| SizedList(vec![row]));
+        cx.run_until_parked();
+
+        for size in crate::settings::FontSize::ALL {
+            let bounds = cx
+                .debug_bounds(font_size_selector(size))
+                .unwrap_or_else(|| panic!("{} has no button", size.id()));
+            assert!(
+                f32::from(bounds.size.width) > 0.0 && f32::from(bounds.size.height) > 0.0,
+                "{} was laid out with no size",
+                size.id()
             );
         }
     }

@@ -35,6 +35,57 @@ impl Default for AppearanceMode {
     }
 }
 
+/// App-wide text size. The scale multiplies every font size the UI uses, so one
+/// choice covers the transcript, the sidebar, the composer and Settings alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontSize {
+    Small,
+    Default,
+    Large,
+    ExtraLarge,
+}
+
+impl FontSize {
+    pub const ALL: [Self; 4] = [Self::Small, Self::Default, Self::Large, Self::ExtraLarge];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Default => "default",
+            Self::Large => "large",
+            Self::ExtraLarge => "extra-large",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Small => "Small",
+            Self::Default => "Default",
+            Self::Large => "Large",
+            Self::ExtraLarge => "Extra Large",
+        }
+    }
+
+    /// Multiplier applied to every design-time font size. The steps stay modest
+    /// on purpose: only the panes that are sized around their text (the sidebar,
+    /// the settings label column) grow with the scale, so a larger jump starts
+    /// pushing content out of the chrome that is still sized in plain pixels.
+    pub fn scale(self) -> f32 {
+        match self {
+            Self::Small => 0.9,
+            Self::Default => 1.0,
+            Self::Large => 1.15,
+            Self::ExtraLarge => 1.3,
+        }
+    }
+}
+
+impl Default for FontSize {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendKind {
     Hermes,
@@ -133,6 +184,9 @@ pub struct Settings {
     pub backend_kind: BackendKind,
     #[serde(default)]
     pub appearance: AppearanceMode,
+    /// How large every font in the interface is drawn.
+    #[serde(default)]
+    pub font_size: FontSize,
     #[serde(default)]
     #[serde(skip_serializing)]
     pub session_token: String,
@@ -243,6 +297,7 @@ impl Default for Settings {
         Self {
             backend_kind: BackendKind::Hermes,
             appearance: AppearanceMode::System,
+            font_size: FontSize::default(),
             session_token: String::new(),
             auto_connect: true,
             selected_profile: String::new(),
@@ -530,7 +585,7 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, SavedWindow, Settings};
+    use super::{BackendKind, FontSize, SavedWindow, Settings};
 
     #[test]
     fn full_websocket_url_preserves_reverse_proxy_path() {
@@ -588,6 +643,56 @@ mod tests {
                 let _ = std::fs::remove_dir_all(parent);
             }
         }
+    }
+
+    /// The text-size steps must actually grow, and the default step must leave
+    /// the interface exactly as designed: every layout test in the tree is
+    /// written against a scale of 1.0.
+    #[test]
+    fn font_size_steps_are_unique_and_grow_from_a_neutral_default() {
+        assert_eq!(FontSize::default().scale(), 1.0);
+
+        let scales: Vec<f32> = FontSize::ALL.iter().map(|size| size.scale()).collect();
+        assert!(
+            scales.windows(2).all(|pair| pair[1] > pair[0]),
+            "each step must be larger than the one before it: {scales:?}"
+        );
+
+        let ids: std::collections::HashSet<&str> =
+            FontSize::ALL.iter().map(|size| size.id()).collect();
+        assert_eq!(
+            ids.len(),
+            FontSize::ALL.len(),
+            "ids become element ids, so they must stay unique"
+        );
+    }
+
+    /// A settings file written before the option existed has no `font_size`
+    /// key, so it has to load at the default rather than fail.
+    #[test]
+    fn a_settings_file_without_a_font_size_loads_at_the_default() {
+        let temp = TempSettings::new();
+        std::fs::write(temp.path(), br#"{"backend_kind": "Hermes"}"#).expect("write settings");
+
+        let settings = Settings::load_from(temp.path());
+
+        assert_eq!(settings.font_size, FontSize::default());
+    }
+
+    /// The choice has to survive the round trip through disk.
+    #[test]
+    fn the_font_size_survives_a_save_and_reload() {
+        let temp = TempSettings::new();
+        let settings = Settings {
+            font_size: FontSize::ExtraLarge,
+            ..Settings::default()
+        };
+        settings.save_to(temp.path());
+
+        assert_eq!(
+            Settings::load_from(temp.path()).font_size,
+            FontSize::ExtraLarge
+        );
     }
 
     #[test]

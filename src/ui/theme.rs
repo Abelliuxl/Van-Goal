@@ -1,8 +1,14 @@
-use crate::settings::AppearanceMode;
-use gpui::{hsla, rgb, Hsla, WindowAppearance};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::settings::{AppearanceMode, FontSize};
+use gpui::{hsla, px, rgb, Hsla, Pixels, WindowAppearance};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+
+/// App-wide multiplier for every font size, held as `f32` bits because atomics
+/// have no float variant. Written at the top of each window's render from the
+/// saved preference, the same way the appearance above is, so that every view
+/// reads one scale without threading it through the element tree.
+static FONT_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
 
 /// App-wide adaptive palette. The active variant is synchronized at the start
 /// of each window render so child views can keep using the compact Theme API.
@@ -21,6 +27,26 @@ impl Theme {
             AppearanceMode::Dark => false,
         };
         LIGHT_THEME.store(light, Ordering::Relaxed);
+    }
+
+    /// Apply the saved text-size preference. Called from the same render entry
+    /// points as [`Theme::sync`], right beside it, so a change in Settings
+    /// reaches both windows on their next frame.
+    pub fn sync_font_size(font_size: FontSize) {
+        FONT_SCALE.store(font_size.scale().to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn font_scale() -> f32 {
+        f32::from_bits(FONT_SCALE.load(Ordering::Relaxed))
+    }
+
+    /// A design-time font size, scaled by the user's text-size preference.
+    ///
+    /// Every `text_size` in the interface goes through here rather than taking
+    /// a literal, so the whole app grows together. Sizes are still written as
+    /// the numbers they were designed at, which keeps the call sites readable.
+    pub fn text_px(value: f32) -> Pixels {
+        px(value * Self::font_scale())
     }
 
     fn is_light() -> bool {

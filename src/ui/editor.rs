@@ -1,3 +1,4 @@
+use crate::ui::theme::Theme;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, fill, hsla, point, px, relative, rgba, size, App, Bounds, Context, CursorStyle,
@@ -273,11 +274,11 @@ impl Editor {
         let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
         };
-        let line_height = px(ROW_HEIGHT);
+        let line_height = px(row_height());
         for (row_index, entry) in self.lines.iter().enumerate() {
             let rows = entry.line.wrap_boundaries().len() + 1;
-            let top = bounds.top() + px(self.rows_above(row_index) as f32 * ROW_HEIGHT);
-            let span = px(ROW_HEIGHT * rows as f32);
+            let top = bounds.top() + px(self.rows_above(row_index) as f32 * row_height());
+            let span = px(row_height() * rows as f32);
             if position.y >= top && position.y <= top + span {
                 let local = point(position.x - bounds.left(), position.y - top);
                 let offset = entry.byte_start
@@ -756,7 +757,15 @@ impl Focusable for Editor {
 
 impl EventEmitter<EditorEvent> for Editor {}
 
-pub const ROW_HEIGHT: f32 = 20.0;
+/// Row height the editor was laid out at, before the text-size preference is
+/// applied. The font is drawn at 13px against a 20px row, and the caret and
+/// selection quads are positioned from this same number, so the two have to
+/// scale together or the caret drifts off the glyphs.
+pub const BASE_ROW_HEIGHT: f32 = 20.0;
+
+fn row_height() -> f32 {
+    BASE_ROW_HEIGHT * Theme::font_scale()
+}
 
 impl EntityInputHandler for Editor {
     fn text_for_range(
@@ -867,11 +876,11 @@ impl EntityInputHandler for Editor {
             .min(entry.line.len());
         let local = entry
             .line
-            .position_for_index(offset_in_line, px(ROW_HEIGHT))?;
-        let top = bounds.top() + px(self.rows_above(row) as f32 * ROW_HEIGHT);
+            .position_for_index(offset_in_line, px(row_height()))?;
+        let top = bounds.top() + px(self.rows_above(row) as f32 * row_height());
         Some(Bounds::new(
             point(bounds.left() + local.x, top),
-            size(px(2.0), px(ROW_HEIGHT)),
+            size(px(2.0), px(row_height())),
         ))
     }
 
@@ -936,7 +945,7 @@ impl Element for EditorElement {
         let rows = editor.estimated_rows().clamp(1, 8);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = px(ROW_HEIGHT * rows as f32).into();
+        style.size.height = px(row_height() * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1030,13 +1039,13 @@ impl Element for EditorElement {
                         .sum();
                     if let Some(local) = entry
                         .line
-                        .position_for_index(cursor - entry.byte_start, px(ROW_HEIGHT))
+                        .position_for_index(cursor - entry.byte_start, px(row_height()))
                     {
-                        let y = bounds.top() + px(rows_above as f32 * ROW_HEIGHT) + local.y;
+                        let y = bounds.top() + px(rows_above as f32 * row_height()) + local.y;
                         cursor_quad = Some(fill(
                             Bounds::new(
                                 point(bounds.left() + local.x, y),
-                                size(px(2.0), px(ROW_HEIGHT)),
+                                size(px(2.0), px(row_height())),
                             ),
                             gpui::blue(),
                         ));
@@ -1058,34 +1067,34 @@ impl Element for EditorElement {
                         .sum();
                     let start_local = entry
                         .line
-                        .position_for_index(intersect_start - entry.byte_start, px(ROW_HEIGHT));
+                        .position_for_index(intersect_start - entry.byte_start, px(row_height()));
                     let end_local = entry
                         .line
-                        .position_for_index(intersect_end - entry.byte_start, px(ROW_HEIGHT));
+                        .position_for_index(intersect_end - entry.byte_start, px(row_height()));
                     if let (Some(start_local), Some(end_local)) = (start_local, end_local) {
                         // One quad per wrapped row is overkill for v1: draw the
                         // whole span on one row when it fits, else a full-row
                         // highlight.
                         if (start_local.y - end_local.y).abs() < px(0.5) {
                             let y =
-                                bounds.top() + px(rows_above as f32 * ROW_HEIGHT) + start_local.y;
+                                bounds.top() + px(rows_above as f32 * row_height()) + start_local.y;
                             selection_quads.push(fill(
                                 Bounds::new(
                                     point(bounds.left() + start_local.x, y),
                                     size(
                                         (end_local.x - start_local.x).max(px(2.0)),
-                                        px(ROW_HEIGHT),
+                                        px(row_height()),
                                     ),
                                 ),
                                 rgba(0x3311ff30),
                             ));
                         } else {
                             let rows = entry.line.wrap_boundaries().len() + 1;
-                            let y = bounds.top() + px(rows_above as f32 * ROW_HEIGHT);
+                            let y = bounds.top() + px(rows_above as f32 * row_height());
                             selection_quads.push(fill(
                                 Bounds::new(
                                     point(bounds.left(), y),
-                                    size(bounds.size.width, px(ROW_HEIGHT * rows as f32)),
+                                    size(bounds.size.width, px(row_height() * rows as f32)),
                                 ),
                                 rgba(0x3311ff30),
                             ));
@@ -1101,7 +1110,7 @@ impl Element for EditorElement {
             .sum();
         let content_size = size(
             bounds.size.width,
-            px(ROW_HEIGHT * content_rows.max(1) as f32),
+            px(row_height() * content_rows.max(1) as f32),
         );
 
         PrepaintState {
@@ -1133,12 +1142,12 @@ impl Element for EditorElement {
             window.paint_quad(quad);
         }
 
-        let line_height = px(ROW_HEIGHT);
+        let line_height = px(row_height());
         let mut rows_above = 0usize;
         for entry in &prepaint.lines {
             let origin = point(
                 bounds.left(),
-                bounds.top() + px(rows_above as f32 * ROW_HEIGHT),
+                bounds.top() + px(rows_above as f32 * row_height()),
             );
             let _ = entry
                 .line
@@ -1196,8 +1205,8 @@ impl Render for Editor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .text_size(gpui::px(13.0))
-            .line_height(gpui::px(ROW_HEIGHT))
+            .text_size(Theme::text_px(13.0))
+            .line_height(px(row_height()))
             .child(
                 div()
                     .id(self.element_id.clone())
