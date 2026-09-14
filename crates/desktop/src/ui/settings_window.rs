@@ -17,7 +17,7 @@ pub struct SettingsView {
     token_editor: Entity<Editor>,
     /// Which backend the text fields currently hold, so they can be re-filled
     /// when a switch changes the active backend.
-    shown_backend: crate::settings::BackendKind,
+    shown_backend: van_goal_core::settings::BackendKind,
 }
 
 impl SettingsView {
@@ -190,7 +190,10 @@ impl Render for SettingsView {
                 state.connection_state.label(),
                 state.last_error.clone(),
                 state.cache_summary.clone(),
-                crate::logger::global_logger().path().display().to_string(),
+                van_goal_core::logger::global_logger()
+                    .path()
+                    .display()
+                    .to_string(),
                 state.local_server.take_message(),
             )
         };
@@ -212,7 +215,7 @@ impl Render for SettingsView {
         // the active backend and connects it, turning it off disconnects it and
         // keeps it off on the next launch.
         let mut backend_section = section("Agent backend");
-        for kind in crate::settings::BackendKind::ALL {
+        for kind in van_goal_core::settings::BackendKind::ALL {
             let is_enabled = settings.is_backend_enabled(kind);
             let is_active = settings.backend_kind == kind;
             let status = match (is_enabled, is_active) {
@@ -234,7 +237,7 @@ impl Render for SettingsView {
         root = root.child(backend_section);
 
         let mut appearance_options = div().flex().flex_row().gap_2();
-        for mode in crate::settings::AppearanceMode::ALL {
+        for mode in van_goal_core::settings::AppearanceMode::ALL {
             let selected = settings.appearance == mode;
             let state = state.clone();
             appearance_options = appearance_options.child(render_menu_button(
@@ -290,7 +293,7 @@ impl Render for SettingsView {
                 ))
                 .child(hint(if settings.is_managed_local_backend() {
                     "Local address: Van-Goal starts and manages hermes serve automatically."
-                } else if settings.backend_kind == crate::settings::BackendKind::OpenClaw {
+                } else if settings.backend_kind == van_goal_core::settings::BackendKind::OpenClaw {
                     "For a reverse-proxy path, paste the complete ws:// or wss:// URL; it overrides Port and TLS."
                 } else {
                     "Van-Goal connects to an already-running server at this address."
@@ -302,7 +305,7 @@ impl Render for SettingsView {
                     "Van-Goal launches the installed CLI in this directory.",
                 ));
         }
-        if settings.backend_kind == crate::settings::BackendKind::Hermes {
+        if settings.backend_kind == van_goal_core::settings::BackendKind::Hermes {
             connection = connection
                 .child(field_row("Default profile", self.profile_editor.clone()))
                 .child(hint("Leave empty to use the Hermes default profile."));
@@ -350,7 +353,7 @@ impl Render for SettingsView {
                     )
                 })
                 .when(
-                    active_backend == crate::settings::BackendKind::Hermes,
+                    active_backend == van_goal_core::settings::BackendKind::Hermes,
                     |this| {
                         this.child(small_button(
                             "stop-managed",
@@ -413,7 +416,7 @@ impl Render for SettingsView {
                     |state, _cx| {
                         state.settings.debug_logging_enabled =
                             !state.settings.debug_logging_enabled;
-                        crate::logger::global_logger()
+                        van_goal_core::logger::global_logger()
                             .set_enabled(state.settings.debug_logging_enabled);
                         state.settings.save();
                     },
@@ -425,7 +428,7 @@ impl Render for SettingsView {
                     Theme::surface_hover(),
                     {
                         move |_event, _window, _cx| {
-                            crate::logger::global_logger().clear();
+                            van_goal_core::logger::global_logger().clear();
                         }
                     },
                 )),
@@ -545,7 +548,7 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
 /// switching a backend on makes it the active backend and connects it,
 /// switching it off disconnects it and leaves it off next launch.
 fn backend_row(
-    kind: crate::settings::BackendKind,
+    kind: van_goal_core::settings::BackendKind,
     is_enabled: bool,
     is_active: bool,
     status: String,
@@ -810,9 +813,12 @@ where
 /// The text-size choices. Every font in the interface is a design-time size
 /// multiplied by the picked scale, so one click resizes the whole app — the
 /// transcript, the sidebar, the composer and this window at once.
-fn font_size_row(settings: &crate::settings::Settings, state: Entity<AppState>) -> AnyElement {
+fn font_size_row(
+    settings: &van_goal_core::settings::Settings,
+    state: Entity<AppState>,
+) -> AnyElement {
     let mut row = div().flex().flex_row().gap_2();
-    for size in crate::settings::FontSize::ALL {
+    for size in van_goal_core::settings::FontSize::ALL {
         let selected = settings.font_size == size;
         let state = state.clone();
         row = row.child(
@@ -845,16 +851,16 @@ fn font_size_row(settings: &crate::settings::Settings, state: Entity<AppState>) 
     row.into_any()
 }
 
-fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
+fn credential_help(kind: van_goal_core::settings::BackendKind) -> &'static str {
     match kind {
-        crate::settings::BackendKind::Hermes => "Local Hermes tokens are discovered automatically.",
-        crate::settings::BackendKind::OpenClaw => {
+        van_goal_core::settings::BackendKind::Hermes => "Local Hermes tokens are discovered automatically.",
+        van_goal_core::settings::BackendKind::OpenClaw => {
             "Use gateway.auth.token. Van-Goal stores it here and keeps the paired-device token the gateway issues in its local app-data file; clearing removes both."
         }
-        crate::settings::BackendKind::OpenCode => {
+        van_goal_core::settings::BackendKind::OpenCode => {
             "Matches OPENCODE_SERVER_PASSWORD when server authentication is enabled."
         }
-        crate::settings::BackendKind::MiMoCode => {
+        van_goal_core::settings::BackendKind::MiMoCode => {
             "Matches the password configured for mimo serve, when enabled."
         }
         _ => "",
@@ -864,8 +870,8 @@ fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::BackendKind;
     use gpui::{AppContext, TestAppContext};
+    use van_goal_core::settings::BackendKind;
 
     /// A box to lay the backend list out in: the test platform's window has no
     /// intrinsic size.
@@ -946,12 +952,12 @@ mod tests {
 
     /// `debug_bounds` takes a `&'static str`, so the selectors are spelled out
     /// rather than formatted from the id.
-    fn font_size_selector(size: crate::settings::FontSize) -> &'static str {
+    fn font_size_selector(size: van_goal_core::settings::FontSize) -> &'static str {
         match size {
-            crate::settings::FontSize::Small => "font-size-small",
-            crate::settings::FontSize::Default => "font-size-default",
-            crate::settings::FontSize::Large => "font-size-large",
-            crate::settings::FontSize::ExtraLarge => "font-size-extra-large",
+            van_goal_core::settings::FontSize::Small => "font-size-small",
+            van_goal_core::settings::FontSize::Default => "font-size-default",
+            van_goal_core::settings::FontSize::Large => "font-size-large",
+            van_goal_core::settings::FontSize::ExtraLarge => "font-size-extra-large",
         }
     }
 
@@ -965,7 +971,7 @@ mod tests {
         let (_host, cx) = cx.add_window_view(|_window, _cx| SizedList(vec![row]));
         cx.run_until_parked();
 
-        for size in crate::settings::FontSize::ALL {
+        for size in van_goal_core::settings::FontSize::ALL {
             let bounds = cx
                 .debug_bounds(font_size_selector(size))
                 .unwrap_or_else(|| panic!("{} has no button", size.id()));

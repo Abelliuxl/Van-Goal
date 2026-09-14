@@ -64,7 +64,7 @@ impl RootView {
             // the size to restore to is kept.
             gpui::WindowBounds::Fullscreen(bounds) => (bounds, false),
         };
-        let saved = crate::settings::SavedWindow {
+        let saved = van_goal_core::settings::SavedWindow {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
             width: f32::from(bounds.size.width),
@@ -294,13 +294,13 @@ fn sidebar_icon(open: bool) -> gpui::Div {
         .child(div().w(px(1.0)).h_full().bg(ink))
 }
 
-fn pill_color(state: &crate::models::ConnectionState) -> gpui::Hsla {
+fn pill_color(state: &van_goal_core::models::ConnectionState) -> gpui::Hsla {
     match state {
-        crate::models::ConnectionState::Connected => Theme::ok(),
-        crate::models::ConnectionState::Connecting => Theme::warn(),
-        crate::models::ConnectionState::Disconnected => Theme::text_tertiary(),
-        crate::models::ConnectionState::Degraded(_) => Theme::warn(),
-        crate::models::ConnectionState::Failed(_) => Theme::danger(),
+        van_goal_core::models::ConnectionState::Connected => Theme::ok(),
+        van_goal_core::models::ConnectionState::Connecting => Theme::warn(),
+        van_goal_core::models::ConnectionState::Disconnected => Theme::text_tertiary(),
+        van_goal_core::models::ConnectionState::Degraded(_) => Theme::warn(),
+        van_goal_core::models::ConnectionState::Failed(_) => Theme::danger(),
     }
 }
 

@@ -1,9 +1,3 @@
-use crate::agent::Backend;
-use crate::cache::SessionCacheStore;
-use crate::local_server::LocalHermesServer;
-use crate::models::*;
-use crate::settings::{BackendKind, Settings};
-use crate::{hermes_config, log_debug};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use gpui::Task;
@@ -12,6 +6,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+use van_goal_core::agent::Backend;
+use van_goal_core::cache::SessionCacheStore;
+use van_goal_core::local_server::LocalHermesServer;
+use van_goal_core::models::*;
+use van_goal_core::settings::{BackendKind, Settings};
+use van_goal_core::{hermes_config, log_debug};
 
 /// Tokio runtime stored as a GPUI global; all backend I/O runs on it while the
 /// UI stays on the GPUI main-thread executor.
@@ -212,7 +212,7 @@ impl AppState {
 
         let (event_tx, event_rx) = unbounded::<AgentEvent>();
 
-        crate::logger::global_logger().set_enabled(settings.debug_logging_enabled);
+        van_goal_core::logger::global_logger().set_enabled(settings.debug_logging_enabled);
 
         let kind = settings.backend_kind;
         let mut state = Self {
@@ -287,7 +287,9 @@ impl AppState {
         let kind = self.settings.backend_kind;
         self.settings.session_token = String::new();
         let forgot_device_token = kind == BackendKind::OpenClaw
-            && crate::agent::openclaw::forget_device_token(&self.settings.active_backend_url());
+            && van_goal_core::agent::openclaw::forget_device_token(
+                &self.settings.active_backend_url(),
+            );
         self.settings.save();
         log_debug!(
             "app",
@@ -310,7 +312,7 @@ impl AppState {
     pub fn stored_credential(&self) -> StoredCredential {
         let kind = self.settings.backend_kind;
         let device_token_characters = if kind == BackendKind::OpenClaw {
-            crate::agent::openclaw::stored_device_token_characters(
+            van_goal_core::agent::openclaw::stored_device_token_characters(
                 &self.settings.active_backend_url(),
             )
         } else {
@@ -1965,9 +1967,9 @@ mod streaming_tests {
         }
         assert_ne!(naive, text, "the naive merge should reproduce the garbling");
         assert!(
-            !crate::markdown::parse(&naive)
+            !van_goal_core::markdown::parse(&naive)
                 .iter()
-                .any(|block| matches!(block, crate::markdown::MarkdownBlock::Table(..))),
+                .any(|block| matches!(block, van_goal_core::markdown::MarkdownBlock::Table(..))),
             "the naive merge is what stopped tables from parsing"
         );
 
@@ -1978,9 +1980,9 @@ mod streaming_tests {
             "the table separator was split"
         );
         // The parser turns that separator into a real table.
-        let tables = crate::markdown::parse(&shown)
+        let tables = van_goal_core::markdown::parse(&shown)
             .into_iter()
-            .filter(|block| matches!(block, crate::markdown::MarkdownBlock::Table(..)))
+            .filter(|block| matches!(block, van_goal_core::markdown::MarkdownBlock::Table(..)))
             .count();
         assert_eq!(tables, 1, "table was not recognised after merging streams");
     }

@@ -34,13 +34,13 @@ export SDKROOT="$(xcrun --show-sdk-path)"
 # Xcode 26+ ships the Metal shader compiler as a separate component:
 xcodebuild -downloadComponent MetalToolchain
 
-cargo build --release
+cargo build --release -p van-goal
 ```
 
 Run the app:
 
 ```bash
-cargo run --release
+cargo run --release -p van-goal
 ```
 
 Package a local app bundle:
@@ -48,6 +48,12 @@ Package a local app bundle:
 ```bash
 Scripts/package_app.sh
 open Build/VanGoal.app
+```
+
+Run the tests:
+
+```bash
+cargo test --workspace
 ```
 
 ## Backends
@@ -79,19 +85,32 @@ OpenClaw connections create a stable Ed25519 device identity in Van-Goal's local
 
 Van-Goal is deliberately a thin frontend — all agent capability lives in the backend.
 
-| Layer | Responsibility |
-| --- | --- |
-| `main.rs` | App entry, tokio runtime, menus, actions, windows |
-| `state.rs` | Single source of truth: sessions, messages, streaming, sending, queue |
-| `agent/` | Backend-neutral facade + protocol adapters (Hermes, OpenCode, CLI, OpenClaw) |
-| `jsonl_process.rs` | Codex / Claude Code / Pi subprocess lifecycle and JSONL streaming |
-| `local_server.rs` | Discovers/launches the local `hermes serve` process |
-| `hermes_config.rs` | Reads/writes `~/.hermes` config, model cache, permission modes |
-| `ui/` | GPUI views: root shell, sidebar, chat, composer, editor, settings |
-| `editor.rs` | Multi-line text editor element built on GPUI text shaping |
-| `markdown.rs` | Block-level markdown parser shared with the renderer |
-| `ui/theme.rs` | Adaptive palette plus the app-wide text scale every font size is multiplied by |
-| `cache.rs` / `secret_store.rs` / `settings.rs` | On-disk cache, local credentials, persisted settings |
+The repository is a Cargo workspace split along the line that matters for
+porting: everything that does not need a UI toolkit lives in `crates/core`, and
+the macOS client in `crates/desktop` is one consumer of it. Nothing in
+`crates/core` may import GPUI, which is what keeps the door open for a second
+frontend.
+
+| Crate | Layer | Responsibility |
+| --- | --- | --- |
+| `core` | `agent/` | Backend-neutral facade + protocol adapters (Hermes, OpenCode, CLI, OpenClaw) |
+| `core` | `models.rs` | Normalized event model every adapter translates into |
+| `core` | `jsonl_process.rs` | Codex / Claude Code / Pi subprocess lifecycle and JSONL streaming |
+| `core` | `local_server.rs` | Discovers/launches the local `hermes serve` process |
+| `core` | `hermes_config.rs` | Reads/writes `~/.hermes` config, model cache, permission modes |
+| `core` | `markdown.rs` | Block-level markdown parser, shared with the renderer |
+| `core` | `cache.rs` / `secret_store.rs` / `settings.rs` / `logger.rs` | On-disk cache, local credentials, persisted settings, debug log |
+| `desktop` | `main.rs` | App entry, tokio runtime, menus, actions, windows |
+| `desktop` | `state.rs` | Single source of truth: sessions, messages, streaming, sending, queue |
+| `desktop` | `ui/` | GPUI views: root shell, sidebar, chat, composer, editor, settings |
+| `desktop` | `ui/editor.rs` | Multi-line text editor element built on GPUI text shaping |
+| `desktop` | `ui/theme.rs` | Adaptive palette plus the app-wide text scale every font size is multiplied by |
+
+`crates/core` has a `testing` feature that redirects the app-data directory to a
+throwaway temp directory. `crates/desktop` turns it on from its
+`[dev-dependencies]`, because `cfg(test)` does not reach a dependency — without
+it a test run would read and rewrite the developer's real settings, session
+cache and OpenClaw device identity.
 
 ### Threading model
 

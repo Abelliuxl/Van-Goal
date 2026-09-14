@@ -13,6 +13,12 @@ pub struct VanGoalLogger {
     handle: Mutex<Option<File>>,
 }
 
+impl Default for VanGoalLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VanGoalLogger {
     fn log_dir() -> PathBuf {
         dirs::app_dir()
@@ -103,7 +109,7 @@ pub mod dirs {
 
     /// Only the non-test path resolves through here, since tests redirect to a
     /// temporary directory.
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
     pub fn app_support() -> PathBuf {
         home().join("Library/Application Support")
     }
@@ -118,16 +124,27 @@ pub mod dirs {
 
     /// Unit tests must never touch the real app data. Building an `AppState`
     /// loads and saves settings, so a test run would otherwise rewrite the
-    /// developer's own preferences and perform the rename migration for real.
-    #[cfg(test)]
+    /// developer's own preferences, cache and paired device identity.
+    ///
+    /// This is a feature rather than `cfg(test)` because `cfg(test)` does not
+    /// reach a dependency: when `crates/desktop` builds its test binary, this
+    /// crate is compiled *without* `cfg(test)` and would resolve the real
+    /// directory — which is exactly what happened the first time these crates
+    /// were split apart. The desktop crate turns the feature on from its
+    /// `[dev-dependencies]`, so it is off for every real build.
+    #[cfg(any(test, feature = "testing"))]
     fn resolve_app_dir() -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("van-goal-test-app-dir-{}", std::process::id()));
+        // The operating system reuses process ids, and this directory is never
+        // cleaned up, so a run can otherwise inherit the settings and cache a
+        // previous run left behind and fail on assertions about defaults.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     fn resolve_app_dir() -> PathBuf {
         migrate_app_dir(&app_support())
     }
@@ -136,6 +153,10 @@ pub mod dirs {
     /// `HermitGPUI` directory into place the first time. Losing that directory
     /// would mean losing the stored credentials, the session cache and the
     /// OpenClaw device pairing — which the Gateway would have to approve again.
+    ///
+    /// Unused while [`resolve_app_dir`] is redirected to a temporary directory,
+    /// which is the case in every test build.
+    #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
     fn migrate_app_dir(support: &std::path::Path) -> PathBuf {
         let current = support.join(APP_DIR);
         let legacy = support.join(LEGACY_APP_DIR);
@@ -154,6 +175,7 @@ pub mod dirs {
         migrate_app_dir(support)
     }
 
+    #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {

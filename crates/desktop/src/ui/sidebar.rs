@@ -1,10 +1,10 @@
-use crate::models::{AgentSession, ConnectionState};
 use crate::state::AppState;
 use crate::ui::theme::Theme;
 use gpui::{
     div, prelude::*, px, AnyElement, Context, Entity, FontWeight, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
+use van_goal_core::models::{AgentSession, ConnectionState};
 
 /// Session list width at the default text size. Wide enough for a model name
 /// under a truncated title, narrow enough to leave the transcript the bulk of

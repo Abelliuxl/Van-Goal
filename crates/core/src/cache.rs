@@ -10,6 +10,12 @@ pub struct SessionCacheStore {
     path: PathBuf,
 }
 
+impl Default for SessionCacheStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionCacheStore {
     pub fn new() -> Self {
         let dir = dirs::app_dir();

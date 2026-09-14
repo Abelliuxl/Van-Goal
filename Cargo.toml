@@ -1,18 +1,20 @@
-[package]
-name = "van-goal"
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/desktop"]
+
+# Shared by every member, so `env!("CARGO_PKG_VERSION")` — which the OpenClaw
+# handshake reports to the Gateway — is the same number whichever crate it is
+# compiled into.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Van-Goal — a native macOS client for local and remote coding agents, rebuilt on GPUI"
 license = "MIT"
 repository = "https://github.com/Abelliuxl/Van-Goal"
-readme = "README.md"
 
-[[bin]]
-name = "VanGoal"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+# UI, desktop only.
 gpui = "0.2.2"
+rfd = "0.15"
 
 # Async runtime for backend transports (HTTP, WebSocket, SSE, subprocesses).
 tokio = { version = "1.47", features = [
@@ -31,13 +33,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 futures = "0.3"
-async-trait = "0.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
 anyhow = "1"
-thiserror = "2"
 
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
@@ -46,16 +46,7 @@ base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-
-# Native open panel for composer attachments
-rfd = "0.15"
-
 chrono = { version = "0.4", features = ["serde", "clock"] }
-
-[dev-dependencies]
-# `test-support` exposes gpui's TestAppContext/TestPlatform so the editor's
-# EntityInputHandler (macOS IME) paths can be driven in unit tests.
-gpui = { version = "0.2.2", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

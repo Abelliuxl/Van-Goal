@@ -1,0 +1,33 @@
+[package]
+name = "van-goal"
+description = "Van-Goal — a native macOS client for local and remote coding agents, rebuilt on GPUI"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "VanGoal"
+path = "src/main.rs"
+
+[dependencies]
+van-goal-core = { path = "../core" }
+
+gpui.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+
+# Native open panel for composer attachments.
+rfd.workspace = true
+# Grapheme segmentation for the composer's cursor movement.
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+# See the `testing` feature in crates/core: it keeps the test suite off the
+# developer's real app-data directory.
+van-goal-core = { path = "../core", features = ["testing"] }
+# `test-support` exposes gpui's TestAppContext/TestPlatform so the editor's
+# EntityInputHandler (macOS IME) paths can be driven in unit tests.
+gpui = { workspace = true, features = ["test-support"] }

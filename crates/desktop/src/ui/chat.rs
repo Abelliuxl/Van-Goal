@@ -1,7 +1,3 @@
-use crate::markdown;
-use crate::models::{
-    compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
-};
 use crate::state::AppState;
 use crate::ui::editor::{Editor, EditorEvent};
 use crate::ui::markdown_view::render_blocks;
@@ -12,6 +8,10 @@ use gpui::{
     MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
 };
 use std::time::Duration;
+use van_goal_core::markdown;
+use van_goal_core::models::{
+    compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
+};
 
 /// Smallest overlay-scrollbar thumb, as a fraction of the track.
 const MIN_THUMB_FRACTION: f32 = 0.06;
@@ -1068,7 +1068,7 @@ impl ChatView {
                                 .child("+"),
                         )
                         .when(
-                            caps.contains(crate::models::BackendCaps::PERMISSION_MODES),
+                            caps.contains(van_goal_core::models::BackendCaps::PERMISSION_MODES),
                             |this| {
                                 this.child(render_menu_button(
                                     "permission-menu-button",
@@ -1094,7 +1094,7 @@ impl ChatView {
                         )
                         .child(div().flex_1())
                         .when(
-                            caps.contains(crate::models::BackendCaps::MODEL_SELECTION),
+                            caps.contains(van_goal_core::models::BackendCaps::MODEL_SELECTION),
                             |this| {
                                 this.child(render_context_ring(usage))
                                     .child(render_menu_button(
@@ -1251,7 +1251,7 @@ fn render_permission_menu(
 }
 
 fn render_model_menu(
-    groups: &[(String, Vec<crate::models::ModelOption>)],
+    groups: &[(String, Vec<van_goal_core::models::ModelOption>)],
     current_provider: &str,
     current_model: &str,
     chat: Entity<ChatView>,
@@ -1431,7 +1431,7 @@ where
 }
 
 fn render_message_bubble(
-    message: &crate::models::ChatMessage,
+    message: &van_goal_core::models::ChatMessage,
     expanded: bool,
     copy: CopyButton,
     author: &str,
@@ -1609,12 +1609,12 @@ fn render_message_bubble(
 }
 
 fn render_activity(
-    message: &crate::models::ChatMessage,
+    message: &van_goal_core::models::ChatMessage,
     expanded: bool,
     id_hash: u64,
     chat: Entity<ChatView>,
 ) -> AnyElement {
-    let seconds = (crate::models::now_unix() - message.timestamp).max(0.0) as i64;
+    let seconds = (van_goal_core::models::now_unix() - message.timestamp).max(0.0) as i64;
     let thinking_label = if message.is_streaming {
         format!("Thinking · {}", duration_string(seconds))
     } else {
@@ -1805,8 +1805,8 @@ fn render_send_button(
 #[cfg(test)]
 mod chat_view_render_tests {
     use super::*;
-    use crate::models::ChatMessage;
     use gpui::{AppContext, ListOffset, TestAppContext, VisualTestContext};
+    use van_goal_core::models::ChatMessage;
 
     /// A box to lay the transcript out in: the test platform's window has no
     /// intrinsic size.
@@ -2174,8 +2174,8 @@ mod scroll_geometry_tests {
 #[cfg(test)]
 mod message_width_tests {
     use super::*;
-    use crate::models::ChatMessage;
     use gpui::{AppContext, TestAppContext, VisualTestContext};
+    use van_goal_core::models::ChatMessage;
 
     struct SizedChat(Entity<ChatView>);
 
@@ -2365,8 +2365,8 @@ mod message_width_tests {
 #[cfg(test)]
 mod copy_button_tests {
     use super::*;
-    use crate::models::ChatMessage;
     use gpui::{AppContext, TestAppContext, VisualTestContext};
+    use van_goal_core::models::ChatMessage;
 
     struct SizedChat(Entity<ChatView>);
 
@@ -2504,7 +2504,7 @@ mod copy_button_tests {
             view.update(cx, |_chat, cx| {
                 let state = _chat.state.clone();
                 state.update(cx, |state, _cx| {
-                    state.settings.backend_kind = crate::settings::BackendKind::OpenClaw;
+                    state.settings.backend_kind = van_goal_core::settings::BackendKind::OpenClaw;
                     state.backend_display_name = "OpenClaw";
                 });
                 cx.notify();

@@ -6279,23 +6279,31 @@ name = "van-goal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
+ "futures",
+ "gpui",
+ "rfd",
+ "tokio",
+ "unicode-segmentation",
+ "van-goal-core",
+]
+
+[[package]]
+name = "van-goal-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "base64",
  "chrono",
  "ed25519-dalek",
  "futures",
- "gpui",
  "rand 0.8.8",
  "regex",
  "reqwest",
- "rfd",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
- "unicode-segmentation",
  "url",
  "uuid",
 ]

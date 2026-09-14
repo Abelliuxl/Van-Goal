@@ -1,13 +1,3 @@
-mod agent;
-mod cache;
-mod hermes_config;
-mod jsonl_process;
-mod local_server;
-mod logger;
-mod markdown;
-mod models;
-mod secret_store;
-mod settings;
 mod state;
 mod ui;
 
@@ -19,6 +9,7 @@ use gpui::{
 use state::AppState;
 use ui::root::RootView;
 use ui::settings_window::OpenSettings;
+use van_goal_core::log_debug;
 
 actions!(van_goal, [NewSession, RefreshSessions, ToggleSidebar, Quit]);
 

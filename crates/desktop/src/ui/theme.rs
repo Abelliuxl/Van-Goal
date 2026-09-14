@@ -1,6 +1,6 @@
-use crate::settings::{AppearanceMode, FontSize};
 use gpui::{hsla, px, rgb, Hsla, Pixels, WindowAppearance};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use van_goal_core::settings::{AppearanceMode, FontSize};
 
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
 
@@ -147,8 +147,8 @@ pub fn rgba_hex(value: u32, alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::Theme;
-    use crate::settings::AppearanceMode;
     use gpui::{Hsla, WindowAppearance};
+    use van_goal_core::settings::AppearanceMode;
 
     /// A label that does not contrast with its fill renders as a blank pill,
     /// which is exactly how the session confirmation lost its button labels.

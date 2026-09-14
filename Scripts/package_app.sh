@@ -17,13 +17,21 @@ fi
 
 APP_NAME="VanGoal"
 BUNDLE_ID="com.abelliuxl.VanGoal"
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+# This is a Cargo workspace, so `cargo metadata` lists every member and the
+# order is not guaranteed — ask for the desktop package by name instead of
+# taking packages[0], which would silently stamp the wrong version (or fail).
+VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+import json, sys
+packages = json.load(sys.stdin)["packages"]
+app = next(p for p in packages if p["name"] == "van-goal")
+print(app["version"])
+')"
 BUILD_DIR="Build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 
 echo "Building release binary..."
-cargo build --release
+cargo build --release -p van-goal
 
 echo "Creating $APP_DIR..."
 rm -rf "$APP_DIR"

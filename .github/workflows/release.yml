@@ -32,7 +32,7 @@ jobs:
         run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release -p van-goal
 
       - name: Package app bundle
         run: ./Scripts/package_app.sh

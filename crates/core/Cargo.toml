@@ -1,0 +1,38 @@
+[package]
+name = "van-goal-core"
+description = "Backend adapters, session model and settings for Van-Goal. No UI dependencies, so the desktop and mobile clients can share it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "van_goal_core"
+path = "src/lib.rs"
+
+[features]
+# Redirects the app-data directory to a throwaway per-process temp directory.
+# A crate that tests against this one enables it from `[dev-dependencies]`,
+# because `cfg(test)` does not propagate into a dependency — without this, a
+# dependent crate's tests would read and rewrite the developer's real settings,
+# session cache and OpenClaw device identity.
+testing = []
+
+[dependencies]
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+anyhow.workspace = true
+
+uuid.workspace = true
+regex.workspace = true
+base64.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+chrono.workspace = true

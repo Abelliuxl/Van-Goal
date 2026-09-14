@@ -1,10 +1,10 @@
-use crate::markdown::{InlineStyle, MarkdownBlock};
 use crate::ui::theme::Theme;
 use gpui::{
     combine_highlights, div, prelude::*, px, relative, AnyElement, Div, FontStyle, FontWeight,
     HighlightStyle, InteractiveText, ParentElement, StrikethroughStyle, Styled, StyledText,
     UnderlineStyle,
 };
+use van_goal_core::markdown::{InlineStyle, MarkdownBlock};
 
 const MAX_TABLE_COLUMNS: usize = 8;
 const MAX_TABLE_ROWS: usize = 80;
@@ -155,8 +155,8 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
 fn render_inline(source: &str, seed: u64) -> AnyElement {
     // Give the text wrapper break opportunities before parsing, so highlight
     // ranges stay aligned with the bytes we actually render.
-    let with_breaks = crate::markdown::add_break_opportunities(source);
-    let parsed = crate::markdown::parse_inline(&with_breaks);
+    let with_breaks = van_goal_core::markdown::add_break_opportunities(source);
+    let parsed = van_goal_core::markdown::parse_inline(&with_breaks);
     let span_highlights = parsed.spans.iter().map(|span| {
         let style = match span.style {
             InlineStyle::Strong => HighlightStyle {
@@ -404,7 +404,7 @@ mod tests {
         ) -> impl IntoElement {
             div()
                 .w(px(600.0))
-                .child(render_blocks(&crate::markdown::parse(self.0)))
+                .child(render_blocks(&van_goal_core::markdown::parse(self.0)))
         }
     }
 
