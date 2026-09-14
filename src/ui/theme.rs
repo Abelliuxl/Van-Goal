@@ -97,6 +97,18 @@ impl Theme {
     pub fn quote_bar() -> Hsla {
         rgba_hex(if Self::is_light() { 0x000000 } else { 0xffffff }, 0.25)
     }
+
+    /// Label colour that stays readable on a given fill. The accent and danger
+    /// fills are bright enough for a dark label; the neutral surfaces are not.
+    /// Comparing lightness beats comparing the fill for equality, which breaks
+    /// silently the moment a colour is redefined.
+    pub fn label_on(fill: Hsla) -> Hsla {
+        if fill.l > 0.5 {
+            gpui::black()
+        } else {
+            Self::text()
+        }
+    }
 }
 
 pub fn rgba_hex(value: u32, alpha: f32) -> Hsla {
@@ -104,4 +116,45 @@ pub fn rgba_hex(value: u32, alpha: f32) -> Hsla {
     let g = ((value >> 8) & 0xff) as f32 / 255.0;
     let b = (value & 0xff) as f32 / 255.0;
     hsla(r, g, b, alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Theme;
+    use crate::settings::AppearanceMode;
+    use gpui::{Hsla, WindowAppearance};
+
+    /// A label that does not contrast with its fill renders as a blank pill,
+    /// which is exactly how the session confirmation lost its button labels.
+    fn assert_contrast(fill: Hsla) {
+        let label = Theme::label_on(fill);
+        assert!(
+            (label.l - fill.l).abs() > 0.3,
+            "label (l={}) is too close to its fill (l={})",
+            label.l,
+            fill.l
+        );
+    }
+
+    #[test]
+    fn button_labels_contrast_with_every_fill_they_use() {
+        for mode in [AppearanceMode::Dark, AppearanceMode::Light] {
+            Theme::sync(
+                mode,
+                match mode {
+                    AppearanceMode::Light => WindowAppearance::Light,
+                    _ => WindowAppearance::Dark,
+                },
+            );
+            // The fills the buttons actually use in this appearance.
+            for fill in [
+                Theme::danger(),
+                Theme::accent(),
+                Theme::surface_hover(),
+                Theme::surface(),
+            ] {
+                assert_contrast(fill);
+            }
+        }
+    }
 }

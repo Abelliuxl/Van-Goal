@@ -384,12 +384,25 @@ fn session_row_action<F>(id: String, label: &'static str, on_click: F) -> Statef
 where
     F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 {
+    // The size has to be set here: these used to sit inside the metadata row and
+    // inherit its 10px, but the overlay that reveals them sets no size of its
+    // own, so they fell back to the window default and rendered oversized.
     div()
         .id(gpui::ElementId::Name(id.into()))
-        .px_1()
+        .px(px(6.0))
+        .py(px(2.0))
         .rounded_sm()
+        .text_size(px(10.0))
+        .text_color(crate::ui::theme::Theme::text_secondary())
+        .bg(crate::ui::theme::Theme::surface())
+        .border_1()
+        .border_color(crate::ui::theme::Theme::border())
         .cursor_pointer()
-        .hover(|style| style.bg(crate::ui::theme::Theme::accent_soft()))
+        .hover(|style| {
+            style
+                .bg(crate::ui::theme::Theme::accent_soft())
+                .text_color(crate::ui::theme::Theme::text())
+        })
         .on_click(on_click)
         .child(label)
 }
@@ -444,14 +457,18 @@ fn header_button(label: &'static str, enabled: bool) -> Stateful<gpui::Div> {
 fn small_button(label: &'static str, color: Hsla) -> Stateful<gpui::Div> {
     div()
         .id(element_id_name(label))
+        .debug_selector(move || format!("button-{label}"))
         .px_2()
         .py_1()
         .rounded_md()
         .text_size(px(11.0))
-        .text_color(gpui::black())
+        .text_color(crate::ui::theme::Theme::label_on(color))
         .bg(color)
         .cursor_pointer()
         .hover(|style| style.opacity(0.85))
+        // The label was never added here, so every one of these buttons drew as
+        // an empty pill: the confirmation offered two unlabelled blobs.
+        .child(label)
 }
 
 // ElementId::Name takes a SharedString; tiny shim keeps call sites tidy.
@@ -604,6 +621,40 @@ mod tests {
             assert!(
                 right <= sidebar_right + 0.5,
                 "row {id} runs past the sidebar: {right} > {sidebar_right}"
+            );
+        }
+    }
+
+    /// The confirmation buttons used to render as empty pills because the
+    /// helper never added its label. A pill with no text is far narrower than
+    /// one holding "Cancel", so width is what catches it.
+    #[gpui::test]
+    fn the_confirmation_buttons_carry_their_labels(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        let doomed = session(
+            "doomed",
+            "Cron: 情话-晚间档 20:05",
+            "deepseek/deepseek-v4.1-flash",
+            None,
+        );
+        let sidebar = cx.new(|cx| {
+            let mut view = SidebarView::new(state.clone(), cx);
+            view.confirm_action = Some(ConfirmAction::DeleteOne(Box::new(doomed.clone())));
+            view
+        });
+        let (_host, cx) = cx.add_window_view(|_window, _cx| SizedSidebar(sidebar));
+        cx.run_until_parked();
+
+        for label in ["Cancel", "Delete"] {
+            let selector: &'static str = Box::leak(format!("button-{label}").into_boxed_str());
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("the {label} button was not laid out"));
+            assert!(
+                f32::from(bounds.size.width) > 30.0 && f32::from(bounds.size.height) > 0.0,
+                "the {label} button is an empty pill: {}x{}",
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height)
             );
         }
     }

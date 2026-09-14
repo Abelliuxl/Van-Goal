@@ -749,11 +749,7 @@ where
         .py_1()
         .rounded_md()
         .text_size(px(11.0))
-        .text_color(if color == Theme::surface_hover() {
-            Theme::text()
-        } else {
-            gpui::black()
-        })
+        .text_color(Theme::label_on(color))
         .bg(color)
         .cursor_pointer()
         .hover(|style| style.opacity(0.85))
