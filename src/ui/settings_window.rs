@@ -36,14 +36,14 @@ impl SettingsView {
                 window_min_size: Some(gpui::size(px(480.0), px(520.0))),
                 ..Default::default()
             },
-            |_window, cx| {
+            |window, cx| {
                 let state_entity = state.clone();
-                cx.new(|cx| Self::new(state_entity, cx))
+                cx.new(|cx| Self::new(state_entity, window, cx))
             },
         )
     }
 
-    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = state.read(cx).settings.clone();
         let make_field = |value: &str, cx: &mut Context<Self>| {
             cx.new(|cx| {
@@ -56,7 +56,11 @@ impl SettingsView {
         let port_editor = make_field(&settings.backend_port.to_string(), cx);
         let workspace_editor = make_field(&settings.workspace_path, cx);
         let profile_editor = make_field(&settings.selected_profile, cx);
-        let token_editor = make_field(&settings.session_token, cx);
+        let token_editor = cx.new(|cx| {
+            let mut editor = Editor::wrapped_single_line(cx);
+            editor.set_text(&settings.session_token, cx);
+            editor
+        });
 
         // Persist edits straight into the settings store.
         let persist_host = {
@@ -129,21 +133,7 @@ impl SettingsView {
                 if *event == EditorEvent::Change {
                     let text = this.token_editor.read(cx).text().to_string();
                     token_state.update(cx, |state, _cx| {
-                        state.settings.session_token = text.clone();
-                        if state.settings.remember_session_token {
-                            let service = crate::keychain::main_credential_store();
-                            if text.trim().is_empty() {
-                                let _ = service.delete(&format!(
-                                    "{}.credential",
-                                    state.settings.backend_kind.id()
-                                ));
-                            } else {
-                                let _ = service.save(
-                                    &format!("{}.credential", state.settings.backend_kind.id()),
-                                    text.trim(),
-                                );
-                            }
-                        }
+                        state.settings.session_token = text;
                         state.settings.save();
                     });
                 }
@@ -152,6 +142,11 @@ impl SettingsView {
         .detach();
 
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe_window_appearance(window, |_, window, cx| {
+            window.refresh();
+            cx.notify();
+        })
+        .detach();
 
         Self {
             state,
@@ -166,8 +161,9 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.state.read(cx).settings.clone();
+        Theme::sync(settings.appearance, window.appearance());
         let (status_label, status_error, cache_summary, log_path, last_server_message) = {
             let state = self.state.read(cx);
             (
@@ -234,11 +230,41 @@ impl Render for SettingsView {
             ));
         root = root.child(backend_section);
 
+        let mut appearance_options = div().flex().flex_row().gap_2();
+        for mode in crate::settings::AppearanceMode::ALL {
+            let selected = settings.appearance == mode;
+            let state = state.clone();
+            appearance_options = appearance_options.child(render_menu_button(
+                format!("appearance-{}", mode.id()),
+                if selected {
+                    format!("✓ {}", mode.display_name())
+                } else {
+                    mode.display_name().to_string()
+                },
+                if selected {
+                    Theme::accent()
+                } else {
+                    Theme::text_secondary()
+                },
+                move |_event, window, cx| {
+                    state.update(cx, |state, cx| {
+                        state.settings.appearance = mode;
+                        state.settings.save();
+                        cx.notify();
+                    });
+                    window.refresh();
+                },
+            ));
+        }
+        root = root.child(section("Appearance").child(appearance_options).child(hint(
+            "System follows the current macOS light or dark appearance.",
+        )));
+
         // Connection section
         let mut connection = section("Connection");
         if uses_network {
             connection = connection
-                .child(field_row("Host", self.host_editor.clone()))
+                .child(field_row("Host or URL", self.host_editor.clone()))
                 .child(field_row("Port", self.port_editor.clone()))
                 .child(toggle_row(
                     "Use TLS (HTTPS/WSS)",
@@ -251,6 +277,8 @@ impl Render for SettingsView {
                 ))
                 .child(hint(if settings.is_managed_local_backend() {
                     "Local address: Hermit starts and manages hermes serve automatically."
+                } else if settings.backend_kind == crate::settings::BackendKind::OpenClaw {
+                    "For a reverse-proxy path, paste the complete ws:// or wss:// URL; it overrides Port and TLS."
                 } else {
                     "Hermit connects to an already-running server at this address."
                 }));
@@ -306,29 +334,10 @@ impl Render for SettingsView {
         let mut credentials = section("Credentials");
         if uses_network {
             credentials = credentials
-                .child(field_row(
+                .child(credential_field(
                     settings.backend_kind.credential_label(),
                     self.token_editor.clone(),
-                ))
-                .child(toggle_row(
-                    "Remember credential in Keychain",
-                    settings.remember_session_token,
-                    state.clone(),
-                    |state, _cx| {
-                        state.settings.remember_session_token =
-                            !state.settings.remember_session_token;
-                        let account = format!("{}.credential", state.settings.backend_kind.id());
-                        let service = crate::keychain::main_credential_store();
-                        if state.settings.remember_session_token {
-                            let token = state.settings.session_token.trim().to_string();
-                            if !token.is_empty() {
-                                let _ = service.save(&account, &token);
-                            }
-                        } else {
-                            let _ = service.delete(&account);
-                        }
-                        state.settings.save();
-                    },
+                    settings.session_token.trim().chars().count(),
                 ))
                 .child(hint(credential_help(settings.backend_kind)));
         } else {
@@ -347,8 +356,6 @@ impl Render for SettingsView {
                     token_editor.update(cx, |editor, cx| editor.clear(cx));
                     state.update(cx, |state, _cx| {
                         state.settings.session_token = String::new();
-                        let account = format!("{}.credential", state.settings.backend_kind.id());
-                        let _ = crate::keychain::main_credential_store().delete(&account);
                         state.settings.save();
                     });
                 }
@@ -544,6 +551,49 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
         .into_any()
 }
 
+fn credential_field(
+    label: &'static str,
+    editor: Entity<Editor>,
+    character_count: usize,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(Theme::text())
+                        .child(label),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(Theme::text_tertiary())
+                        .child(format!("{character_count} characters stored")),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(Theme::surface())
+                .border_1()
+                .border_color(Theme::border())
+                .text_size(px(12.0))
+                .child(editor),
+        )
+        .into_any()
+}
+
 fn toggle_row<F>(label: &'static str, is_on: bool, state: Entity<AppState>, apply: F) -> AnyElement
 where
     F: Fn(&mut AppState, &mut gpui::App) + 'static,
@@ -616,7 +666,7 @@ where
 }
 
 fn render_menu_button<F>(
-    id: &'static str,
+    id: impl Into<SharedString>,
     label: String,
     color: gpui::Hsla,
     on_click: F,
@@ -646,7 +696,7 @@ fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
     match kind {
         crate::settings::BackendKind::Hermes => "Local Hermes tokens are discovered automatically.",
         crate::settings::BackendKind::OpenClaw => {
-            "Use the token configured by OPENCLAW_GATEWAY_TOKEN or gateway.auth.token."
+            "Use gateway.auth.token. Hermit stores it in its local settings and keeps the paired-device token in its local app-data file."
         }
         crate::settings::BackendKind::OpenCode => {
             "Matches OPENCODE_SERVER_PASSWORD when server authentication is enabled."

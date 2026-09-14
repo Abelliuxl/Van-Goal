@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 /// Markdown block parser, a direct port of the SwiftUI MarkdownBlockParser:
 /// headings, paragraphs, bullets, numbered lists, quotes, fenced code, tables
 /// and separators. Inline markup is rendered by the view layer.
@@ -11,6 +13,283 @@ pub enum MarkdownBlock {
     Code(String),
     Table(Vec<String>, Vec<Vec<String>>),
     Separator,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineStyle {
+    Strong,
+    Emphasis,
+    Code,
+    Strikethrough,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineSpan {
+    pub range: Range<usize>,
+    pub style: InlineStyle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineLink {
+    pub range: Range<usize>,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineMarkdown {
+    pub text: String,
+    pub spans: Vec<InlineSpan>,
+    pub links: Vec<InlineLink>,
+}
+
+/// Parse the inline Markdown used inside headings, paragraphs, list items,
+/// quotes and table cells. Delimiters are removed from the visible text while
+/// byte ranges are retained for GPUI text highlighting and link hit testing.
+pub fn parse_inline(content: &str) -> InlineMarkdown {
+    let mut output = InlineMarkdown::default();
+    parse_inline_into(content, &mut output);
+    output
+}
+
+fn parse_inline_into(content: &str, output: &mut InlineMarkdown) {
+    let mut index = 0usize;
+    while index < content.len() {
+        let rest = &content[index..];
+
+        if rest.starts_with('\\') {
+            let escaped_start = index + 1;
+            if let Some(character) = content[escaped_start..].chars().next() {
+                if r#"\\`*_{}[]()#+-.!>|~"#.contains(character) {
+                    output.text.push(character);
+                    index = escaped_start + character.len_utf8();
+                    continue;
+                }
+            }
+        }
+
+        if rest.starts_with('`') {
+            let marker_len = rest.bytes().take_while(|byte| *byte == b'`').count();
+            let marker = &rest[..marker_len];
+            if let Some(close) = find_unescaped(content, marker, index + marker_len) {
+                let mut code = &content[index + marker_len..close];
+                if code.starts_with(' ') && code.ends_with(' ') && code.len() > 1 {
+                    code = &code[1..code.len() - 1];
+                }
+                append_literal(output, code, InlineStyle::Code);
+                index = close + marker_len;
+                continue;
+            }
+        }
+
+        if rest.starts_with("**") || rest.starts_with("__") {
+            let marker = &rest[..2];
+            if let Some(close) = find_strong_close(content, marker, index + 2) {
+                append_nested(output, &content[index + 2..close], InlineStyle::Strong);
+                index = close + 2;
+                continue;
+            }
+        }
+
+        if rest.starts_with("~~") {
+            if let Some(close) = find_unescaped(content, "~~", index + 2) {
+                append_nested(
+                    output,
+                    &content[index + 2..close],
+                    InlineStyle::Strikethrough,
+                );
+                index = close + 2;
+                continue;
+            }
+        }
+
+        if rest.starts_with("![") {
+            if let Some((label, url, end)) = parse_link_at(content, index + 1) {
+                let start = output.text.len();
+                output.text.push_str("Image: ");
+                parse_inline_into(label, output);
+                let range = start..output.text.len();
+                if is_link_target(url) {
+                    output.links.push(InlineLink {
+                        range,
+                        url: url.to_string(),
+                    });
+                }
+                index = end;
+                continue;
+            }
+        }
+
+        if rest.starts_with('[') {
+            if let Some((label, url, end)) = parse_link_at(content, index) {
+                let start = output.text.len();
+                parse_inline_into(label, output);
+                let range = start..output.text.len();
+                if !range.is_empty() && is_link_target(url) {
+                    output.links.push(InlineLink {
+                        range,
+                        url: url.to_string(),
+                    });
+                }
+                index = end;
+                continue;
+            }
+        }
+
+        if rest.starts_with('<') {
+            if let Some(close_offset) = rest.find('>') {
+                let candidate = &rest[1..close_offset];
+                if is_link_target(candidate) {
+                    let start = output.text.len();
+                    output.text.push_str(candidate);
+                    output.links.push(InlineLink {
+                        range: start..output.text.len(),
+                        url: candidate.to_string(),
+                    });
+                    index += close_offset + 1;
+                    continue;
+                }
+            }
+        }
+
+        if rest.starts_with("https://") || rest.starts_with("http://") {
+            let end_offset = rest
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    (offset > 0 && character.is_whitespace()).then_some(offset)
+                })
+                .unwrap_or(rest.len());
+            let mut candidate = &rest[..end_offset];
+            while candidate
+                .chars()
+                .next_back()
+                .is_some_and(|character| ['.', ',', ';', ':'].contains(&character))
+            {
+                candidate = &candidate[..candidate.len() - 1];
+            }
+            if !candidate.is_empty() {
+                let start = output.text.len();
+                output.text.push_str(candidate);
+                output.links.push(InlineLink {
+                    range: start..output.text.len(),
+                    url: candidate.to_string(),
+                });
+                index += candidate.len();
+                continue;
+            }
+        }
+
+        if (rest.starts_with('*') || rest.starts_with('_')) && can_open_emphasis(content, index) {
+            let marker = &rest[..1];
+            if let Some(close) = find_emphasis_close(content, marker, index + 1) {
+                append_nested(output, &content[index + 1..close], InlineStyle::Emphasis);
+                index = close + 1;
+                continue;
+            }
+        }
+
+        let character = rest.chars().next().expect("valid UTF-8 boundary");
+        output.text.push(character);
+        index += character.len_utf8();
+    }
+}
+
+fn append_literal(output: &mut InlineMarkdown, text: &str, style: InlineStyle) {
+    let start = output.text.len();
+    output.text.push_str(text);
+    if start < output.text.len() {
+        output.spans.push(InlineSpan {
+            range: start..output.text.len(),
+            style,
+        });
+    }
+}
+
+fn append_nested(output: &mut InlineMarkdown, text: &str, style: InlineStyle) {
+    let start = output.text.len();
+    parse_inline_into(text, output);
+    if start < output.text.len() {
+        output.spans.push(InlineSpan {
+            range: start..output.text.len(),
+            style,
+        });
+    }
+}
+
+fn find_unescaped(content: &str, marker: &str, mut from: usize) -> Option<usize> {
+    while from <= content.len() {
+        let offset = content[from..].find(marker)?;
+        let candidate = from + offset;
+        let slash_count = content[..candidate]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count();
+        if slash_count % 2 == 0 {
+            return Some(candidate);
+        }
+        from = candidate + marker.len();
+    }
+    None
+}
+
+fn find_strong_close(content: &str, marker: &str, from: usize) -> Option<usize> {
+    let close = find_unescaped(content, marker, from)?;
+    let marker_character = marker.chars().next()?;
+    if content[close + marker.len()..].starts_with(marker_character) {
+        Some(close + marker_character.len_utf8())
+    } else {
+        Some(close)
+    }
+}
+
+fn can_open_emphasis(content: &str, index: usize) -> bool {
+    let marker = content[index..].chars().next().unwrap_or('*');
+    let next = content[index + marker.len_utf8()..].chars().next();
+    if next.is_none_or(char::is_whitespace) {
+        return false;
+    }
+    if marker == '_' {
+        let previous = content[..index].chars().next_back();
+        if previous.is_some_and(char::is_alphanumeric) && next.is_some_and(char::is_alphanumeric) {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_emphasis_close(content: &str, marker: &str, mut from: usize) -> Option<usize> {
+    while let Some(candidate) = find_unescaped(content, marker, from) {
+        let before = content[..candidate].chars().next_back();
+        let after = content[candidate + marker.len()..].chars().next();
+        let doubled = content[candidate + marker.len()..].starts_with(marker);
+        let intraword_underscore = marker == "_"
+            && before.is_some_and(char::is_alphanumeric)
+            && after.is_some_and(char::is_alphanumeric);
+        if before.is_some_and(|character| !character.is_whitespace())
+            && !doubled
+            && !intraword_underscore
+        {
+            return Some(candidate);
+        }
+        from = candidate + marker.len();
+    }
+    None
+}
+
+fn parse_link_at(content: &str, open: usize) -> Option<(&str, &str, usize)> {
+    if !content[open..].starts_with('[') {
+        return None;
+    }
+    let label_end = find_unescaped(content, "](", open + 1)?;
+    let url_start = label_end + 2;
+    let url_end = find_unescaped(content, ")", url_start)?;
+    let label = &content[open + 1..label_end];
+    let url = content[url_start..url_end].trim();
+    Some((label, url, url_end + 1))
+}
+
+fn is_link_target(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://") || value.starts_with("mailto:")
 }
 
 pub fn parse(content: &str) -> Vec<MarkdownBlock> {
@@ -306,5 +585,44 @@ mod tests {
         // multi-line keeps "12.4 GB" intact
         let blocks = parse("Disk shows 12.4 GB free.\nAll good.");
         assert!(matches!(blocks[0], MarkdownBlock::Paragraph(_)));
+    }
+
+    #[test]
+    fn parses_common_inline_markdown_without_showing_delimiters() {
+        let inline = parse_inline(
+            "Use **bold and *italic***, `cargo test`, ~~old~~, and [docs](https://example.com).",
+        );
+        assert_eq!(
+            inline.text,
+            "Use bold and italic, cargo test, old, and docs."
+        );
+        assert!(inline
+            .spans
+            .iter()
+            .any(|span| span.style == InlineStyle::Strong
+                && &inline.text[span.range.clone()] == "bold and italic"));
+        assert!(inline
+            .spans
+            .iter()
+            .any(|span| span.style == InlineStyle::Emphasis
+                && &inline.text[span.range.clone()] == "italic"));
+        assert!(inline
+            .spans
+            .iter()
+            .any(|span| span.style == InlineStyle::Code
+                && &inline.text[span.range.clone()] == "cargo test"));
+        assert_eq!(inline.links.len(), 1);
+        assert_eq!(&inline.text[inline.links[0].range.clone()], "docs");
+        assert_eq!(inline.links[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn inline_parser_preserves_escapes_and_intraword_underscores() {
+        let inline = parse_inline(r"\*literal\* and snake_case plus <https://example.com>");
+        assert_eq!(
+            inline.text,
+            "*literal* and snake_case plus https://example.com"
+        );
+        assert_eq!(inline.links.len(), 1);
     }
 }

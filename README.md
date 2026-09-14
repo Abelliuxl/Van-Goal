@@ -18,7 +18,7 @@ Hermit GPUI is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit)
 - **Queue + clarify** — queue follow-up prompts while a turn is running (send now / edit / cancel), and answer Hermes clarify prompts from a tappable card or the composer.
 - **Model switcher** — pick any provider/model your Hermes config exposes, with a context-window meter.
 - **Permission modes** — Full access / Ask first / Restricted tools, applied through `hermes config set`.
-- **Native integration** — macOS Keychain credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
+- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
 
 ## Build
 
@@ -64,7 +64,14 @@ Backends are selectable in Settings; each adapter translates its native protocol
 
 Local CLI backends use the workspace directory configured in Settings and reuse the CLI's existing login. Hermes defaults to port `9119`, OpenCode/MiMoCode to `4096`, OpenClaw to `18789`.
 
-OpenClaw connections create a stable Ed25519 device identity in the Keychain and sign the Gateway challenge nonce. A new remote device may appear as pending in OpenClaw and must be approved once.
+OpenClaw connections create a stable Ed25519 device identity in Hermit's local app-data directory and sign the Gateway challenge nonce. A new remote device may appear as pending in OpenClaw and must be approved once.
+
+### Connect to OpenClaw
+
+1. Start the OpenClaw Gateway and note its host, port, TLS setting, and `gateway.auth.token`.
+2. Open Hermit Settings, choose **OpenClaw**, enter either a host/port or a complete `ws://` / `wss://` Gateway URL, and click **Connect to OpenClaw**. Complete URLs preserve reverse-proxy paths and override the separate Port and TLS fields.
+3. On the first connection, run `openclaw devices list` on the Gateway host and approve Hermit's exact pending request with `openclaw devices approve <requestId>`.
+4. Connect again. Hermit stores the issued device token in its local app-data directory and keeps Hermes and OpenClaw connection settings separate.
 
 ## Architecture
 
@@ -81,7 +88,7 @@ Hermit GPUI is deliberately a thin frontend — all agent capability lives in th
 | `ui/` | GPUI views: root shell, sidebar, chat, composer, editor, settings |
 | `editor.rs` | Multi-line text editor element built on GPUI text shaping |
 | `markdown.rs` | Block-level markdown parser shared with the renderer |
-| `cache.rs` / `keychain.rs` / `settings.rs` | On-disk cache, Keychain credentials, persisted settings |
+| `cache.rs` / `secret_store.rs` / `settings.rs` | On-disk cache, local credentials, persisted settings |
 
 ### Threading model
 
@@ -89,7 +96,7 @@ GPUI owns the main-thread UI executor. A multi-threaded tokio runtime is install
 
 ## Differences from the SwiftUI Hermit
 
-- Fixed dark theme (the SwiftUI version follows system appearance).
+- System, light, and dark appearance modes are available in Settings.
 - File attachments are added via the native open panel (the `+` button); drag-and-drop is not wired yet.
 - Inline markdown (bold/links) is not styled per-span yet; block-level structure is.
 

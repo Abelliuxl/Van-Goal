@@ -1,5 +1,9 @@
-use crate::markdown::MarkdownBlock;
-use gpui::{div, prelude::*, px, AnyElement, Div, ParentElement, Styled};
+use crate::markdown::{InlineStyle, MarkdownBlock};
+use gpui::{
+    combine_highlights, div, prelude::*, px, AnyElement, Div, FontStyle, FontWeight,
+    HighlightStyle, InteractiveText, ParentElement, StrikethroughStyle, Styled, StyledText,
+    UnderlineStyle,
+};
 
 const MAX_TABLE_COLUMNS: usize = 8;
 const MAX_TABLE_ROWS: usize = 80;
@@ -8,14 +12,15 @@ const CELL_MAX_WIDTH: f32 = 240.0;
 /// Render parsed markdown blocks as div-based layout. Strings wrap natively;
 /// code blocks scroll horizontally and tables get a simple grid.
 pub fn render_blocks(blocks: &[MarkdownBlock]) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .children(blocks.iter().map(render_block))
+    div().flex().flex_col().gap_2().children(
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| render_block(block, index as u64)),
+    )
 }
 
-fn render_block(block: &MarkdownBlock) -> AnyElement {
+fn render_block(block: &MarkdownBlock, seed: u64) -> AnyElement {
     match block {
         MarkdownBlock::Heading(level, text) => {
             let (size, weight) = match level {
@@ -27,13 +32,13 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
                 .font_weight(weight)
                 .text_size(size)
                 .text_color(crate::ui::theme::Theme::text())
-                .child(text.clone())
+                .child(render_inline(text, seed))
                 .into_any()
         }
         MarkdownBlock::Paragraph(text) => div()
             .text_size(px(13.0))
             .text_color(crate::ui::theme::Theme::text())
-            .child(text.clone())
+            .child(render_inline(text, seed))
             .into_any(),
         MarkdownBlock::Bullet(text) => div()
             .flex()
@@ -50,7 +55,7 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
                     .text_size(px(13.0))
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
-                    .child(text.clone()),
+                    .child(render_inline(text, seed)),
             )
             .into_any(),
         MarkdownBlock::Numbered(number, text) => div()
@@ -69,7 +74,7 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
                     .text_size(px(13.0))
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
-                    .child(text.clone()),
+                    .child(render_inline(text, seed)),
             )
             .into_any(),
         MarkdownBlock::Quote(text) => div()
@@ -78,7 +83,7 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
             .pl_2()
             .text_size(px(13.0))
             .text_color(crate::ui::theme::Theme::text_secondary())
-            .child(text.clone())
+            .child(render_inline(text, seed))
             .into_any(),
         MarkdownBlock::Code(text) => div()
             .id(gpui::ElementId::NamedInteger(
@@ -100,7 +105,7 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
                     .child(text.clone()),
             )
             .into_any(),
-        MarkdownBlock::Table(headers, rows) => render_table(headers, rows).into_any(),
+        MarkdownBlock::Table(headers, rows) => render_table(headers, rows, seed).into_any(),
         MarkdownBlock::Separator => div()
             .h(px(1.0))
             .w_full()
@@ -109,7 +114,78 @@ fn render_block(block: &MarkdownBlock) -> AnyElement {
     }
 }
 
-fn render_table(headers: &[String], rows: &[Vec<String>]) -> AnyElement {
+fn render_inline(source: &str, seed: u64) -> AnyElement {
+    let parsed = crate::markdown::parse_inline(source);
+    let span_highlights = parsed.spans.iter().map(|span| {
+        let style = match span.style {
+            InlineStyle::Strong => HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+            InlineStyle::Emphasis => HighlightStyle {
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            },
+            InlineStyle::Code => HighlightStyle {
+                background_color: Some(crate::ui::theme::Theme::code_bg()),
+                ..Default::default()
+            },
+            InlineStyle::Strikethrough => HighlightStyle {
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        (span.range.clone(), style)
+    });
+    let link_highlights = parsed.links.iter().map(|link| {
+        (
+            link.range.clone(),
+            HighlightStyle {
+                color: Some(crate::ui::theme::Theme::accent()),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    });
+    let highlights = combine_highlights(span_highlights, link_highlights).collect::<Vec<_>>();
+    let styled = StyledText::new(parsed.text).with_highlights(highlights);
+
+    if parsed.links.is_empty() {
+        return styled.into_any();
+    }
+
+    let ranges = parsed
+        .links
+        .iter()
+        .map(|link| link.range.clone())
+        .collect::<Vec<_>>();
+    let urls = parsed
+        .links
+        .into_iter()
+        .map(|link| link.url)
+        .collect::<Vec<_>>();
+    InteractiveText::new(
+        gpui::ElementId::NamedInteger(
+            "markdown-inline".into(),
+            crate::ui::hash_id(source).wrapping_add(seed),
+        ),
+        styled,
+    )
+    .on_click(ranges, move |index, _window, cx| {
+        if let Some(url) = urls.get(index) {
+            cx.open_url(url);
+        }
+    })
+    .into_any()
+}
+
+fn render_table(headers: &[String], rows: &[Vec<String>], seed: u64) -> AnyElement {
     let column_count = headers
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0))
@@ -126,7 +202,13 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> AnyElement {
             .flex()
             .flex_row()
             .bg(crate::ui::theme::Theme::tool_bg())
-            .children((0..column_count).map(|column| table_cell(cell_text(headers, column), true)))
+            .children((0..column_count).map(|column| {
+                table_cell(
+                    cell_text(headers, column),
+                    true,
+                    seed.wrapping_mul(1000).wrapping_add(column as u64),
+                )
+            }))
             .into_any(),
     );
     children.push(
@@ -142,7 +224,14 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> AnyElement {
             div()
                 .flex()
                 .flex_row()
-                .children((0..column_count).map(|column| table_cell(cell_text(row, column), false)))
+                .children((0..column_count).map(|column| {
+                    table_cell(
+                        cell_text(row, column),
+                        false,
+                        seed.wrapping_mul(1000)
+                            .wrapping_add(((row_index + 1) * column_count + column) as u64),
+                    )
+                }))
                 .into_any(),
         );
         if row_index + 1 < visible_rows.len() {
@@ -183,7 +272,7 @@ fn render_table(headers: &[String], rows: &[Vec<String>]) -> AnyElement {
     table.into_any()
 }
 
-fn table_cell(text: String, is_header: bool) -> gpui::AnyElement {
+fn table_cell(text: String, is_header: bool, seed: u64) -> gpui::AnyElement {
     let mut cell = div()
         .px_2()
         .py_1()
@@ -200,7 +289,7 @@ fn table_cell(text: String, is_header: bool) -> gpui::AnyElement {
     if is_header {
         cell = cell.font_weight(gpui::FontWeight::SEMIBOLD);
     }
-    cell.child(text).into_any()
+    cell.child(render_inline(&text, seed)).into_any()
 }
 
 fn cell_text(cells: &[String], index: usize) -> String {

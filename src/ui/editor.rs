@@ -8,7 +8,10 @@ use gpui::{
     UTF16Selection, Window, WrappedLine,
 };
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_segmentation::UnicodeSegmentation;
+
+static NEXT_EDITOR_ID: AtomicU64 = AtomicU64::new(1);
 
 actions!(
     editor,
@@ -74,6 +77,8 @@ struct LineEntry {
 }
 
 pub struct Editor {
+    hitbox_id: SharedString,
+    element_id: SharedString,
     focus_handle: FocusHandle,
     content: String,
     placeholder: SharedString,
@@ -86,19 +91,29 @@ pub struct Editor {
     max_rows: f32,
     /// Single-line fields hide newlines and use input cursor style.
     single_line: bool,
+    /// Long single values such as credentials may wrap visually while still
+    /// rejecting embedded line breaks and submitting on Enter.
+    wrap_long_lines: bool,
 }
 
 impl Editor {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self::new_with(cx, false)
+        Self::new_with(cx, false, true)
     }
 
     pub fn single_line(cx: &mut Context<Self>) -> Self {
-        Self::new_with(cx, true)
+        Self::new_with(cx, true, false)
     }
 
-    fn new_with(cx: &mut Context<Self>, single_line: bool) -> Self {
+    pub fn wrapped_single_line(cx: &mut Context<Self>) -> Self {
+        Self::new_with(cx, true, true)
+    }
+
+    fn new_with(cx: &mut Context<Self>, single_line: bool, wrap_long_lines: bool) -> Self {
+        let id = NEXT_EDITOR_ID.fetch_add(1, Ordering::Relaxed);
         Self {
+            hitbox_id: format!("editor-hitbox-{id}").into(),
+            element_id: format!("editor-element-{id}").into(),
             focus_handle: cx.focus_handle(),
             content: String::new(),
             placeholder: "Type here…".into(),
@@ -110,6 +125,7 @@ impl Editor {
             is_selecting: false,
             max_rows: if single_line { 1.0 } else { 8.0 },
             single_line,
+            wrap_long_lines,
         }
     }
 
@@ -127,7 +143,12 @@ impl Editor {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
-        self.content = text.into();
+        let text = text.into();
+        self.content = if self.single_line {
+            normalize_single_line(&text)
+        } else {
+            text
+        };
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
@@ -149,20 +170,23 @@ impl Editor {
     // -- movement ---------------------------------------------------------
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
         cx.notify();
     }
 
     fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
+        let offset = if self.selection_reversed {
             self.selected_range.start
         } else {
             self.selected_range.end
-        }
+        };
+        self.clamp(offset)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -172,11 +196,31 @@ impl Editor {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.selected_range = self.clamp_range(self.selected_range.clone());
         cx.notify();
     }
 
+    /// Clamp `offset` into the content *and* onto a character boundary. Every
+    /// range the editor stores has to stay valid for slicing `content`, no
+    /// matter what offsets AppKit hands us.
     fn clamp(&self, offset: usize) -> usize {
-        offset.min(self.content.len())
+        let mut offset = offset.min(self.content.len());
+        while offset > 0 && !self.content.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    /// Same as [`Self::clamp`], for both ends of a range. Inverted ranges are
+    /// normalized instead of panicking on `start > end`.
+    fn clamp_range(&self, range: Range<usize>) -> Range<usize> {
+        let (start, end) = if range.start <= range.end {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+        let start = self.clamp(start);
+        start..self.clamp(end).max(start)
     }
 
     /// Start-of-line (or start-of-text for Home) index.
@@ -213,38 +257,23 @@ impl Editor {
 
     // -- utf16 mapping (IME) ----------------------------------------------
 
+    /// Byte offsets of AppKit's utf16 ranges. Always lands on a character
+    /// boundary, so the result is safe to slice `content` with.
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        byte_offset_from_utf16(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-        utf16_offset
+        utf16_offset_from_byte(&self.content, self.clamp(offset))
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        let range = self.clamp_range(range.clone());
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+        self.clamp_range(self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end))
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -261,11 +290,12 @@ impl Editor {
             let span = px(ROW_HEIGHT * rows as f32);
             if position.y >= top && position.y <= top + span {
                 let local = point(position.x - bounds.left(), position.y - top);
-                return entry.byte_start
+                let offset = entry.byte_start
                     + entry
                         .line
                         .closest_index_for_position(local, line_height)
                         .unwrap_or_else(|closest| closest);
+                return self.clamp(offset);
             }
         }
         // Below/above all lines: clamp to start or end.
@@ -291,17 +321,30 @@ impl Editor {
         new_text: &str,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked_range.clone())
-            .unwrap_or_else(|| self.selected_range.clone());
+        let new_text = if self.single_line {
+            normalize_single_line(new_text)
+        } else {
+            new_text.to_string()
+        };
+        // AppKit's replacement range wins, then the live marked text, then the
+        // selection. Whatever we get gets clamped: a stale range (AppKit
+        // replays ranges from before the app cleared or rewrote the editor)
+        // must never slice out of bounds, because that panic unwinds across
+        // the Objective-C boundary and aborts the whole app.
+        let range = self.clamp_range(
+            range_utf16
+                .as_ref()
+                .map(|range| self.range_from_utf16(range))
+                .or_else(|| self.marked_range.clone())
+                .unwrap_or_else(|| self.selected_range.clone()),
+        );
+        let cursor = range.start + new_text.len();
         self.content = format!(
             "{}{new_text}{}",
             &self.content[..range.start],
             &self.content[range.end..]
         );
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selected_range = cursor..cursor;
         self.marked_range = None;
         cx.emit(EditorEvent::Change);
         cx.notify();
@@ -434,17 +477,19 @@ impl Editor {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        let range = self.clamp_range(self.selected_range.clone());
+        if !range.is_empty() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[range].to_string(),
             ));
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        let range = self.clamp_range(self.selected_range.clone());
+        if !range.is_empty() {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
+                self.content[range].to_string(),
             ));
             self.replace_text_in_range_internal(None, "", cx);
         }
@@ -492,7 +537,7 @@ impl Editor {
     }
 
     fn estimated_rows(&self) -> usize {
-        if self.single_line {
+        if self.single_line && !self.wrap_long_lines {
             return 1;
         }
         let logical_lines = self.content.split('\n').count().max(1);
@@ -503,6 +548,213 @@ impl Editor {
             .map(|line| line.len().saturating_sub(1) / 90)
             .sum();
         (logical_lines + wraps).max(1)
+    }
+}
+
+fn normalize_single_line(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect()
+}
+
+/// Byte offset of a utf16 offset inside `text`, clamped to `text.len()`.
+///
+/// AppKit speaks utf16 (`NSRange`), the editor stores byte offsets. Iterating
+/// whole characters keeps the result on a character boundary.
+fn byte_offset_from_utf16(text: &str, offset: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for character in text.chars() {
+        if utf16_count >= offset {
+            break;
+        }
+        utf16_count += character.len_utf16();
+        utf8_offset += character.len_utf8();
+    }
+    utf8_offset
+}
+
+/// The inverse of [`byte_offset_from_utf16`].
+fn utf16_offset_from_byte(text: &str, offset: usize) -> usize {
+    let mut utf16_offset = 0;
+    let mut utf8_count = 0;
+    for character in text.chars() {
+        if utf8_count >= offset {
+            break;
+        }
+        utf8_count += character.len_utf8();
+        utf16_offset += character.len_utf16();
+    }
+    utf16_offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, Empty, TestAppContext, VisualTestContext};
+
+    #[test]
+    fn pasted_single_line_values_drop_terminal_line_breaks() {
+        assert_eq!(normalize_single_line("gateway-token\r\n"), "gateway-token");
+    }
+
+    // -- macOS input method (IMKit/AppKit) drivers -------------------------
+    //
+    // AppKit talks to the editor through `EntityInputHandler` with NSRange
+    // utf16 offsets: `setMarkedText:selectedRange:replacementRange:` arrives
+    // as `replace_and_mark_text_in_range`, `insertText:replacementRange:` as
+    // `replace_text_in_range`, and `unmarkText` as `unmark_text`. The
+    // `selectedRange` is relative to the *new marked text*, `replacementRange`
+    // is in document coordinates (or none for NSNotFound).
+
+    fn appkit_set_marked_text(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        text: &str,
+        selected_range: Option<(usize, usize)>,
+        replacement_range: Option<(usize, usize)>,
+    ) {
+        let selected_range = selected_range.map(|(location, length)| location..location + length);
+        let replacement_range =
+            replacement_range.map(|(location, length)| location..location + length);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_and_mark_text_in_range(
+                replacement_range,
+                text,
+                selected_range,
+                window,
+                cx,
+            )
+        });
+    }
+
+    fn appkit_insert_text(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        text: &str,
+        replacement_range: Option<(usize, usize)>,
+    ) {
+        let replacement_range =
+            replacement_range.map(|(location, length)| location..location + length);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.replace_text_in_range(replacement_range, text, window, cx)
+        });
+    }
+
+    fn appkit_unmark_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+        editor.update_in(cx, |editor, window, cx| editor.unmark_text(window, cx));
+    }
+
+    /// `markedRange` as AppKit reads it back from the editor.
+    fn appkit_marked_range(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(usize, usize)> {
+        editor
+            .update_in(cx, |editor, window, cx| {
+                editor.marked_text_range(window, cx)
+            })
+            .map(|range| (range.start, range.end - range.start))
+    }
+
+    fn editor_state(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) -> (String, Range<usize>, Option<Range<usize>>) {
+        editor.update_in(cx, |editor, _, _| {
+            (
+                editor.content.clone(),
+                editor.selected_range.clone(),
+                editor.marked_range.clone(),
+            )
+        })
+    }
+
+    /// Every range the editor keeps must be usable for slicing `content`.
+    fn assert_ranges_in_bounds(editor: &Entity<Editor>, cx: &mut VisualTestContext, step: &str) {
+        let (content, selected, marked) = editor_state(editor, cx);
+        for (name, range) in [("selected_range", Some(selected)), ("marked_range", marked)] {
+            let Some(range) = range else { continue };
+            assert!(
+                range.start <= range.end && range.end <= content.len(),
+                "{step}: {name} {range:?} escapes content of {} bytes ({content:?})",
+                content.len()
+            );
+            assert!(
+                content.is_char_boundary(range.start) && content.is_char_boundary(range.end),
+                "{step}: {name} {range:?} is not on char boundaries ({content:?})"
+            );
+        }
+    }
+
+    fn pinyin_commit(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+        keys: &str,
+        commit: &str,
+    ) {
+        for (index, _) in keys.char_indices().skip(1) {
+            let marked = appkit_marked_range(editor, cx);
+            let composition = &keys[..index];
+            appkit_set_marked_text(
+                editor,
+                cx,
+                composition,
+                Some((composition.chars().count(), 0)),
+                marked,
+            );
+            assert_ranges_in_bounds(editor, cx, &format!("composing {composition}"));
+        }
+        let marked = appkit_marked_range(editor, cx);
+        appkit_set_marked_text(editor, cx, keys, Some((keys.chars().count(), 0)), marked);
+        assert_ranges_in_bounds(editor, cx, &format!("composing {keys}"));
+        appkit_insert_text(editor, cx, commit, None);
+        assert_ranges_in_bounds(editor, cx, &format!("committing {commit}"));
+    }
+
+    #[gpui::test]
+    fn ime_unmark_then_ascii_insert_does_not_slice_out_of_bounds(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::wrapped_single_line(cx));
+        let (_root, cx) = cx.add_window_view(|_window, _cx| Empty);
+
+        // Compose "ni" (AppKit passes the live `markedRange` as replacementRange).
+        appkit_set_marked_text(&editor, cx, "n", Some((1, 0)), None);
+        let marked = appkit_marked_range(&editor, cx);
+        appkit_set_marked_text(&editor, cx, "ni", Some((2, 0)), marked);
+
+        // AppKit unmarks, then delivers the next key with replacementRange = NSNotFound.
+        appkit_unmark_text(&editor, cx);
+        appkit_insert_text(&editor, cx, "x", None);
+
+        let (content, selected, marked) = editor_state(&editor, cx);
+        assert_eq!(content, "nix");
+        assert_eq!(selected, content.len()..content.len());
+        assert_eq!(marked, None);
+    }
+
+    #[gpui::test]
+    fn pinyin_session_over_committed_chinese_stays_in_bounds(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::wrapped_single_line(cx));
+        let (_root, cx) = cx.add_window_view(|_window, _cx| Empty);
+
+        // Pinyin/Chinese typing, as the user does in the composer.
+        pinyin_commit(&editor, cx, "nihao", "你好");
+        appkit_insert_text(&editor, cx, " ", None);
+        pinyin_commit(&editor, cx, "shi", "是");
+        appkit_insert_text(&editor, cx, " ", None);
+        pinyin_commit(&editor, cx, "zhongguo", "中国");
+
+        // AppKit unmarks the composition and then delivers the next keystroke
+        // with `replacementRange = NSNotFound` (plain ASCII insert).
+        appkit_unmark_text(&editor, cx);
+        assert_ranges_in_bounds(&editor, cx, "after unmarkText");
+        appkit_insert_text(&editor, cx, "!", None);
+        assert_ranges_in_bounds(&editor, cx, "after ascii insert");
+
+        let (content, selected, marked) = editor_state(&editor, cx);
+        assert_eq!(content, "你好 是 中国!");
+        assert_eq!(selected, content.len()..content.len());
+        assert_eq!(marked, None);
     }
 }
 
@@ -524,7 +776,7 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp_range(self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
     }
@@ -550,7 +802,6 @@ impl EntityInputHandler for Editor {
             .as_ref()
             .map(|range| self.range_to_utf16(range))
     }
-
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.marked_range = None;
     }
@@ -573,26 +824,38 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked_range.clone())
-            .unwrap_or_else(|| self.selected_range.clone());
+        let range = self.clamp_range(
+            range_utf16
+                .as_ref()
+                .map(|range| self.range_from_utf16(range))
+                .or_else(|| self.marked_range.clone())
+                .unwrap_or_else(|| self.selected_range.clone()),
+        );
         self.content = format!(
             "{}{new_text}{}",
             &self.content[..range.start],
             &self.content[range.end..]
         );
-        if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        } else {
+        let marked_end = range.start + new_text.len();
+        if new_text.is_empty() {
             self.marked_range = None;
+        } else {
+            self.marked_range = Some(range.start..marked_end);
         }
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        // AppKit's `selectedRange` is relative to the marked text it just
+        // handed us, *not* to the document: measure it against `new_text` and
+        // anchor it at the insertion point. Measuring it against the whole
+        // content (as this used to) walks the cursor further past the end with
+        // every utf8/utf16 length mismatch, which used to panic - and abort -
+        // the app on later keystrokes.
+        let selected_range = new_selected_range_utf16
+            .map(|range_utf16| {
+                let start = byte_offset_from_utf16(new_text, range_utf16.start);
+                let end = byte_offset_from_utf16(new_text, range_utf16.end).max(start);
+                range.start + start..range.start + end
+            })
+            .unwrap_or(marked_end..marked_end);
+        self.selected_range = self.clamp_range(selected_range);
         cx.emit(EditorEvent::Change);
         cx.notify();
     }
@@ -604,12 +867,17 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let range = self.range_from_utf16(&range_utf16);
+        let range = self.clamp_range(self.range_from_utf16(&range_utf16));
         let row = self.row_for_byte(range.start)?;
         let entry = &self.lines[row];
+        // `lines` may lag one frame behind `content`, so stay inside the line.
+        let offset_in_line = range
+            .start
+            .saturating_sub(entry.byte_start)
+            .min(entry.line.len());
         let local = entry
             .line
-            .position_for_index(range.start - entry.byte_start, px(ROW_HEIGHT))?;
+            .position_for_index(offset_in_line, px(ROW_HEIGHT))?;
         let top = bounds.top() + px(self.rows_above(row) as f32 * ROW_HEIGHT);
         Some(Bounds::new(
             point(bounds.left() + local.x, top),
@@ -623,7 +891,7 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.index_for_mouse_position(point))
+        Some(self.clamp(self.index_for_mouse_position(point)))
     }
 }
 
@@ -908,8 +1176,9 @@ impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let single_line = self.single_line;
+        let wrap_long_lines = self.wrap_long_lines;
         div()
-            .id("editor-hitbox")
+            .id(self.hitbox_id.clone())
             .flex()
             .key_context("Editor")
             .track_focus(&self.focus_handle(cx))
@@ -941,9 +1210,9 @@ impl Render for Editor {
             .line_height(gpui::px(ROW_HEIGHT))
             .child(
                 div()
-                    .id("editor-element")
+                    .id(self.element_id.clone())
                     .w_full()
-                    .when(single_line, |this| {
+                    .when(single_line && !wrap_long_lines, |this| {
                         this.overflow_x_scroll().whitespace_nowrap()
                     })
                     .child(EditorElement { entity }),

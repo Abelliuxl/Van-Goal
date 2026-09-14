@@ -46,6 +46,7 @@ pub struct AppState {
     pub is_sending: bool,
     pub is_refreshing_sessions: bool,
     pub transport_ready: bool,
+    gateway_connecting: bool,
     pub pending_queue: Vec<QueuedPrompt>,
     pub pending_clarify: Option<PendingClarify>,
     pub last_error: Option<String>,
@@ -121,6 +122,7 @@ impl AppState {
             is_sending: false,
             is_refreshing_sessions: false,
             transport_ready: false,
+            gateway_connecting: false,
             pending_queue: Vec::new(),
             pending_clarify: None,
             last_error: None,
@@ -221,7 +223,7 @@ impl AppState {
     fn backend_config(&self) -> BackendConfig {
         BackendConfig {
             base_url: self.settings.active_backend_url(),
-            credential: self.settings.session_token.clone(),
+            credential: self.settings.session_token.trim().to_string(),
             profile: self.settings.normalized_profile(),
             workspace: self.settings.workspace_trimmed(),
         }
@@ -324,7 +326,6 @@ impl AppState {
                         state.settings.session_token = token;
                         state.settings.save();
                     }
-                    state.connection_state = ConnectionState::Connected;
                     state.connect_gateway(cx);
                     state.refresh_sessions(false, cx);
                     if let Some(session) = state.selected_session.clone() {
@@ -341,7 +342,7 @@ impl AppState {
 
     /// Opens the backend's event stream onto the shared channel.
     fn connect_gateway(&mut self, cx: &mut gpui::Context<Self>) {
-        if self.transport_ready {
+        if self.transport_ready || self.gateway_connecting {
             return;
         }
         if self.settings.backend_kind == BackendKind::Hermes
@@ -350,6 +351,7 @@ impl AppState {
             self.connection_state = ConnectionState::Failed("Missing Hermes session token".into());
             return;
         }
+        self.gateway_connecting = true;
         let backend = self.backend.clone();
         let config = self.backend_config();
         let event_tx = self.event_tx.clone();
@@ -360,11 +362,15 @@ impl AppState {
             let result = join
                 .await
                 .unwrap_or(Err(anyhow::anyhow!("connect task failed")));
-            let _ = this.update(cx, |state, _cx| {
+            let _ = this.update(cx, |state, cx| {
+                state.gateway_connecting = false;
                 if let Err(error) = result {
+                    state.transport_ready = false;
+                    state.connection_state = ConnectionState::Failed(error.to_string());
                     state.last_error = Some(error.to_string());
                     log_debug!("app", "gateway connect failed: {error}");
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -1067,6 +1073,7 @@ impl AppState {
         self.backend_display_name = backend_static_name(kind);
         self.backend_caps = self.backend_caps_for(kind);
         self.transport_ready = false;
+        self.gateway_connecting = false;
         self.connection_state = ConnectionState::Disconnected;
         self.selected_session = None;
         let cached_sessions = self.cached_state.sessions.clone();
@@ -1092,6 +1099,7 @@ impl AppState {
             backend.lock().await.disconnect();
         });
         self.transport_ready = false;
+        self.gateway_connecting = false;
         self.connection_state = ConnectionState::Disconnected;
         cx.notify();
     }
@@ -1115,7 +1123,9 @@ impl AppState {
         match event {
             AgentEvent::Connected => {
                 self.transport_ready = true;
+                self.gateway_connecting = false;
                 self.connection_state = ConnectionState::Connected;
+                self.last_error = None;
             }
             AgentEvent::SessionInfo(session_id) => {
                 self.live_gateway_session_id = Some(session_id.clone());
@@ -1170,6 +1180,7 @@ impl AppState {
             }
             AgentEvent::Disconnected => {
                 self.transport_ready = false;
+                self.gateway_connecting = false;
                 self.pending_clarify = None;
                 if self.connection_state == ConnectionState::Connected {
                     self.connection_state = ConnectionState::Disconnected;
@@ -1177,6 +1188,7 @@ impl AppState {
             }
             AgentEvent::Failed(message) => {
                 self.transport_ready = false;
+                self.gateway_connecting = false;
                 self.pending_clarify = None;
                 self.connection_state = ConnectionState::Failed(message.clone());
                 self.last_error = Some(message);

@@ -2,11 +2,11 @@ mod agent;
 mod cache;
 mod hermes_config;
 mod jsonl_process;
-mod keychain;
 mod local_server;
 mod logger;
 mod markdown;
 mod models;
+mod secret_store;
 mod settings;
 mod state;
 mod ui;
@@ -47,7 +47,7 @@ fn open_main_window(
             window_min_size: Some(size(px(560.0), px(480.0))),
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| RootView::new(state, cx)),
+        |window, cx| cx.new(|cx| RootView::new(state, window, cx)),
     )
 }
 
@@ -104,6 +104,9 @@ fn main() {
                 log_debug!("app", "failed to open main window: {error}");
             }
         }
+
+        let state = cx.global::<StateGlobal>().0.clone();
+        state.update(cx, |state, cx| state.bootstrap(cx));
 
         // App-level actions.
         cx.on_action(|_: &Quit, cx| cx.quit());

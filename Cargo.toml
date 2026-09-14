@@ -47,13 +47,15 @@ sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 
-# macOS Keychain
-security-framework = "3"
-
 # Native open panel for composer attachments
 rfd = "0.15"
 
 chrono = { version = "0.4", features = ["serde", "clock"] }
+
+[dev-dependencies]
+# `test-support` exposes gpui's TestAppContext/TestPlatform so the editor's
+# EntityInputHandler (macOS IME) paths can be driven in unit tests.
+gpui = { version = "0.2.2", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

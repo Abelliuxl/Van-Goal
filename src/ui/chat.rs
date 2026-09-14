@@ -29,14 +29,32 @@ impl ChatView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(cx);
-            editor.set_placeholder("Ask Hermes for follow-up changes", cx);
+            editor.set_placeholder("Ask your agent for follow-up changes", cx);
             editor
         });
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&state, |this, state, cx| {
+            let composer_text = state.read(cx).composer_text.clone();
+            if this.editor.read(cx).text() != composer_text {
+                this.editor.update(cx, |editor, cx| {
+                    editor.set_text(composer_text, cx);
+                });
+            }
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
-            if *event == EditorEvent::Submit {
-                let state = this.state.clone();
-                state.update(cx, |state, cx| state.send_composer(cx));
+            let state = this.state.clone();
+            match event {
+                EditorEvent::Change => {
+                    let text = this.editor.read(cx).text().to_string();
+                    state.update(cx, |state, cx| {
+                        state.composer_text = text;
+                        cx.notify();
+                    });
+                }
+                EditorEvent::Submit => {
+                    state.update(cx, |state, cx| state.send_composer(cx));
+                }
             }
         })
         .detach();
@@ -135,7 +153,9 @@ impl Render for ChatView {
 
 impl ChatView {
     fn render_message_list(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let is_empty = self.state.read(cx).messages.is_empty();
+        let state = self.state.read(cx);
+        let is_empty = state.messages.is_empty();
+        let backend_name = state.backend_display_name().to_string();
 
         if is_empty {
             return div()
@@ -162,9 +182,9 @@ impl ChatView {
                             div()
                                 .text_size(px(13.0))
                                 .text_color(Theme::text_secondary())
-                                .child(
-                                    "Hermit will start local Hermes when needed. Send a message or resume a session from the sidebar.",
-                                ),
+                                .child(format!(
+                                    "Hermit is ready to use {backend_name}. Send a message or resume a session from the sidebar."
+                                )),
                         ),
                 )
                 .into_any();
@@ -188,7 +208,9 @@ impl ChatView {
     }
 
     fn render_clarify_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let clarify = self.state.read(cx).pending_clarify.clone()?;
+        let state_snapshot = self.state.read(cx);
+        let clarify = state_snapshot.pending_clarify.clone()?;
+        let backend_name = state_snapshot.backend_display_name().to_string();
         let state = self.state.clone();
 
         let mut card = div()
@@ -214,7 +236,7 @@ impl ChatView {
                             .text_size(px(11.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text_secondary())
-                            .child("Hermes needs your confirmation"),
+                            .child(format!("{backend_name} needs your confirmation")),
                     )
                     .child(div().flex_1())
                     .child(
@@ -316,7 +338,7 @@ impl ChatView {
                     .selected_session
                     .as_ref()
                     .and_then(|session| session.model.clone())
-                    .unwrap_or_else(|| "Hermes".to_string())
+                    .unwrap_or_else(|| state.backend_display_name().to_string())
             } else {
                 configured
             }
@@ -852,7 +874,7 @@ fn render_message_bubble(
                         div()
                             .text_size(px(13.0))
                             .text_color(Theme::text())
-                            .child(message.content.clone()),
+                            .child(render_blocks(&markdown::parse(&message.content))),
                     ),
             )
             .into_any(),
@@ -887,18 +909,7 @@ fn render_message_bubble(
             }
 
             if !message.content.trim().is_empty() {
-                if message.is_streaming {
-                    let table_like = markdown::contains_markdown_table(&message.content);
-                    bubble = bubble.child(
-                        div()
-                            .text_size(px(13.0))
-                            .when(table_like, |this| this.font_family("Menlo"))
-                            .text_color(Theme::text())
-                            .child(message.content.clone()),
-                    );
-                } else {
-                    bubble = bubble.child(render_blocks(&markdown::parse(&message.content)));
-                }
+                bubble = bubble.child(render_blocks(&markdown::parse(&message.content)));
             }
 
             if !message.is_streaming && !message.content.trim().is_empty() {

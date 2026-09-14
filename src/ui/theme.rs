@@ -1,69 +1,94 @@
-use gpui::{hsla, rgb, Hsla};
+use crate::settings::AppearanceMode;
+use gpui::{hsla, rgb, Hsla, WindowAppearance};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Fixed dark theme for Hermit GPUI (v1). Derived from the SwiftUI app's
-/// visual language but tuned for a GPUI-rendered dark surface.
+static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+
+/// App-wide adaptive palette. The active variant is synchronized at the start
+/// of each window render so child views can keep using the compact Theme API.
 pub struct Theme;
 
 impl Theme {
+    pub fn sync(preference: AppearanceMode, system: WindowAppearance) {
+        let light = match preference {
+            AppearanceMode::System => {
+                matches!(
+                    system,
+                    WindowAppearance::Light | WindowAppearance::VibrantLight
+                )
+            }
+            AppearanceMode::Light => true,
+            AppearanceMode::Dark => false,
+        };
+        LIGHT_THEME.store(light, Ordering::Relaxed);
+    }
+
+    fn is_light() -> bool {
+        LIGHT_THEME.load(Ordering::Relaxed)
+    }
+
     pub fn window_bg() -> Hsla {
-        rgb(0x141416).into()
+        rgb(if Self::is_light() { 0xf7f7f9 } else { 0x141416 }).into()
     }
     pub fn sidebar_bg() -> Hsla {
-        rgb(0x1a1a1e).into()
+        rgb(if Self::is_light() { 0xefeff3 } else { 0x1a1a1e }).into()
     }
     pub fn surface() -> Hsla {
-        rgb(0x202024).into()
+        rgb(if Self::is_light() { 0xffffff } else { 0x202024 }).into()
     }
     pub fn surface_hover() -> Hsla {
-        rgb(0x28282e).into()
+        rgb(if Self::is_light() { 0xe8eaf0 } else { 0x28282e }).into()
     }
     pub fn input_bg() -> Hsla {
-        rgb(0x1c1c21).into()
+        rgb(if Self::is_light() { 0xf3f3f6 } else { 0x1c1c21 }).into()
     }
     pub fn border() -> Hsla {
-        rgb(0x2c2c33).into()
+        rgb(if Self::is_light() { 0xd9d9e0 } else { 0x2c2c33 }).into()
     }
     pub fn border_strong() -> Hsla {
-        rgb(0x3a3a44).into()
+        rgb(if Self::is_light() { 0xc4c4ce } else { 0x3a3a44 }).into()
     }
     pub fn text() -> Hsla {
-        rgb(0xe8e8ec).into()
+        rgb(if Self::is_light() { 0x202126 } else { 0xe8e8ec }).into()
     }
     pub fn text_secondary() -> Hsla {
-        rgb(0x9b9ba6).into()
+        rgb(if Self::is_light() { 0x5f616b } else { 0x9b9ba6 }).into()
     }
     pub fn text_tertiary() -> Hsla {
-        rgb(0x6d6d78).into()
+        rgb(if Self::is_light() { 0x858894 } else { 0x6d6d78 }).into()
     }
     pub fn accent() -> Hsla {
-        rgb(0x4f8cff).into()
+        rgb(if Self::is_light() { 0x276df1 } else { 0x4f8cff }).into()
     }
     pub fn accent_soft() -> Hsla {
-        rgba_hex(0x4f8cff, 0.16)
+        rgba_hex(
+            if Self::is_light() { 0x276df1 } else { 0x4f8cff },
+            if Self::is_light() { 0.12 } else { 0.16 },
+        )
     }
     pub fn user_bubble() -> Hsla {
-        rgb(0x2c3b58).into()
+        rgb(if Self::is_light() { 0xdce8ff } else { 0x2c3b58 }).into()
     }
     pub fn tool_bg() -> Hsla {
-        rgba_hex(0xffffff, 0.05)
+        rgba_hex(if Self::is_light() { 0x000000 } else { 0xffffff }, 0.05)
     }
     pub fn clarify_bg() -> Hsla {
-        rgba_hex(0x4f8cff, 0.10)
+        rgba_hex(if Self::is_light() { 0x276df1 } else { 0x4f8cff }, 0.10)
     }
     pub fn danger() -> Hsla {
-        rgb(0xff5f57).into()
+        rgb(if Self::is_light() { 0xd93f38 } else { 0xff5f57 }).into()
     }
     pub fn warn() -> Hsla {
-        rgb(0xf5a623).into()
+        rgb(if Self::is_light() { 0xb86600 } else { 0xf5a623 }).into()
     }
     pub fn ok() -> Hsla {
-        rgb(0x34c759).into()
+        rgb(if Self::is_light() { 0x21883c } else { 0x34c759 }).into()
     }
     pub fn code_bg() -> Hsla {
-        rgb(0x1b1b20).into()
+        rgb(if Self::is_light() { 0xedeef2 } else { 0x1b1b20 }).into()
     }
     pub fn quote_bar() -> Hsla {
-        rgba_hex(0xffffff, 0.25)
+        rgba_hex(if Self::is_light() { 0x000000 } else { 0xffffff }, 0.25)
     }
 }
 

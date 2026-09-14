@@ -31,6 +31,15 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
 cp target/release/$APP_NAME "$CONTENTS/MacOS/$APP_NAME"
 
+# Compile the macOS app icon and asset catalog into the bundle.
+xcrun actool \
+    --compile "$CONTENTS/Resources" \
+    --platform macosx \
+    --minimum-deployment-target 12.0 \
+    --app-icon AppIcon \
+    --output-partial-info-plist "$BUILD_DIR/AppIcon-Info.plist" \
+    assets/Assets.xcassets
+
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,6 +59,10 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <string>$APP_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSMinimumSystemVersion</key>

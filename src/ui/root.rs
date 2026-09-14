@@ -15,10 +15,15 @@ pub struct RootView {
 }
 
 impl RootView {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
         let chat = cx.new(|cx| ChatView::new(state.clone(), cx));
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe_window_appearance(window, |_, window, cx| {
+            window.refresh();
+            cx.notify();
+        })
+        .detach();
         Self {
             state,
             sidebar,
@@ -28,7 +33,8 @@ impl RootView {
 }
 
 impl Render for RootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Theme::sync(self.state.read(cx).settings.appearance, window.appearance());
         let state = self.state.clone();
         let state_new = self.state.clone();
         let state_settings = self.state.clone();
