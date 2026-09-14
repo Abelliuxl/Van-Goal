@@ -490,20 +490,6 @@ pub fn parse(content: &str) -> Vec<MarkdownBlock> {
     blocks
 }
 
-/// Does the content contain a markdown table (used to pick streaming font)?
-pub fn contains_markdown_table(content: &str) -> bool {
-    let lines: Vec<&str> = content.split('\n').collect();
-    if lines.len() < 2 {
-        return false;
-    }
-    for index in 0..lines.len() - 1 {
-        if lines[index].contains('|') && is_table_separator(lines[index + 1]) {
-            return true;
-        }
-    }
-    false
-}
-
 fn normalize(content: &str) -> String {
     let mut text = content.replace("\r\n", "\n").replace('\r', "\n");
 

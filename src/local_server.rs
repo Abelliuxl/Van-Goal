@@ -1,6 +1,6 @@
 use crate::hermes_config::hermes_executable_path;
 use crate::log_debug;
-use crate::logger::{dirs, global_logger};
+use crate::logger::global_logger;
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -27,10 +27,6 @@ impl LocalHermesServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-    }
-
-    pub fn is_launching(&self) -> bool {
-        *self.is_launching.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub async fn start(&self, port: u16) {
@@ -106,8 +102,4 @@ async fn is_reachable(url: &str) -> bool {
             .await,
         Ok(response) if response.status().is_success()
     )
-}
-
-pub fn log_dir() -> PathBuf {
-    dirs::app_support().join("HermitGPUI")
 }

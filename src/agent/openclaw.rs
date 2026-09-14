@@ -281,6 +281,46 @@ impl OpenClawBackend {
     }
 }
 
+/// The Gateway WebSocket URL behind an HTTP(S) base URL. Shared by the
+/// handshake and by the stored-credential lookup below, so the key a device
+/// token is filed under cannot drift between writing and reading it.
+fn gateway_url(base_url: &str) -> Result<url::Url> {
+    let mut parsed = url::Url::parse(base_url)?;
+    parsed
+        .set_scheme(if parsed.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| anyhow!("Could not build OpenClaw gateway WebSocket URL."))?;
+    Ok(parsed)
+}
+
+/// Characters of the paired-device token the Gateway issued for this address.
+/// That token lives in the app-data secret store rather than in settings, which
+/// is why the gateway-token field can be empty while connecting still works.
+/// Settings reads it through here so the stored credential is visible.
+pub fn stored_device_token_characters(base_url: &str) -> usize {
+    let Ok(url) = gateway_url(base_url) else {
+        return 0;
+    };
+    OpenClawDeviceIdentity::load_device_token(&url.to_string())
+        .ok()
+        .flatten()
+        .map(|token| token.trim().chars().count())
+        .unwrap_or(0)
+}
+
+/// Forget the paired-device token held for this address, so the next connect
+/// has to authenticate with the gateway token again. Returns whether a token
+/// was actually removed.
+pub fn forget_device_token(base_url: &str) -> bool {
+    let Ok(url) = gateway_url(base_url) else {
+        return false;
+    };
+    OpenClawDeviceIdentity::forget_device_token(&url.to_string()).unwrap_or(false)
+}
+
 fn sessions_create_params(key: &str) -> serde_json::Value {
     serde_json::json!({ "key": key })
 }
@@ -381,14 +421,7 @@ impl GatewayHandle {
         if self.is_connected() {
             return Ok(());
         }
-        let mut parsed = url::Url::parse(base_url)?;
-        parsed
-            .set_scheme(if parsed.scheme() == "https" {
-                "wss"
-            } else {
-                "ws"
-            })
-            .map_err(|_| anyhow!("Could not build OpenClaw gateway WebSocket URL."))?;
+        let parsed = gateway_url(base_url)?;
         let (command_tx, command_rx) = unbounded::<GatewayCommand>();
         let (connected_tx, connected_rx) = watch::channel(GatewayHandshakeState::Pending);
         *self.command_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(command_tx);

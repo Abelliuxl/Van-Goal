@@ -16,7 +16,9 @@ pub struct SettingsView {
     workspace_editor: Entity<Editor>,
     profile_editor: Entity<Editor>,
     token_editor: Entity<Editor>,
-    backend_menu_open: bool,
+    /// Which backend the text fields currently hold, so they can be re-filled
+    /// when a switch changes the active backend.
+    shown_backend: crate::settings::BackendKind,
 }
 
 impl SettingsView {
@@ -141,7 +143,26 @@ impl SettingsView {
         )
         .detach();
 
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&state, |this, state, cx| {
+            // Switching a backend on swaps the whole connection block, so the
+            // fields have to be re-filled from the newly active backend instead
+            // of showing the previous one's address.
+            let settings = state.read(cx).settings.clone();
+            if settings.backend_kind != this.shown_backend {
+                this.shown_backend = settings.backend_kind;
+                this.host_editor.update(cx, |editor, cx| {
+                    editor.set_text(settings.backend_host.clone(), cx)
+                });
+                this.port_editor.update(cx, |editor, cx| {
+                    editor.set_text(settings.backend_port.to_string(), cx)
+                });
+                this.token_editor.update(cx, |editor, cx| {
+                    editor.set_text(settings.session_token.clone(), cx)
+                });
+            }
+            cx.notify();
+        })
+        .detach();
         cx.observe_window_appearance(window, |_, window, cx| {
             window.refresh();
             cx.notify();
@@ -155,7 +176,7 @@ impl SettingsView {
             workspace_editor,
             profile_editor,
             token_editor,
-            backend_menu_open: false,
+            shown_backend: settings.backend_kind,
         }
     }
 }
@@ -188,46 +209,29 @@ impl Render for SettingsView {
             .p_4()
             .overflow_y_scroll();
 
-        // Backend section
+        // Backend section. Every backend owns a switch: turning one on makes it
+        // the active backend and connects it, turning it off disconnects it and
+        // keeps it off on the next launch.
         let mut backend_section = section("Agent backend");
-        let chat = cx.entity();
-        backend_section = backend_section
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(render_menu_button(
-                        "settings-backend-picker",
-                        format!("{} ▾", settings.backend_kind.display_name()),
-                        Theme::accent(),
-                        {
-                            let chat = chat.clone();
-                            move |_event, _window, cx| {
-                                chat.update(cx, |chat, cx| {
-                                    chat.backend_menu_open = !chat.backend_menu_open;
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_secondary())
-                            .child(settings.backend_kind.description()),
-                    ),
-            )
-            .child(toggle_row(
-                "Connect on launch",
-                settings.auto_connect,
+        for kind in crate::settings::BackendKind::ALL {
+            let is_enabled = settings.is_backend_enabled(kind);
+            let is_active = settings.backend_kind == kind;
+            let status = match (is_enabled, is_active) {
+                (true, true) => status_label.clone(),
+                (true, false) => "On".to_string(),
+                (false, _) => "Off".to_string(),
+            };
+            backend_section = backend_section.child(backend_row(
+                kind,
+                is_enabled,
+                is_active,
+                status,
                 state.clone(),
-                |state, _cx| {
-                    state.settings.auto_connect = !state.settings.auto_connect;
-                    state.settings.save();
-                },
             ));
+        }
+        backend_section = backend_section.child(hint(
+            "One backend runs at a time. Switching one on switches the others off, and a backend you switch off stays off after a restart.",
+        ));
         root = root.child(backend_section);
 
         let mut appearance_options = div().flex().flex_row().gap_2();
@@ -292,24 +296,50 @@ impl Render for SettingsView {
                 .child(field_row("Default profile", self.profile_editor.clone()))
                 .child(hint("Leave empty to use the Hermes default profile."));
         }
+        let active_backend = settings.backend_kind;
+        let active_enabled = settings.is_backend_enabled(active_backend);
+        connection = connection.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(Theme::text_secondary())
+                .child(active_backend.description()),
+        );
         connection = connection.child(
             div()
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(small_button(
-                    "connect-now",
-                    format!("Connect to {}", settings.backend_kind.display_name()),
-                    Theme::accent(),
-                    {
-                        let state = state.clone();
-                        move |_event, _window, cx| {
-                            state.update(cx, |state, cx| state.connect(cx));
-                        }
-                    },
-                ))
+                .child(if active_enabled {
+                    small_button(
+                        "disconnect-now",
+                        format!("Switch off {}", active_backend.display_name()),
+                        Theme::danger(),
+                        {
+                            let state = state.clone();
+                            move |_event, _window, cx| {
+                                state.update(cx, |state, cx| {
+                                    state.disable_backend(active_backend, cx)
+                                });
+                            }
+                        },
+                    )
+                } else {
+                    small_button(
+                        "connect-now",
+                        format!("Switch on {}", active_backend.display_name()),
+                        Theme::accent(),
+                        {
+                            let state = state.clone();
+                            move |_event, _window, cx| {
+                                state.update(cx, |state, cx| {
+                                    state.enable_backend(active_backend, cx)
+                                });
+                            }
+                        },
+                    )
+                })
                 .when(
-                    settings.backend_kind == crate::settings::BackendKind::Hermes,
+                    active_backend == crate::settings::BackendKind::Hermes,
                     |this| {
                         this.child(small_button(
                             "stop-managed",
@@ -330,14 +360,16 @@ impl Render for SettingsView {
         }
         root = root.child(connection);
 
-        // Credentials section
+        // Credentials section. Read the credential that is actually used rather
+        // than the raw field: an empty field does not mean nothing is stored.
+        let stored_credential = self.state.read(cx).stored_credential();
         let mut credentials = section("Credentials");
         if uses_network {
             credentials = credentials
                 .child(credential_field(
                     settings.backend_kind.credential_label(),
                     self.token_editor.clone(),
-                    settings.session_token.trim().chars().count(),
+                    stored_credential,
                 ))
                 .child(hint(credential_help(settings.backend_kind)));
         } else {
@@ -354,10 +386,7 @@ impl Render for SettingsView {
                 let token_editor = self.token_editor.clone();
                 move |_event, _window, cx| {
                     token_editor.update(cx, |editor, cx| editor.clear(cx));
-                    state.update(cx, |state, _cx| {
-                        state.settings.session_token = String::new();
-                        state.settings.save();
-                    });
+                    state.update(cx, |state, cx| state.clear_credential(cx));
                 }
             },
         ));
@@ -429,69 +458,8 @@ impl Render for SettingsView {
                     })),
             );
 
-        // Backend picker popup
-        if self.backend_menu_open {
-            root = root.child(render_backend_menu(cx.entity(), self.state.clone()));
-        }
-
         root
     }
-}
-
-impl SettingsView {
-    fn toggle_backend(&mut self, kind: crate::settings::BackendKind, cx: &mut Context<Self>) {
-        self.backend_menu_open = false;
-        let state = self.state.clone();
-        state.update(cx, |state, cx| state.switch_backend(kind, cx));
-        // Refresh editor fields from the (possibly changed) settings.
-        let settings = state.read(cx).settings.clone();
-        self.host_editor.update(cx, |editor, cx| {
-            editor.set_text(settings.backend_host.clone(), cx)
-        });
-        self.port_editor.update(cx, |editor, cx| {
-            editor.set_text(settings.backend_port.to_string(), cx)
-        });
-        self.token_editor.update(cx, |editor, cx| {
-            editor.set_text(settings.session_token.clone(), cx)
-        });
-        cx.notify();
-    }
-}
-
-fn render_backend_menu(chat: Entity<SettingsView>, state: Entity<AppState>) -> AnyElement {
-    div()
-        .absolute()
-        .top(px(48.0))
-        .left(px(28.0))
-        .w(px(240.0))
-        .rounded_lg()
-        .bg(Theme::surface())
-        .border_1()
-        .border_color(Theme::border_strong())
-        .py_1()
-        .flex()
-        .flex_col()
-        .children(crate::settings::BackendKind::ALL.iter().map(|kind| {
-            let chat = chat.clone();
-            let state = state.clone();
-            let kind = *kind;
-            div()
-                .id(gpui::ElementId::Name(
-                    format!("backend-{}", kind.id()).into(),
-                ))
-                .px_3()
-                .py_1()
-                .text_size(px(12.0))
-                .text_color(Theme::text())
-                .cursor_pointer()
-                .hover(|style| style.bg(Theme::surface_hover()))
-                .on_click(move |_event, _window, cx| {
-                    chat.update(cx, |chat, cx| chat.toggle_backend(kind, cx));
-                    let _ = &state;
-                })
-                .child(kind.display_name())
-        }))
-        .into_any()
 }
 
 // -- small building blocks ---------------------------------------------------
@@ -551,10 +519,115 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
         .into_any()
 }
 
+/// One backend and its own on/off switch. The switch is the only control:
+/// switching a backend on makes it the active backend and connects it,
+/// switching it off disconnects it and leaves it off next launch.
+fn backend_row(
+    kind: crate::settings::BackendKind,
+    is_enabled: bool,
+    is_active: bool,
+    status: String,
+    state: Entity<AppState>,
+) -> AnyElement {
+    let on_toggle = state.clone();
+    div()
+        .id(gpui::ElementId::Name(
+            format!("backend-row-{}", kind.id()).into(),
+        ))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .when(is_active, |this| this.bg(Theme::accent_soft()))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(Theme::text())
+                        .child(kind.display_name()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(if is_enabled {
+                            Theme::ok()
+                        } else {
+                            Theme::text_tertiary()
+                        })
+                        .child(status),
+                ),
+        )
+        .child(switch_toggle(
+            format!("backend-switch-{}", kind.id()),
+            is_enabled,
+            move |_event, _window, cx| {
+                on_toggle.update(cx, |state, cx| {
+                    if is_enabled {
+                        state.disable_backend(kind, cx);
+                    } else {
+                        state.enable_backend(kind, cx);
+                    }
+                });
+            },
+        ))
+        .into_any()
+}
+
+/// A labelled track-and-knob switch. Captioned for accessibility with the
+/// backend it controls, since seven of them sit next to each other.
+fn switch_toggle<F>(id: String, is_on: bool, on_click: F) -> AnyElement
+where
+    F: Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+{
+    div()
+        .id(gpui::ElementId::Name(id.into()))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(if is_on {
+                    Theme::ok()
+                } else {
+                    Theme::text_tertiary()
+                })
+                .child(if is_on { "ON" } else { "OFF" }),
+        )
+        .child(
+            div()
+                .w(px(34.0))
+                .h(px(18.0))
+                .rounded_full()
+                .bg(if is_on {
+                    Theme::accent()
+                } else {
+                    Theme::border()
+                })
+                .p(px(2.0))
+                .flex()
+                .when(is_on, |this| this.justify_end())
+                .when(!is_on, |this| this.justify_start())
+                .child(div().size(px(14.0)).rounded_full().bg(Theme::text())),
+        )
+        .into_any()
+}
+
 fn credential_field(
     label: &'static str,
     editor: Entity<Editor>,
-    character_count: usize,
+    stored: crate::state::StoredCredential,
 ) -> AnyElement {
     div()
         .flex()
@@ -575,8 +648,18 @@ fn credential_field(
                 .child(
                     div()
                         .text_size(px(10.0))
-                        .text_color(Theme::text_tertiary())
-                        .child(format!("{character_count} characters stored")),
+                        .text_color(if stored.is_stored() {
+                            Theme::ok()
+                        } else {
+                            Theme::text_tertiary()
+                        })
+                        .child(if stored.saved_characters > 0 {
+                            format!("{} characters stored", stored.saved_characters)
+                        } else if stored.is_stored() {
+                            "Stored as a paired device token".to_string()
+                        } else {
+                            "Nothing stored".to_string()
+                        }),
                 ),
         )
         .child(
@@ -591,6 +674,17 @@ fn credential_field(
                 .text_size(px(12.0))
                 .child(editor),
         )
+        .when(stored.device_token_characters > 0, |this| {
+            this.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Theme::text_tertiary())
+                    .child(format!(
+                        "Hermit also holds a paired-device token for this gateway ({} characters), and that is what it connects with — this field can stay empty.",
+                        stored.device_token_characters
+                    )),
+            )
+        })
         .into_any()
 }
 
@@ -696,7 +790,7 @@ fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
     match kind {
         crate::settings::BackendKind::Hermes => "Local Hermes tokens are discovered automatically.",
         crate::settings::BackendKind::OpenClaw => {
-            "Use gateway.auth.token. Hermit stores it in its local settings and keeps the paired-device token in its local app-data file."
+            "Use gateway.auth.token. Hermit stores it here and keeps the paired-device token the gateway issues in its local app-data file; clearing removes both."
         }
         crate::settings::BackendKind::OpenCode => {
             "Matches OPENCODE_SERVER_PASSWORD when server authentication is enabled."

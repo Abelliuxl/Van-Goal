@@ -40,6 +40,19 @@ impl LocalSecretStore {
         Ok(self.load()?.values.get(account).cloned())
     }
 
+    /// Forget one stored secret. Returns whether anything was removed.
+    pub fn remove(&self, account: &str) -> Result<bool> {
+        let _guard = store_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut stored = self.load()?;
+        let removed = stored.values.remove(account).is_some();
+        if removed {
+            self.write(&stored)?;
+        }
+        Ok(removed)
+    }
+
     fn load(&self) -> Result<StoredSecrets> {
         match std::fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes)

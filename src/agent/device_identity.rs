@@ -87,6 +87,13 @@ impl OpenClawDeviceIdentity {
     pub fn save_device_token(gateway: &str, token: &str) -> Result<()> {
         openclaw_device_store().save(&device_token_account(gateway), token)
     }
+
+    /// Drop the paired-device token for a gateway. The device identity itself is
+    /// kept: the gateway still knows the device, so re-pairing does not have to
+    /// be approved again from scratch.
+    pub fn forget_device_token(gateway: &str) -> Result<bool> {
+        openclaw_device_store().remove(&device_token_account(gateway))
+    }
 }
 
 fn device_auth_payload(device_id: &str, nonce: &str, signed_at: i64, token: &str) -> String {

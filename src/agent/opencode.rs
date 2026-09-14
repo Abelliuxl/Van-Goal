@@ -21,7 +21,6 @@ struct SharedState {
 /// Adapter for the structured HTTP + SSE interface exposed by `opencode serve`
 /// (and the OpenCode-compatible `mimo serve`).
 pub struct OpenCodeBackend {
-    id: &'static str,
     display_name: &'static str,
     http: reqwest::Client,
     shared: Arc<Mutex<SharedState>>,
@@ -31,9 +30,8 @@ pub struct OpenCodeBackend {
 }
 
 impl OpenCodeBackend {
-    pub fn new(id: &'static str, display_name: &'static str) -> Self {
+    pub fn new(display_name: &'static str) -> Self {
         Self {
-            id,
             display_name,
             http: reqwest::Client::builder()
                 .timeout(HTTP_TIMEOUT)

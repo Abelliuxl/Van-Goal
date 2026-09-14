@@ -106,9 +106,25 @@ fn best_stream_text(streams: &BTreeMap<DeltaSource, String>) -> String {
 }
 
 struct ConnectOutcome {
-    base_url: String,
     discovered_token: Option<String>,
     error: Option<String>,
+}
+
+/// What is actually stored for the active backend, split by where it lives.
+/// Settings renders this so that "field is empty" and "nothing is saved" stop
+/// looking like the same thing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoredCredential {
+    /// Characters of gateway token or server password held in settings.
+    pub saved_characters: usize,
+    /// Characters of the paired-device token OpenClaw holds for this gateway.
+    pub device_token_characters: usize,
+}
+
+impl StoredCredential {
+    pub fn is_stored(self) -> bool {
+        self.saved_characters > 0 || self.device_token_characters > 0
+    }
 }
 
 /// Single source of truth for sessions, messages, streaming and sending —
@@ -139,7 +155,6 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub is_changing_permission_mode: bool,
     /// (message id, tool index) pairs expanded in the activity pill.
-    pub expanded_tools: HashSet<(String, usize)>,
     /// Prompt held back because no live session existed when the user hit send.
     pub pending_after_start: Option<(String, Vec<ComposerAttachment>)>,
     /// Text received per event stream for the turn in flight. One reply can
@@ -223,7 +238,6 @@ impl AppState {
             context_window_tokens: hermes_config::DEFAULT_CONTEXT_WINDOW,
             permission_mode: PermissionMode::FullAccess,
             is_changing_permission_mode: false,
-            expanded_tools: HashSet::new(),
             pending_after_start: None,
             streaming_text: BTreeMap::new(),
             sessions_refresh_inflight: false,
@@ -263,8 +277,47 @@ impl AppState {
             && (!self.composer_text.trim().is_empty() || !self.composer_attachments.is_empty())
     }
 
+    /// Forget the credential backing the active backend. OpenClaw keeps its
+    /// paired-device token outside settings, so clearing only the text field
+    /// would leave the app still able to connect — which is exactly what made
+    /// "Clear Credential" look like it did nothing.
+    pub fn clear_credential(&mut self, cx: &mut gpui::Context<Self>) {
+        let kind = self.settings.backend_kind;
+        self.settings.session_token = String::new();
+        let forgot_device_token = kind == BackendKind::OpenClaw
+            && crate::agent::openclaw::forget_device_token(&self.settings.active_backend_url());
+        self.settings.save();
+        log_debug!(
+            "app",
+            "credential cleared backend={} deviceToken={}",
+            kind.id(),
+            forgot_device_token
+        );
+        cx.notify();
+    }
+
     pub fn backend_caps(&self) -> BackendCaps {
         self.backend_caps
+    }
+
+    /// The credential that actually backs the active backend. Settings shows
+    /// this instead of the raw token field, because an empty field does not mean
+    /// "no credential": OpenClaw authenticates with a paired-device token kept
+    /// in the app-data secret store, so its gateway-token field is legitimately
+    /// empty while connecting still works.
+    pub fn stored_credential(&self) -> StoredCredential {
+        let kind = self.settings.backend_kind;
+        let device_token_characters = if kind == BackendKind::OpenClaw {
+            crate::agent::openclaw::stored_device_token_characters(
+                &self.settings.active_backend_url(),
+            )
+        } else {
+            0
+        };
+        StoredCredential {
+            saved_characters: self.settings.stored_credential_characters(kind),
+            device_token_characters,
+        }
     }
 
     pub fn backend_display_name(&self) -> &'static str {
@@ -324,14 +377,18 @@ impl AppState {
     // ------------------------------------------------------------------
 
     pub fn bootstrap(&mut self, cx: &mut gpui::Context<Self>) {
+        let kind = self.settings.backend_kind;
         log_debug!(
             "app",
-            "bootstrap autoConnect={}",
-            self.settings.auto_connect
+            "bootstrap backend={} enabled={}",
+            kind.id(),
+            self.settings.is_backend_enabled(kind)
         );
         self.refresh_hermes_model_config();
         self.refresh_permission_mode();
-        if self.settings.auto_connect {
+        // Only a backend whose own switch is on connects. A backend the user
+        // switched off stays off across launches instead of reconnecting.
+        if self.settings.is_backend_enabled(kind) {
             self.connect(cx);
         }
     }
@@ -355,7 +412,6 @@ impl AppState {
                     Ok(url) => url,
                     Err(error) => {
                         return ConnectOutcome {
-                            base_url: fallback_url,
                             discovered_token: None,
                             error: Some(error.to_string()),
                         };
@@ -372,7 +428,6 @@ impl AppState {
             };
             if let Err(error) = backend.lock().await.probe(&config).await {
                 return ConnectOutcome {
-                    base_url,
                     discovered_token: None,
                     error: Some(error.to_string()),
                 };
@@ -384,7 +439,6 @@ impl AppState {
                     Ok(token) => Some(token),
                     Err(error) => {
                         return ConnectOutcome {
-                            base_url,
                             discovered_token: None,
                             error: Some(error.to_string()),
                         };
@@ -394,7 +448,6 @@ impl AppState {
                 None
             };
             ConnectOutcome {
-                base_url,
                 discovered_token,
                 error: None,
             }
@@ -402,7 +455,6 @@ impl AppState {
 
         cx.spawn(async move |this, cx| {
             let outcome = join.await.unwrap_or(ConnectOutcome {
-                base_url: String::new(),
                 discovered_token: None,
                 error: Some("connect task failed".into()),
             });
@@ -995,11 +1047,6 @@ impl AppState {
         self.rebuild_model_provider_groups();
     }
 
-    pub fn reload_model_config(&mut self, cx: &mut gpui::Context<Self>) {
-        self.refresh_hermes_model_config();
-        cx.notify();
-    }
-
     fn rebuild_model_provider_groups(&mut self) {
         let current_provider = self.current_model_provider.clone();
         let current_model = self.current_model_name.clone();
@@ -1170,12 +1217,17 @@ impl AppState {
         cx.notify();
     }
 
+    /// Make `kind` the active backend. Choosing a backend means "use this one",
+    /// so its switch is turned on — which turns every other backend off, since
+    /// only one can be connected at a time.
     pub fn switch_backend(&mut self, kind: BackendKind, cx: &mut gpui::Context<Self>) {
+        self.settings.set_backend_enabled(kind, true);
         let backend = self.backend.clone();
         tokio_spawn(cx, async move {
             backend.lock().await.disconnect();
         });
         self.settings.switch_backend(kind);
+        self.settings.save();
         self.backend = Arc::new(AsyncMutex::new(Backend::make(kind)));
         self.backend_id = backend_static_id(kind);
         self.backend_display_name = backend_static_name(kind);
@@ -1194,9 +1246,32 @@ impl AppState {
         self.last_error = None;
         log_debug!("app", "backend switched to={}", kind.id());
         cx.notify();
-        if self.settings.auto_connect {
+        if self.settings.is_backend_enabled(kind) {
             self.connect(cx);
         }
+    }
+
+    /// Turn a backend's switch on, switching to it if it is not already active.
+    pub fn enable_backend(&mut self, kind: BackendKind, cx: &mut gpui::Context<Self>) {
+        if self.settings.backend_kind == kind && self.settings.is_backend_enabled(kind) {
+            // Already the active backend: this is a plain reconnect.
+            self.connect(cx);
+            return;
+        }
+        self.switch_backend(kind, cx);
+    }
+
+    /// Turn a backend's switch off. Disconnecting the active backend leaves the
+    /// app disconnected until the user turns a backend back on, and the choice
+    /// survives a restart.
+    pub fn disable_backend(&mut self, kind: BackendKind, cx: &mut gpui::Context<Self>) {
+        self.settings.set_backend_enabled(kind, false);
+        self.settings.save();
+        log_debug!("app", "backend disabled id={}", kind.id());
+        if self.settings.backend_kind == kind {
+            self.disconnect(cx);
+        }
+        cx.notify();
     }
 
     pub fn disconnect(&mut self, cx: &mut gpui::Context<Self>) {

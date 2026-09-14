@@ -100,13 +100,6 @@ impl BackendKind {
         )
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
-        BackendKind::ALL
-            .iter()
-            .copied()
-            .find(|kind| kind.id() == value)
-    }
-
     pub fn description(&self) -> &'static str {
         match self {
             BackendKind::Hermes => {
@@ -143,7 +136,12 @@ pub struct Settings {
     #[serde(default)]
     #[serde(skip_serializing)]
     pub session_token: String,
+    /// Legacy global switch. Kept only so a settings file written before the
+    /// per-backend switches existed still decides what to connect on launch;
+    /// it is never written back, and the choice is materialised into each
+    /// backend's own `enabled` flag by [`Settings::migrate_switches`].
     #[serde(default = "default_true")]
+    #[serde(skip_serializing)]
     pub auto_connect: bool,
     #[serde(default)]
     pub selected_profile: String,
@@ -171,10 +169,31 @@ pub struct PerBackendConnection {
     pub use_tls: bool,
     #[serde(default)]
     pub credential: String,
+    /// This backend's own on/off switch. `None` means the file was written
+    /// before per-backend switches existed; [`Settings::migrate_switches`]
+    /// fills those in on first load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Write a file only the current user can read. Settings hold credentials, so
+/// the mode is applied at creation time rather than fixed up afterwards.
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -206,81 +225,180 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let path = Self::path();
-        let settings = match std::fs::read(&path) {
+        Self::load_from(&Self::path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        let mut settings = match std::fs::read(path) {
             Ok(data) => match serde_json::from_slice::<Settings>(&data) {
-                Ok(mut settings) => {
-                    let scoped = settings
-                        .per_backend
-                        .get(settings.backend_kind.id())
-                        .cloned()
-                        .unwrap_or_default();
-                    if settings.backend_host.is_empty() {
-                        settings.backend_host = if scoped.host.is_empty() {
-                            DEFAULT_HOST.to_string()
-                        } else {
-                            scoped.host
-                        };
-                    }
-                    if settings.backend_port == 0 {
-                        settings.backend_port = if scoped.port > 0 {
-                            scoped.port
-                        } else {
-                            settings.backend_kind.default_port()
-                        };
-                    }
-                    if !scoped.credential.is_empty() {
-                        settings.session_token = scoped.credential;
-                    }
-                    settings
+                Ok(settings) => settings,
+                Err(error) => {
+                    // Never overwrite a file we could not parse. Silently falling
+                    // back to the defaults is what makes the app forget which
+                    // backend the user was on, so keep the bad file for
+                    // inspection and let the user re-enter their settings.
+                    crate::log_debug!("settings", "settings.json unreadable: {error}");
+                    let _ = std::fs::rename(path, path.with_extension("json.corrupt"));
+                    Settings::default()
                 }
-                Err(_) => Settings::default(),
             },
             Err(_) => Settings::default(),
         };
-        settings.save();
+        // Restore the scoped credential into the flat fields *before* anything
+        // writes those fields back, otherwise the empty `session_token` that
+        // deserialization produces would overwrite the stored credential.
+        settings.apply_scoped_connection();
+        settings.migrate_switches();
+        settings.save_to(path);
         settings
     }
 
-    pub fn save(&self) {
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    /// Fold the per-backend record of the active backend into the flat fields
+    /// the rest of the app reads.
+    fn apply_scoped_connection(&mut self) {
+        let scoped = self
+            .per_backend
+            .get(self.backend_kind.id())
+            .cloned()
+            .unwrap_or_default();
+        if self.backend_host.is_empty() {
+            self.backend_host = if scoped.host.is_empty() {
+                DEFAULT_HOST.to_string()
+            } else {
+                scoped.host
+            };
         }
-        let mut persisted = self.clone();
-        persisted.per_backend.insert(
+        if self.backend_port == 0 {
+            self.backend_port = if scoped.port > 0 {
+                scoped.port
+            } else {
+                self.backend_kind.default_port()
+            };
+        }
+        if !scoped.credential.is_empty() {
+            self.session_token = scoped.credential;
+        }
+    }
+
+    /// Give a settings file written before per-backend switches existed an
+    /// explicit switch per backend: the backend the user was last on inherits
+    /// the old global `auto_connect`, everything else starts switched off.
+    /// Without this an upgrade would either connect every backend or none.
+    fn migrate_switches(&mut self) {
+        if self
+            .per_backend
+            .values()
+            .any(|connection| connection.enabled.is_some())
+        {
+            return;
+        }
+        let active = self.backend_kind;
+        let was_auto_connect = self.auto_connect;
+        self.sync_active_connection();
+        for kind in BackendKind::ALL {
+            let enabled = kind == active && was_auto_connect;
+            self.per_backend
+                .entry(kind.id().to_string())
+                .or_default()
+                .enabled = Some(enabled);
+        }
+    }
+
+    /// Mirror the flat fields of the backend currently being edited into its
+    /// per-backend record, so that writing another backend's switch cannot
+    /// drop the host, port, TLS or credential the user just typed.
+    fn sync_active_connection(&mut self) {
+        let enabled = self
+            .per_backend
+            .get(self.backend_kind.id())
+            .and_then(|connection| connection.enabled);
+        self.per_backend.insert(
             self.backend_kind.id().to_string(),
             PerBackendConnection {
                 host: self.backend_host.clone(),
                 port: self.backend_port,
                 use_tls: self.backend_use_tls,
                 credential: self.session_token.trim().to_string(),
+                enabled,
             },
         );
-        if let Ok(data) = serde_json::to_vec_pretty(&persisted) {
-            if std::fs::write(&path, data).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    /// Whether this backend's switch is on. Only one backend can be connected
+    /// at a time, so `true` here means "this is the backend the app uses".
+    pub fn is_backend_enabled(&self, kind: BackendKind) -> bool {
+        self.per_backend
+            .get(kind.id())
+            .and_then(|connection| connection.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Characters of credential held for a backend. The active backend keeps
+    /// its token in the flat field the Settings editor writes to; every other
+    /// backend keeps its own copy, so read whichever is authoritative.
+    pub fn stored_credential_characters(&self, kind: BackendKind) -> usize {
+        let scoped = self
+            .per_backend
+            .get(kind.id())
+            .map(|connection| connection.credential.trim().chars().count())
+            .unwrap_or(0);
+        if kind == self.backend_kind {
+            // The scoped copy can lag the flat field by one keystroke, so report
+            // the larger of the two rather than briefly claiming nothing is saved.
+            return scoped.max(self.session_token.trim().chars().count());
+        }
+        scoped
+    }
+
+    /// Flip one backend's switch. Turning a backend on turns every other one
+    /// off: a stale on-flag would otherwise reconnect a backend the user had
+    /// deliberately disconnected. The caller persists via [`Settings::save`],
+    /// so this stays pure and cannot touch a real file from a test.
+    pub fn set_backend_enabled(&mut self, kind: BackendKind, enabled: bool) {
+        self.sync_active_connection();
+        if enabled {
+            for other in BackendKind::ALL {
+                if other != kind {
+                    if let Some(connection) = self.per_backend.get_mut(other.id()) {
+                        connection.enabled = Some(false);
+                    }
                 }
             }
         }
+        self.per_backend
+            .entry(kind.id().to_string())
+            .or_default()
+            .enabled = Some(enabled);
+    }
+
+    pub fn save(&self) {
+        self.save_to(&Self::path());
+    }
+
+    fn save_to(&self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut persisted = self.clone();
+        persisted.sync_active_connection();
+        let Ok(data) = serde_json::to_vec_pretty(&persisted) else {
+            return;
+        };
+        // Write a sibling file and rename it into place. `save` runs on every
+        // keystroke in Settings, and a plain write that is interrupted leaves
+        // truncated JSON behind — which the next launch reads as "no settings"
+        // and resets to the defaults.
+        let temporary = path.with_extension("json.tmp");
+        if write_private(&temporary, &data).is_err() {
+            return;
+        }
+        let _ = std::fs::rename(&temporary, path);
     }
 
     /// Persist the outgoing backend's connection under its scoped key and load
     /// the incoming one, mirroring the didSet logic in the SwiftUI store.
     pub fn switch_backend(&mut self, next: BackendKind) {
-        let outgoing = self.backend_kind;
-        self.per_backend.insert(
-            outgoing.id().to_string(),
-            PerBackendConnection {
-                host: self.backend_host.clone(),
-                port: self.backend_port,
-                use_tls: self.backend_use_tls,
-                credential: self.session_token.trim().to_string(),
-            },
-        );
+        self.sync_active_connection();
         self.session_token.clear();
         self.backend_kind = next;
         let scoped = self.per_backend.get(next.id()).cloned().unwrap_or_default();
@@ -296,7 +414,6 @@ impl Settings {
         };
         self.backend_use_tls = scoped.use_tls;
         self.session_token = scoped.credential;
-        self.save();
     }
 
     pub fn resolved_host(&self) -> String {
@@ -404,5 +521,234 @@ mod tests {
             settings.active_backend_url(),
             "https://claw.example.com:8443"
         );
+    }
+
+    /// A settings file in a private directory. Every test here goes through an
+    /// explicit path, so none of them can touch the real
+    /// `~/Library/Application Support/HermitGPUI/settings.json`.
+    struct TempSettings(std::path::PathBuf);
+
+    impl TempSettings {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("hermit-settings-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir.join("settings.json"))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSettings {
+        fn drop(&mut self) {
+            if let Some(parent) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
+    #[test]
+    fn only_one_backend_switch_is_on_at_a_time() {
+        let mut settings = Settings::default();
+        settings.set_backend_enabled(BackendKind::OpenClaw, true);
+        assert!(settings.is_backend_enabled(BackendKind::OpenClaw));
+        assert!(!settings.is_backend_enabled(BackendKind::Hermes));
+
+        // Turning another backend on switches, it does not add: the backend the
+        // user came from must end up switched off.
+        settings.set_backend_enabled(BackendKind::Hermes, true);
+        assert!(settings.is_backend_enabled(BackendKind::Hermes));
+        assert!(!settings.is_backend_enabled(BackendKind::OpenClaw));
+    }
+
+    #[test]
+    fn switching_a_backend_off_leaves_every_backend_off() {
+        let mut settings = Settings::default();
+        settings.set_backend_enabled(BackendKind::OpenClaw, true);
+        settings.set_backend_enabled(BackendKind::OpenClaw, false);
+
+        // Disconnecting is what the user asked for, so nothing may come back on
+        // by itself on the next launch.
+        assert!(BackendKind::ALL
+            .iter()
+            .all(|kind| !settings.is_backend_enabled(*kind)));
+    }
+
+    #[test]
+    fn a_legacy_settings_file_migrates_to_a_single_enabled_backend() {
+        let temp = TempSettings::new();
+        // Written before per-backend switches existed: no `enabled` key
+        // anywhere, only the global auto_connect.
+        std::fs::write(
+            temp.path(),
+            br#"{
+                "backend_kind": "OpenClaw",
+                "auto_connect": true,
+                "backend_host": "claw.example.com",
+                "backend_port": 18789,
+                "per_backend": {}
+            }"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = Settings::load_from(temp.path());
+        assert_eq!(settings.backend_kind, BackendKind::OpenClaw);
+        assert!(
+            settings.is_backend_enabled(BackendKind::OpenClaw),
+            "the backend the user was last on stays on"
+        );
+        assert_eq!(
+            BackendKind::ALL
+                .iter()
+                .filter(|kind| settings.is_backend_enabled(**kind))
+                .count(),
+            1,
+            "an upgraded install must come up with exactly one backend on"
+        );
+    }
+
+    /// The shape of a real settings file written by the version before
+    /// per-backend switches: every backend has a scoped record, none of them has
+    /// an `enabled` key, and only the global `auto_connect` says what to do.
+    /// Upgrading must come up on the backend the user was last using, with the
+    /// others switched off, and must not lose the stored host or credential.
+    #[test]
+    fn a_real_legacy_file_upgrades_without_losing_the_active_backend() {
+        let temp = TempSettings::new();
+        std::fs::write(
+            temp.path(),
+            br#"{
+              "backend_kind": "OpenClaw",
+              "appearance": "System",
+              "auto_connect": true,
+              "selected_profile": "",
+              "workspace_path": "/tmp",
+              "backend_host": "liuxl.example.com",
+              "backend_port": 18789,
+              "backend_use_tls": true,
+              "debug_logging_enabled": false,
+              "per_backend": {
+                "hermes":     { "host": "127.0.0.1", "port": 9119,  "use_tls": false, "credential": "hermes-token" },
+                "opencode":   { "host": "127.0.0.1", "port": 4096,  "use_tls": false, "credential": "" },
+                "mimocode":   { "host": "127.0.0.1", "port": 4096,  "use_tls": false, "credential": "" },
+                "codex":      { "host": "127.0.0.1", "port": 0,     "use_tls": false, "credential": "" },
+                "claudecode": { "host": "127.0.0.1", "port": 0,     "use_tls": false, "credential": "" },
+                "pi":         { "host": "127.0.0.1", "port": 0,     "use_tls": false, "credential": "" },
+                "openclaw":   { "host": "liuxl.example.com", "port": 18789, "use_tls": true, "credential": "" }
+              }
+            }"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = Settings::load_from(temp.path());
+        assert_eq!(settings.backend_kind, BackendKind::OpenClaw);
+        assert!(settings.is_backend_enabled(BackendKind::OpenClaw));
+        assert_eq!(
+            BackendKind::ALL
+                .iter()
+                .filter(|kind| settings.is_backend_enabled(**kind))
+                .count(),
+            1,
+            "an upgraded install must come up with exactly one backend on"
+        );
+        // The address and the other backends' credentials must survive.
+        assert_eq!(settings.backend_host, "liuxl.example.com");
+        assert_eq!(settings.backend_port, 18789);
+        assert!(settings.backend_use_tls);
+        assert_eq!(
+            settings.stored_credential_characters(BackendKind::Hermes),
+            "hermes-token".chars().count(),
+            "another backend's stored token must not be wiped by the upgrade"
+        );
+    }
+
+    #[test]
+    fn a_legacy_install_with_auto_connect_off_stays_disconnected() {
+        let temp = TempSettings::new();
+        std::fs::write(
+            temp.path(),
+            br#"{"backend_kind": "OpenClaw", "auto_connect": false}"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = Settings::load_from(temp.path());
+        assert!(BackendKind::ALL
+            .iter()
+            .all(|kind| !settings.is_backend_enabled(*kind)));
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_preserved_instead_of_reset() {
+        let temp = TempSettings::new();
+        let broken = b"{ this is not json";
+        std::fs::write(temp.path(), broken).expect("write broken settings");
+
+        let settings = Settings::load_from(temp.path());
+        assert_eq!(settings.backend_kind, BackendKind::Hermes);
+
+        // The unreadable file is kept for inspection rather than deleted, and
+        // the file that replaced it is valid.
+        let backup = temp.path().with_extension("json.corrupt");
+        assert_eq!(
+            std::fs::read(&backup).expect("the unreadable file must be kept"),
+            broken
+        );
+        let rewritten = std::fs::read(temp.path()).expect("rewritten settings");
+        serde_json::from_slice::<Settings>(&rewritten).expect("rewritten file parses");
+    }
+
+    #[test]
+    fn saving_leaves_no_temporary_file_behind() {
+        let temp = TempSettings::new();
+        Settings::default().save_to(temp.path());
+
+        assert!(temp.path().exists());
+        assert!(
+            !temp.path().with_extension("json.tmp").exists(),
+            "the temporary file is renamed into place, never left behind"
+        );
+    }
+
+    #[test]
+    fn each_backend_keeps_its_own_credential_across_a_switch() {
+        let temp = TempSettings::new();
+        let mut settings = Settings {
+            backend_kind: BackendKind::OpenClaw,
+            backend_host: "claw.example.com".into(),
+            backend_port: 18789,
+            session_token: "openclaw-secret".into(),
+            ..Settings::default()
+        };
+        settings.save_to(temp.path());
+
+        settings.switch_backend(BackendKind::Hermes);
+        settings.session_token = "hermes-secret".into();
+        settings.save_to(temp.path());
+
+        // Reload, then switch back: each backend comes up with its own token and
+        // address, which is what makes the separate switches usable.
+        let mut reloaded = Settings::load_from(temp.path());
+        assert_eq!(reloaded.session_token, "hermes-secret");
+        reloaded.switch_backend(BackendKind::OpenClaw);
+        assert_eq!(reloaded.session_token, "openclaw-secret");
+        assert_eq!(reloaded.backend_host, "claw.example.com");
+        assert_eq!(reloaded.backend_port, 18789);
+    }
+
+    #[test]
+    fn switching_backend_keeps_each_switch_as_it_was() {
+        let temp = TempSettings::new();
+        let mut settings = Settings::default();
+        settings.set_backend_enabled(BackendKind::OpenClaw, true);
+
+        settings.switch_backend(BackendKind::Hermes);
+        settings.switch_backend(BackendKind::OpenClaw);
+        settings.save_to(temp.path());
+
+        // Switching must not turn a backend on or off behind the user's back.
+        assert!(settings.is_backend_enabled(BackendKind::OpenClaw));
+        assert!(!settings.is_backend_enabled(BackendKind::Hermes));
     }
 }

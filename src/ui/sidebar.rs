@@ -11,10 +11,15 @@ pub struct SidebarView {
     confirm_action: Option<ConfirmAction>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ConfirmAction {
     ArchiveAll,
     DeleteAll,
+    /// Per-session actions, so one conversation can be archived or deleted
+    /// without touching the rest of the list. Confirmed the same way as the
+    /// bulk actions.
+    ArchiveOne(Box<AgentSession>),
+    DeleteOne(Box<AgentSession>),
 }
 
 impl SidebarView {
@@ -38,7 +43,7 @@ impl Render for SidebarView {
             )
         };
 
-        let confirm = self.confirm_action;
+        let confirm = self.confirm_action.clone();
 
         div()
             .flex()
@@ -116,16 +121,30 @@ impl Render for SidebarView {
 impl SidebarView {
     fn render_confirm(&self, action: ConfirmAction, cx: &mut Context<Self>) -> AnyElement {
         let count = self.state.read(cx).sessions.len();
-        let (title, body, confirm_label) = match action {
+        let (title, body, confirm_label, is_destructive) = match &action {
             ConfirmAction::ArchiveAll => (
                 format!("Archive all {count} sessions?"),
-                "Sessions will be removed from the list; transcripts are kept.",
+                "Sessions will be removed from the list; transcripts are kept.".to_string(),
                 "Archive all",
+                false,
             ),
             ConfirmAction::DeleteAll => (
                 format!("Delete all {count} sessions?"),
-                "Sessions and their transcripts will be permanently deleted.",
+                "Sessions and their transcripts will be permanently deleted.".to_string(),
                 "Delete all",
+                true,
+            ),
+            ConfirmAction::ArchiveOne(session) => (
+                format!("Archive “{}”?", session.display_title()),
+                "The session leaves the list; its transcript is kept.".to_string(),
+                "Archive",
+                false,
+            ),
+            ConfirmAction::DeleteOne(session) => (
+                format!("Delete “{}”?", session.display_title()),
+                "The session and its transcript will be permanently deleted.".to_string(),
+                "Delete",
+                true,
             ),
         };
         div()
@@ -169,7 +188,7 @@ impl SidebarView {
                     .child(
                         small_button(
                             confirm_label,
-                            if action == ConfirmAction::DeleteAll {
+                            if is_destructive {
                                 crate::ui::theme::Theme::danger()
                             } else {
                                 crate::ui::theme::Theme::accent()
@@ -179,13 +198,19 @@ impl SidebarView {
                             move |this, _event, _window, cx| {
                                 this.confirm_action = None;
                                 let state = this.state.clone();
-                                match action {
+                                match action.clone() {
                                     ConfirmAction::ArchiveAll => {
                                         state.update(cx, |state, cx| state.archive_all(cx))
                                     }
                                     ConfirmAction::DeleteAll => {
                                         state.update(cx, |state, cx| state.delete_all(cx))
                                     }
+                                    ConfirmAction::ArchiveOne(session) => state
+                                        .update(cx, |state, cx| {
+                                            state.archive_session(&session, cx)
+                                        }),
+                                    ConfirmAction::DeleteOne(session) => state
+                                        .update(cx, |state, cx| state.delete_session(&session, cx)),
                                 }
                             },
                         )),
@@ -216,10 +241,14 @@ impl SidebarView {
                 .into_any();
         }
 
+        let sidebar = cx.entity();
         let rows = sessions
             .into_iter()
             .map(|session| {
                 let is_selected = selected_id.as_deref() == Some(session.id.as_str());
+                let row_hash = hash_id(&session.id);
+                let archive_target = session.clone();
+                let delete_target = session.clone();
                 div()
                     .id(gpui::ElementId::NamedInteger(
                         "session-row".into(),
@@ -259,6 +288,7 @@ impl SidebarView {
                         div()
                             .flex()
                             .flex_row()
+                            .items_center()
                             .gap_2()
                             .text_size(px(10.0))
                             .text_color(crate::ui::theme::Theme::text_tertiary())
@@ -274,13 +304,65 @@ impl SidebarView {
                                         div().child(session.profile.clone().unwrap_or_default()),
                                     )
                                 },
-                            ),
+                            )
+                            .child(div().flex_1())
+                            .child(session_row_action(
+                                format!("session-archive-{row_hash}"),
+                                "Archive",
+                                {
+                                    let sidebar = sidebar.clone();
+                                    move |_event, _window, cx| {
+                                        // The row itself resumes the session, so the
+                                        // action must not also trigger that.
+                                        cx.stop_propagation();
+                                        sidebar.update(cx, |this, cx| {
+                                            this.confirm_action = Some(ConfirmAction::ArchiveOne(
+                                                Box::new(archive_target.clone()),
+                                            ));
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                            ))
+                            .child(session_row_action(
+                                format!("session-delete-{row_hash}"),
+                                "Delete",
+                                {
+                                    let sidebar = sidebar.clone();
+                                    move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                        sidebar.update(cx, |this, cx| {
+                                            this.confirm_action = Some(ConfirmAction::DeleteOne(
+                                                Box::new(delete_target.clone()),
+                                            ));
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                            )),
                     )
             })
             .collect::<Vec<_>>();
 
         div().flex().flex_col().children(rows).into_any()
     }
+}
+
+/// A small text action on a session row. The row's own click resumes the
+/// session, so these stop propagation and hand the choice to the confirmation
+/// panel above the list.
+fn session_row_action<F>(id: String, label: &'static str, on_click: F) -> Stateful<gpui::Div>
+where
+    F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+{
+    div()
+        .id(gpui::ElementId::Name(id.into()))
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::ui::theme::Theme::accent_soft()))
+        .on_click(on_click)
+        .child(label)
 }
 
 fn render_row_title(session: &AgentSession) -> gpui::AnyElement {
@@ -312,7 +394,7 @@ fn render_row_title(session: &AgentSession) -> gpui::AnyElement {
 
 fn header_button(label: &'static str, enabled: bool) -> Stateful<gpui::Div> {
     let base = div()
-        .id(ElementIdName(label))
+        .id(element_id_name(label))
         .px_2()
         .py_1()
         .rounded_md()
@@ -332,7 +414,7 @@ fn header_button(label: &'static str, enabled: bool) -> Stateful<gpui::Div> {
 
 fn small_button(label: &'static str, color: Hsla) -> Stateful<gpui::Div> {
     div()
-        .id(ElementIdName(label))
+        .id(element_id_name(label))
         .px_2()
         .py_1()
         .rounded_md()
@@ -344,7 +426,7 @@ fn small_button(label: &'static str, color: Hsla) -> Stateful<gpui::Div> {
 }
 
 // ElementId::Name takes a SharedString; tiny shim keeps call sites tidy.
-fn ElementIdName(label: &'static str) -> gpui::ElementId {
+fn element_id_name(label: &'static str) -> gpui::ElementId {
     gpui::ElementId::Name(label.into())
 }
 

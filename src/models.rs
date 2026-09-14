@@ -10,18 +10,8 @@ macro_rules! bitflags_like {
         impl $name {
             $(pub const $variant: Self = Self($value);)*
 
-            pub const fn bits(self) -> $t { self.0 }
-
             pub const fn contains(self, other: Self) -> bool {
                 self.0 & other.0 == other.0
-            }
-
-            pub const fn union(self, other: Self) -> Self {
-                Self(self.0 | other.0)
-            }
-
-            pub const fn is_empty(self) -> bool {
-                self.0 == 0
             }
         }
 
@@ -156,17 +146,6 @@ impl ComposerAttachment {
             .unwrap_or_else(|| self.path.clone())
     }
 
-    pub fn is_image(&self) -> bool {
-        let ext = std::path::Path::new(&self.path)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "heic" | "webp" | "tiff" | "bmp"
-        )
-    }
-
     pub fn kind_label(&self) -> &'static str {
         if std::path::Path::new(&self.path).is_dir() {
             "Folder"
@@ -234,15 +213,6 @@ impl MessageRole {
             "system" => Some(MessageRole::System),
             "tool" => Some(MessageRole::Tool),
             _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-            MessageRole::System => "system",
-            MessageRole::Tool => "tool",
         }
     }
 }

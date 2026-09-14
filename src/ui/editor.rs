@@ -88,7 +88,6 @@ pub struct Editor {
     lines: Vec<LineEntry>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    max_rows: f32,
     /// Single-line fields hide newlines and use input cursor style.
     single_line: bool,
     /// Long single values such as credentials may wrap visually while still
@@ -123,7 +122,6 @@ impl Editor {
             lines: Vec::new(),
             last_bounds: None,
             is_selecting: false,
-            max_rows: if single_line { 1.0 } else { 8.0 },
             single_line,
             wrap_long_lines,
         }
@@ -157,14 +155,6 @@ impl Editor {
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_text("", cx);
-    }
-
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus_handle);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.content.is_empty()
     }
 
     // -- movement ---------------------------------------------------------

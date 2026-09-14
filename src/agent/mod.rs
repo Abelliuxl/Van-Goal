@@ -25,12 +25,8 @@ impl Backend {
     pub fn make(kind: BackendKind) -> Self {
         match kind {
             BackendKind::Hermes => Backend::Hermes(hermes::HermesBackend::new()),
-            BackendKind::OpenCode => {
-                Backend::OpenCode(opencode::OpenCodeBackend::new("opencode", "OpenCode"))
-            }
-            BackendKind::MiMoCode => {
-                Backend::MiMoCode(opencode::OpenCodeBackend::new("mimocode", "MiMoCode"))
-            }
+            BackendKind::OpenCode => Backend::OpenCode(opencode::OpenCodeBackend::new("OpenCode")),
+            BackendKind::MiMoCode => Backend::MiMoCode(opencode::OpenCodeBackend::new("MiMoCode")),
             BackendKind::Codex => Backend::Codex(cli::LocalCliBackend::new(BackendKind::Codex)),
             BackendKind::ClaudeCode => {
                 Backend::ClaudeCode(cli::LocalCliBackend::new(BackendKind::ClaudeCode))
@@ -49,18 +45,6 @@ impl Backend {
             Backend::ClaudeCode(_) => "claudecode",
             Backend::Pi(_) => "pi",
             Backend::OpenClaw(_) => "openclaw",
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Backend::Hermes(_) => "Hermes",
-            Backend::OpenCode(_) => "OpenCode",
-            Backend::MiMoCode(_) => "MiMoCode",
-            Backend::Codex(_) => "Codex CLI",
-            Backend::ClaudeCode(_) => "Claude Code",
-            Backend::Pi(_) => "Pi",
-            Backend::OpenClaw(_) => "OpenClaw",
         }
     }
 
