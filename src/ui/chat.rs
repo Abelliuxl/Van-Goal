@@ -102,6 +102,16 @@ pub struct ChatView {
     scrollbar_grab: Option<f32>,
     /// Bumped on every programmatic scroll so stale next-frame callbacks bail.
     scroll_epoch: u64,
+    /// Message the pointer is over, which is what reveals its copy button. It
+    /// stays set briefly after the pointer leaves so the button can be reached.
+    hovered_message: Option<String>,
+    /// Pending hide of `hovered_message`. Dropping the task cancels it, which
+    /// is how re-entering the message keeps the button up.
+    copy_hide_task: Option<gpui::Task<()>>,
+    /// Message copied most recently, so its button can confirm the copy.
+    copied_message: Option<String>,
+    /// Pending reset of `copied_message`.
+    copied_reset_task: Option<gpui::Task<()>>,
 }
 
 impl ChatView {
@@ -167,7 +177,63 @@ impl ChatView {
             list_hovered: false,
             scrollbar_grab: None,
             scroll_epoch: 0,
+            hovered_message: None,
+            copy_hide_task: None,
+            copied_message: None,
+            copied_reset_task: None,
         }
+    }
+
+    /// How long the copy button stays after the pointer leaves a message, so it
+    /// can actually be reached.
+    const COPY_HIDE_DELAY: Duration = Duration::from_millis(700);
+    /// How long the checkmark stays before the button returns to the copy icon.
+    const COPY_CONFIRMATION: Duration = Duration::from_millis(1400);
+
+    /// Reveal or hide the copy button for a message. Leaving starts a timer
+    /// rather than hiding at once: the button sits away from the text, so an
+    /// immediate hide would make it impossible to click.
+    fn set_message_hovered(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        match id {
+            Some(id) => {
+                // Cancels a pending hide: the pointer came back in time.
+                self.copy_hide_task = None;
+                if self.hovered_message.as_deref() != Some(id.as_str()) {
+                    self.hovered_message = Some(id);
+                    cx.notify();
+                }
+            }
+            None => {
+                if self.hovered_message.is_none() {
+                    return;
+                }
+                self.copy_hide_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Self::COPY_HIDE_DELAY).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.hovered_message = None;
+                        this.copy_hide_task = None;
+                        cx.notify();
+                    });
+                }));
+            }
+        }
+    }
+
+    /// Put a message on the clipboard and show the checkmark on its button.
+    fn copy_message(&mut self, id: &str, content: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(content));
+        self.copied_message = Some(id.to_string());
+        self.copied_reset_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Self::COPY_CONFIRMATION)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.copied_message = None;
+                this.copied_reset_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// Identity of the message list currently rendered: switching sessions has
@@ -524,13 +590,18 @@ impl ChatView {
             let Some(message) = messages.get(index) else {
                 return div().into_any();
             };
-            let expanded = chat_for_list
-                .read(cx)
-                .expanded_messages
-                .contains(&message.id);
+            let (expanded, revealed, copied) = {
+                let chat = chat_for_list.read(cx);
+                (
+                    chat.expanded_messages.contains(&message.id),
+                    chat.hovered_message.as_deref() == Some(message.id.as_str()),
+                    chat.copied_message.as_deref() == Some(message.id.as_str()),
+                )
+            };
             render_message_bubble(
                 message,
                 expanded,
+                CopyButton { revealed, copied },
                 index,
                 chat_for_list.clone(),
                 state_entity.clone(),
@@ -1275,9 +1346,106 @@ fn render_model_menu(
     menu.into_any()
 }
 
+/// Whether a message's copy button is showing, and whether it is currently
+/// confirming a copy.
+#[derive(Clone, Copy, Default)]
+struct CopyButton {
+    revealed: bool,
+    copied: bool,
+}
+
+/// Two offset sheets. Drawn rather than typed: the glyphs that mean "copy" are
+/// missing from most fonts and would fall back to something unrecognisable.
+fn copy_icon() -> AnyElement {
+    let ink = Theme::text_secondary();
+    div()
+        .relative()
+        .w(px(13.0))
+        .h(px(13.0))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(9.0))
+                .h(px(9.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(ink),
+        )
+        .child(
+            // The front sheet is filled with the transcript background so it
+            // covers the back sheet's corner instead of crossing its outline.
+            div()
+                .absolute()
+                .bottom_0()
+                .right_0()
+                .w(px(9.0))
+                .h(px(9.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(ink)
+                .bg(Theme::window_bg()),
+        )
+        .into_any()
+}
+
+fn copied_icon() -> AnyElement {
+    div()
+        .text_size(px(12.0))
+        .text_color(Theme::ok())
+        .child("✓")
+        .into_any()
+}
+
+/// The copy affordance. It is hidden, not absent, while the pointer is away:
+/// removing it from the tree would reflow the header every time the pointer
+/// crossed the transcript.
+fn copy_button<F>(state: CopyButton, id_hash: u64, on_click: F) -> AnyElement
+where
+    F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+{
+    div()
+        .id(gpui::ElementId::NamedInteger(
+            "copy-message".into(),
+            id_hash,
+        ))
+        .debug_selector(move || {
+            format!(
+                "copy-button-{}",
+                match (state.copied, state.revealed) {
+                    (true, _) => "copied",
+                    (false, true) => "revealed",
+                    (false, false) => "hidden",
+                }
+            )
+        })
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .w(px(22.0))
+        .h(px(20.0))
+        .rounded_sm()
+        .cursor_pointer()
+        .opacity(if state.revealed || state.copied {
+            1.0
+        } else {
+            0.0
+        })
+        .on_click(on_click)
+        .child(if state.copied {
+            copied_icon()
+        } else {
+            copy_icon()
+        })
+        .into_any()
+}
+
 fn render_message_bubble(
     message: &crate::models::ChatMessage,
     expanded: bool,
+    copy: CopyButton,
     index: usize,
     chat: Entity<ChatView>,
     state: Entity<AppState>,
@@ -1330,13 +1498,30 @@ fn render_message_bubble(
             )
             .into_any(),
         MessageRole::Assistant => {
+            let has_content = !message.is_streaming && !message.content.trim().is_empty();
             let mut bubble = div()
+                .id(gpui::ElementId::NamedInteger(
+                    "assistant-message".into(),
+                    id_hash,
+                ))
+                .debug_selector(move || format!("assistant-message-{index}"))
                 .w_full()
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
                 .gap_1()
-                .py_1();
+                .py_1()
+                // The pointer has to be over the message itself, not over the
+                // button, for the button to appear — and leaving it starts a
+                // grace period rather than hiding straight away.
+                .on_hover({
+                    let chat = chat.clone();
+                    let message_id = message.id.clone();
+                    move |hovered: &bool, _window, cx| {
+                        let id = hovered.then(|| message_id.clone());
+                        chat.update(cx, |chat, cx| chat.set_message_hovered(id, cx));
+                    }
+                });
 
             bubble = bubble.child(
                 div()
@@ -1358,6 +1543,25 @@ fn render_message_bubble(
                                 .text_color(Theme::accent())
                                 .child("streaming…"),
                         )
+                    })
+                    // Sits in the header row so revealing it costs no height:
+                    // reserving a line under every message would waste space in
+                    // the common case where nobody copies anything.
+                    .when(has_content, |this| {
+                        let chat = chat.clone();
+                        let message_id = message.id.clone();
+                        let content = message.content.clone();
+                        this.child(div().flex_1()).child(copy_button(
+                            copy,
+                            id_hash,
+                            move |_event, _window, cx| {
+                                let message_id = message_id.clone();
+                                let content = content.clone();
+                                chat.update(cx, |chat, cx| {
+                                    chat.copy_message(&message_id, content.clone(), cx)
+                                });
+                            },
+                        ))
                     }),
             );
 
@@ -1367,33 +1571,6 @@ fn render_message_bubble(
 
             if !message.content.trim().is_empty() {
                 bubble = bubble.child(render_blocks(&markdown::parse(&message.content)));
-            }
-
-            if !message.is_streaming && !message.content.trim().is_empty() {
-                let content = message.content.clone();
-                bubble = bubble.child(
-                    div().flex().flex_row().child(
-                        div()
-                            .id(gpui::ElementId::NamedInteger(
-                                "copy-message".into(),
-                                id_hash,
-                            ))
-                            .px_2()
-                            .py(px(2.0))
-                            .rounded_full()
-                            .bg(Theme::tool_bg())
-                            .text_size(px(10.0))
-                            .text_color(Theme::text_tertiary())
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(Theme::text()))
-                            .on_click(move |_event, _window, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    content.clone(),
-                                ));
-                            })
-                            .child("Copy"),
-                    ),
-                );
             }
 
             let _ = state;
@@ -2086,6 +2263,135 @@ mod message_width_tests {
             f32::from(second.origin.y) >= first_bottom - 0.5,
             "the reply starts at {} but the prompt bubble runs to {first_bottom}",
             f32::from(second.origin.y)
+        );
+    }
+}
+
+#[cfg(test)]
+mod copy_button_tests {
+    use super::*;
+    use crate::models::ChatMessage;
+    use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    struct SizedChat(Entity<ChatView>);
+
+    impl Render for SizedChat {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(800.0))
+                .h(px(600.0))
+                .flex()
+                .flex_col()
+                .child(self.0.clone())
+        }
+    }
+
+    /// One reply, plus the id it was given so the test can address it.
+    fn render_reply(cx: &mut TestAppContext) -> (Entity<ChatView>, String, &mut VisualTestContext) {
+        let message = ChatMessage::new(MessageRole::Assistant, "hello there".to_string());
+        let id = message.id.clone();
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.messages = vec![message];
+        });
+        let (host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        let view = host.read_with(cx, |host, _cx| host.0.clone());
+        cx.run_until_parked();
+        (view, id, cx)
+    }
+
+    fn hover(view: &Entity<ChatView>, id: Option<String>, cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            view.update(cx, |chat, cx| chat.set_message_hovered(id, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_copy_button_stays_hidden_until_the_message_is_hovered(cx: &mut TestAppContext) {
+        let (view, id, cx) = render_reply(cx);
+        assert!(
+            cx.debug_bounds("copy-button-hidden").is_some(),
+            "the copy button is showing before anything is hovered"
+        );
+
+        hover(&view, Some(id), cx);
+        assert!(
+            cx.debug_bounds("copy-button-revealed").is_some(),
+            "hovering the message did not reveal its copy button"
+        );
+        assert!(cx.debug_bounds("copy-button-hidden").is_none());
+    }
+
+    /// The button sits in the message header, away from the text, so hiding it
+    /// the instant the pointer leaves would make it unclickable.
+    #[gpui::test]
+    fn the_copy_button_lingers_after_the_pointer_leaves(cx: &mut TestAppContext) {
+        let (view, id, cx) = render_reply(cx);
+        hover(&view, Some(id), cx);
+        assert!(cx.debug_bounds("copy-button-revealed").is_some());
+
+        hover(&view, None, cx);
+        assert!(
+            cx.debug_bounds("copy-button-revealed").is_some(),
+            "the button vanished the moment the pointer left"
+        );
+
+        cx.executor()
+            .advance_clock(ChatView::COPY_HIDE_DELAY + Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("copy-button-hidden").is_some(),
+            "the button never went away after the grace period"
+        );
+    }
+
+    #[gpui::test]
+    fn a_copy_is_confirmed_then_the_button_returns(cx: &mut TestAppContext) {
+        let (view, id, cx) = render_reply(cx);
+        hover(&view, Some(id.clone()), cx);
+
+        cx.update(|_window, cx| {
+            view.update(cx, |chat, cx| {
+                chat.copy_message(&id, "hello there".to_string(), cx)
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("copy-button-copied").is_some(),
+            "copying gave no visible confirmation"
+        );
+
+        cx.executor()
+            .advance_clock(ChatView::COPY_CONFIRMATION + Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("copy-button-copied").is_none(),
+            "the confirmation never cleared"
+        );
+        assert!(
+            cx.debug_bounds("copy-button-revealed").is_some(),
+            "the button did not come back after confirming"
+        );
+    }
+
+    /// Leaving and coming back must cancel the pending hide rather than let it
+    /// fire while the pointer is back on the message.
+    #[gpui::test]
+    fn returning_to_the_message_cancels_the_pending_hide(cx: &mut TestAppContext) {
+        let (view, id, cx) = render_reply(cx);
+        hover(&view, Some(id.clone()), cx);
+        hover(&view, None, cx);
+        hover(&view, Some(id), cx);
+
+        cx.executor()
+            .advance_clock(ChatView::COPY_HIDE_DELAY + Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("copy-button-revealed").is_some(),
+            "the button hid even though the pointer was back on the message"
         );
     }
 }
