@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod cache;
+pub mod chat;
 pub mod hermes_config;
 pub mod jsonl_process;
 pub mod local_server;
