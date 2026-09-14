@@ -87,12 +87,6 @@ impl Render for RootView {
                             .text_color(Theme::accent())
                             .child("Van-Goal"),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(Theme::text_tertiary())
-                            .child("GPUI"),
-                    )
                     .child(div().flex_1())
                     .child(toolbar_button("refresh", "⟳ Refresh", {
                         let state = state_settings;
@@ -194,22 +188,49 @@ fn sidebar_toggle(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id("sidebar-toggle")
+        .debug_selector(|| "sidebar-toggle".into())
         .flex()
         .flex_row()
         .items_center()
         .justify_center()
-        .w(px(26.0))
+        .w(px(28.0))
         .h(px(24.0))
         .rounded_md()
-        .bg(Theme::surface())
-        .border_1()
-        .border_color(Theme::border())
-        .text_size(px(12.0))
-        .text_color(Theme::text_secondary())
         .cursor_pointer()
-        .hover(|style| style.bg(Theme::surface_hover()).text_color(Theme::text()))
+        .hover(|style| style.bg(Theme::surface_hover()))
         .on_click(on_click)
-        .child(if open { "◀" } else { "▶" })
+        .child(sidebar_icon(open))
+}
+
+/// A window with its side panel: the panel is filled while the list is showing
+/// and empty once it is hidden, so the icon reads as a state rather than a
+/// direction. Drawn from primitives because a glyph would not sit on the text
+/// baseline predictably.
+fn sidebar_icon(open: bool) -> gpui::Div {
+    let ink = Theme::text_secondary();
+    div()
+        .debug_selector(move || format!("sidebar-icon-{}", if open { "open" } else { "hidden" }))
+        .w(px(16.0))
+        .h(px(14.0))
+        .rounded_sm()
+        .border_1()
+        .border_color(ink)
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .child(
+            div()
+                .debug_selector(move || {
+                    format!(
+                        "sidebar-icon-panel-{}",
+                        if open { "open" } else { "hidden" }
+                    )
+                })
+                .w(px(4.0))
+                .h_full()
+                .when(open, |this| this.bg(ink)),
+        )
+        .child(div().w(px(1.0)).h_full().bg(ink))
 }
 
 fn pill_color(state: &crate::models::ConnectionState) -> gpui::Hsla {
@@ -219,5 +240,105 @@ fn pill_color(state: &crate::models::ConnectionState) -> gpui::Hsla {
         crate::models::ConnectionState::Disconnected => Theme::text_tertiary(),
         crate::models::ConnectionState::Degraded(_) => Theme::warn(),
         crate::models::ConnectionState::Failed(_) => Theme::danger(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    /// The test platform's window has no intrinsic size, and the shell is
+    /// `size_full`.
+    struct SizedRoot(Entity<RootView>);
+
+    impl Render for SizedRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(1000.0))
+                .h(px(700.0))
+                .flex()
+                .flex_col()
+                .child(self.0.clone())
+        }
+    }
+
+    fn root(cx: &mut TestAppContext, open: bool) -> &mut gpui::VisualTestContext {
+        let state = cx.new(AppState::new);
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| RootView::new(state.clone(), window, cx));
+            view.update(cx, |view, _cx| view.sidebar_open = open);
+            SizedRoot(view)
+        });
+        cx.run_until_parked();
+        cx
+    }
+
+    /// The toggle was a solid triangle glyph. It is now a drawn window with its
+    /// side panel, so it needs a real box to draw into.
+    #[gpui::test]
+    fn the_toolbar_draws_a_sidebar_icon_inside_the_toggle(cx: &mut TestAppContext) {
+        let cx = root(cx, true);
+
+        let toggle = cx
+            .debug_bounds("sidebar-toggle")
+            .expect("the sidebar toggle was not laid out");
+        assert!(
+            f32::from(toggle.size.width) >= 20.0 && f32::from(toggle.size.height) >= 20.0,
+            "the toggle is too small to hold an icon: {}x{}",
+            f32::from(toggle.size.width),
+            f32::from(toggle.size.height)
+        );
+
+        let icon = cx
+            .debug_bounds("sidebar-icon-open")
+            .expect("the sidebar icon was not laid out");
+        assert!(
+            f32::from(icon.size.width) > 0.0 && f32::from(icon.size.height) > 0.0,
+            "the sidebar icon collapsed"
+        );
+        assert!(
+            f32::from(icon.origin.x) >= f32::from(toggle.origin.x) - 0.5
+                && f32::from(icon.origin.x) + f32::from(icon.size.width)
+                    <= f32::from(toggle.origin.x) + f32::from(toggle.size.width) + 0.5
+                && f32::from(icon.origin.y) + f32::from(icon.size.height)
+                    <= f32::from(toggle.origin.y) + f32::from(toggle.size.height) + 0.5,
+            "the sidebar icon escapes its button"
+        );
+    }
+
+    /// The panel is what distinguishes shown from hidden, so it has to exist in
+    /// both states and fill the icon's height.
+    #[gpui::test]
+    fn the_icon_panel_is_drawn_in_both_states(cx: &mut TestAppContext) {
+        for (open, selector) in [
+            (true, "sidebar-icon-panel-open"),
+            (false, "sidebar-icon-panel-hidden"),
+        ] {
+            let cx = root(cx, open);
+            let panel = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no panel for open={open}"));
+            let icon = cx
+                .debug_bounds(if open {
+                    "sidebar-icon-open"
+                } else {
+                    "sidebar-icon-hidden"
+                })
+                .expect("icon");
+            assert!(
+                f32::from(panel.size.width) > 0.0 && f32::from(panel.size.height) > 0.0,
+                "the panel has no size for open={open}"
+            );
+            // The panel fills the icon's interior, which sits inside a 1px
+            // border, so it spans the icon without exceeding it.
+            assert!(
+                f32::from(panel.size.height) <= f32::from(icon.size.height)
+                    && f32::from(panel.size.height) >= f32::from(icon.size.height) - 3.0,
+                "the panel does not span the icon for open={open}: panel={} icon={}",
+                f32::from(panel.size.height),
+                f32::from(icon.size.height)
+            );
+        }
     }
 }
