@@ -103,10 +103,7 @@ impl Render for SidebarView {
                     .w_full()
                     .bg(crate::ui::theme::Theme::border()),
             )
-            .children(match confirm {
-                Some(action) => Some(self.render_confirm(action, cx)),
-                None => None,
-            })
+            .children(confirm.map(|action| self.render_confirm(action, cx)))
             .child(
                 div()
                     .id("sidebar-list")

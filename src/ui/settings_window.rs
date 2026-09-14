@@ -5,7 +5,6 @@ use gpui::{
     actions, div, prelude::*, px, AnyElement, Context, Entity, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Render, SharedString, Styled, Window,
 };
-use std::time::Duration;
 
 actions!(hermit, [OpenSettings]);
 
@@ -65,7 +64,7 @@ impl SettingsView {
         });
 
         // Persist edits straight into the settings store.
-        let persist_host = {
+        {
             let state = state.clone();
             cx.subscribe(
                 &host_editor,
@@ -80,8 +79,7 @@ impl SettingsView {
                 },
             )
             .detach()
-        };
-        let _ = persist_host;
+        }
         let port_state = state.clone();
         cx.subscribe(
             &port_editor,
@@ -534,6 +532,7 @@ fn backend_row(
         .id(gpui::ElementId::Name(
             format!("backend-row-{}", kind.id()).into(),
         ))
+        .debug_selector(move || format!("backend-row-{}", kind.id()))
         .flex()
         .flex_row()
         .items_center()
@@ -581,14 +580,16 @@ fn backend_row(
         .into_any()
 }
 
-/// A labelled track-and-knob switch. Captioned for accessibility with the
-/// backend it controls, since seven of them sit next to each other.
+/// A labelled track-and-knob switch. The caller supplies the id, which doubles
+/// as the debug selector so a test can find each backend's switch.
 fn switch_toggle<F>(id: String, is_on: bool, on_click: F) -> AnyElement
 where
     F: Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
+    let selector = id.clone();
     div()
         .id(gpui::ElementId::Name(id.into()))
+        .debug_selector(move || selector.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -802,14 +803,86 @@ fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
     }
 }
 
-// Keep SharedString import used on all platforms.
-#[allow(unused)]
-fn _use_shared(s: SharedString) -> String {
-    s.to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::BackendKind;
+    use gpui::{AppContext, TestAppContext};
 
-// Silence unused import warning for Duration (kept for future debounces).
-#[allow(unused)]
-fn _use_duration() -> Duration {
-    Duration::from_secs(1)
+    /// A box to lay the backend list out in: the test platform's window has no
+    /// intrinsic size.
+    struct SizedList(Vec<AnyElement>);
+
+    impl Render for SizedList {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(560.0))
+                .h(px(680.0))
+                .flex()
+                .flex_col()
+                .children(std::mem::take(&mut self.0))
+        }
+    }
+
+    /// Every backend needs its own switch, and each one has to be laid out with
+    /// a real size inside its row — a list of seven is exactly where a layout
+    /// bug would hide.
+    #[gpui::test]
+    fn every_backend_gets_its_own_switch(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        let settings = state.update(cx, |state, _cx| state.settings.clone());
+        let rows: Vec<AnyElement> = BackendKind::ALL
+            .iter()
+            .map(|kind| {
+                backend_row(
+                    *kind,
+                    settings.is_backend_enabled(*kind),
+                    settings.backend_kind == *kind,
+                    "Off".to_string(),
+                    state.clone(),
+                )
+            })
+            .collect();
+        let (_host, cx) = cx.add_window_view(|_window, _cx| SizedList(rows));
+        cx.run_until_parked();
+
+        // `debug_bounds` takes a `&'static str`, so the selectors are spelled
+        // out here in the same order as `BackendKind::ALL`.
+        const SELECTORS: [(&str, &str); 7] = [
+            ("backend-row-hermes", "backend-switch-hermes"),
+            ("backend-row-opencode", "backend-switch-opencode"),
+            ("backend-row-mimocode", "backend-switch-mimocode"),
+            ("backend-row-codex", "backend-switch-codex"),
+            ("backend-row-claudecode", "backend-switch-claudecode"),
+            ("backend-row-pi", "backend-switch-pi"),
+            ("backend-row-openclaw", "backend-switch-openclaw"),
+        ];
+
+        for (kind, (row_selector, switch_selector)) in BackendKind::ALL.iter().zip(SELECTORS) {
+            let row = cx
+                .debug_bounds(row_selector)
+                .unwrap_or_else(|| panic!("{} has no row", kind.id()));
+            assert!(
+                f32::from(row.size.height) > 0.0,
+                "{} row collapsed to zero height",
+                kind.id()
+            );
+
+            let switch = cx
+                .debug_bounds(switch_selector)
+                .unwrap_or_else(|| panic!("{} has no switch", kind.id()));
+            assert!(
+                f32::from(switch.size.width) > 0.0 && f32::from(switch.size.height) > 0.0,
+                "{} switch has no size",
+                kind.id()
+            );
+            assert!(
+                f32::from(switch.origin.x) >= f32::from(row.origin.x)
+                    && f32::from(switch.origin.x) + f32::from(switch.size.width)
+                        <= f32::from(row.origin.x) + f32::from(row.size.width) + 1.0,
+                "{} switch escaped its row",
+                kind.id()
+            );
+        }
+    }
 }

@@ -18,6 +18,7 @@ Hermit GPUI is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit)
 - **Queue + clarify** — queue follow-up prompts while a turn is running (send now / edit / cancel), and answer Hermes clarify prompts from a tappable card or the composer.
 - **Model switcher** — pick any provider/model your Hermes config exposes, with a context-window meter.
 - **Permission modes** — Full access / Ask first / Restricted tools, applied through `hermes config set`.
+- **One switch per backend** — each backend has its own on/off switch in Settings. Switching one on connects it and switches the others off; switching it off disconnects it and keeps it off after a restart. The backend you were last using is the one that comes back on launch.
 - **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
 
 ## Build
@@ -69,9 +70,9 @@ OpenClaw connections create a stable Ed25519 device identity in Hermit's local a
 ### Connect to OpenClaw
 
 1. Start the OpenClaw Gateway and note its host, port, TLS setting, and `gateway.auth.token`.
-2. Open Hermit Settings, choose **OpenClaw**, enter either a host/port or a complete `ws://` / `wss://` Gateway URL, and click **Connect to OpenClaw**. Complete URLs preserve reverse-proxy paths and override the separate Port and TLS fields.
+2. Open Hermit Settings and switch **OpenClaw** on, entering either a host/port or a complete `ws://` / `wss://` Gateway URL. Complete URLs preserve reverse-proxy paths and override the separate Port and TLS fields.
 3. On the first connection, run `openclaw devices list` on the Gateway host and approve Hermit's exact pending request with `openclaw devices approve <requestId>`.
-4. Connect again. Hermit stores the issued device token in its local app-data directory and keeps Hermes and OpenClaw connection settings separate.
+4. Switch OpenClaw on again. Hermit stores the issued device token in its local app-data directory and keeps each backend's connection settings separate; Settings reports that stored token, which is why the gateway-token field can stay empty once the device is paired.
 
 ## Architecture
 
@@ -97,6 +98,7 @@ GPUI owns the main-thread UI executor. A multi-threaded tokio runtime is install
 ## Differences from the SwiftUI Hermit
 
 - System, light, and dark appearance modes are available in Settings.
+- Backends are managed with per-backend switches rather than a single connect action.
 - File attachments are added via the native open panel (the `+` button); drag-and-drop is not wired yet.
 - Inline markdown (bold/links) is not styled per-span yet; block-level structure is.
 
