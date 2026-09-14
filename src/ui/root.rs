@@ -85,7 +85,7 @@ impl Render for RootView {
                             .text_size(px(15.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(Theme::accent())
-                            .child("Hermit"),
+                            .child("Van-Goal"),
                     )
                     .child(
                         div()

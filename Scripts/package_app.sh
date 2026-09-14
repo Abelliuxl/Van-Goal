@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package the release binary into a local HermitGPUI.app bundle.
+# Package the release binary into a local VanGoal.app bundle.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -15,8 +15,8 @@ if [ -z "${SDKROOT:-}" ]; then
     export SDKROOT="$(xcrun --show-sdk-path)"
 fi
 
-APP_NAME="HermitGPUI"
-BUNDLE_ID="com.abelliuxl.HermitGPUI"
+APP_NAME="VanGoal"
+BUNDLE_ID="com.abelliuxl.VanGoal"
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 BUILD_DIR="Build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
@@ -46,9 +46,9 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Hermit</string>
+    <string>Van-Goal</string>
     <key>CFBundleDisplayName</key>
-    <string>Hermit</string>
+    <string>Van-Goal</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>

@@ -208,7 +208,7 @@ impl HermesBackend {
 
     pub async fn create_session(&mut self, config: &BackendConfig) -> Result<SessionIDs> {
         let mut params = serde_json::json!({
-            "source": "hermit",
+            "source": "van-goal",
             "cols": 110,
             "close_on_disconnect": false
         });
@@ -231,7 +231,7 @@ impl HermesBackend {
     ) -> Result<SessionIDs> {
         let mut params = serde_json::json!({
             "session_id": session_id,
-            "source": "hermit",
+            "source": "van-goal",
             "cols": 110,
             "close_on_disconnect": false
         });

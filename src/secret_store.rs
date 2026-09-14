@@ -97,5 +97,5 @@ fn store_lock() -> &'static Mutex<()> {
 }
 
 pub fn openclaw_device_store() -> LocalSecretStore {
-    LocalSecretStore::new(dirs::app_support().join("HermitGPUI/openclaw-device-identity.json"))
+    LocalSecretStore::new(dirs::app_dir().join("openclaw-device-identity.json"))
 }

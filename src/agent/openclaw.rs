@@ -146,7 +146,7 @@ impl OpenClawBackend {
 
     pub async fn create_session(&mut self, config: &BackendConfig) -> Result<SessionIDs> {
         self.ensure_connected(config).await?;
-        let proposed = format!("agent:main:hermit:{}", uuid::Uuid::new_v4());
+        let proposed = format!("agent:main:van-goal:{}", uuid::Uuid::new_v4());
         let result = self
             .gateway
             .request("sessions.create", sessions_create_params(&proposed))
@@ -744,7 +744,7 @@ async fn handle_frame(
                 "maxProtocol": 4,
                 "client": {
                     "id": OPENCLAW_CLIENT_ID,
-                    "displayName": "Hermit GPUI",
+                    "displayName": "Van-Goal",
                     "version": env!("CARGO_PKG_VERSION"),
                     "platform": OPENCLAW_PLATFORM,
                     "deviceFamily": OPENCLAW_DEVICE_FAMILY,
@@ -767,7 +767,7 @@ async fn handle_frame(
                     (true, None) => serde_json::json!({}),
                 },
                 "locale": "en-US",
-                "userAgent": format!("hermit-gpui/{}", env!("CARGO_PKG_VERSION")),
+                "userAgent": format!("van-goal/{}", env!("CARGO_PKG_VERSION")),
                 "device": device
             });
             let frame = serde_json::json!({
@@ -934,16 +934,16 @@ mod tests {
     #[test]
     fn session_rpc_params_match_openclaw_v4_schema() {
         assert_eq!(
-            sessions_create_params("agent:main:hermit:test"),
-            serde_json::json!({ "key": "agent:main:hermit:test" })
+            sessions_create_params("agent:main:van-goal:test"),
+            serde_json::json!({ "key": "agent:main:van-goal:test" })
         );
         assert_eq!(
-            session_messages_subscribe_params("agent:main:hermit:test"),
-            serde_json::json!({ "key": "agent:main:hermit:test" })
+            session_messages_subscribe_params("agent:main:van-goal:test"),
+            serde_json::json!({ "key": "agent:main:van-goal:test" })
         );
         assert_eq!(
-            legacy_session_messages_subscribe_params("agent:main:hermit:test"),
-            serde_json::json!({ "sessionKey": "agent:main:hermit:test" })
+            legacy_session_messages_subscribe_params("agent:main:van-goal:test"),
+            serde_json::json!({ "sessionKey": "agent:main:van-goal:test" })
         );
     }
 

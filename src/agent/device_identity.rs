@@ -11,7 +11,7 @@ pub const OPENCLAW_SCOPES: &[&str] = &["operator.read", "operator.write", "opera
 pub const OPENCLAW_PLATFORM: &str = "darwin";
 pub const OPENCLAW_DEVICE_FAMILY: &str = "desktop";
 
-/// Stable Ed25519 device identity persisted in Hermit's local app data, used to answer
+/// Stable Ed25519 device identity persisted in Van-Goal's local app data, used to answer
 /// the OpenClaw Gateway connect challenge (port of OpenClawDeviceIdentity).
 pub struct OpenClawDeviceIdentity {
     pub device_id: String,

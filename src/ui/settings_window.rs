@@ -6,7 +6,7 @@ use gpui::{
     IntoElement, ParentElement, Render, SharedString, Styled, Window,
 };
 
-actions!(hermit, [OpenSettings]);
+actions!(van_goal, [OpenSettings]);
 
 pub struct SettingsView {
     state: Entity<AppState>,
@@ -30,7 +30,7 @@ impl SettingsView {
             gpui::WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Hermit Settings".into()),
+                    title: Some("Van-Goal Settings".into()),
                     appears_transparent: false,
                     traffic_light_position: None,
                 }),
@@ -278,16 +278,18 @@ impl Render for SettingsView {
                     },
                 ))
                 .child(hint(if settings.is_managed_local_backend() {
-                    "Local address: Hermit starts and manages hermes serve automatically."
+                    "Local address: Van-Goal starts and manages hermes serve automatically."
                 } else if settings.backend_kind == crate::settings::BackendKind::OpenClaw {
                     "For a reverse-proxy path, paste the complete ws:// or wss:// URL; it overrides Port and TLS."
                 } else {
-                    "Hermit connects to an already-running server at this address."
+                    "Van-Goal connects to an already-running server at this address."
                 }));
         } else {
             connection = connection
                 .child(field_row("Workspace", self.workspace_editor.clone()))
-                .child(hint("Hermit launches the installed CLI in this directory."));
+                .child(hint(
+                    "Van-Goal launches the installed CLI in this directory.",
+                ));
         }
         if settings.backend_kind == crate::settings::BackendKind::Hermes {
             connection = connection
@@ -681,7 +683,7 @@ fn credential_field(
                     .text_size(px(10.0))
                     .text_color(Theme::text_tertiary())
                     .child(format!(
-                        "Hermit also holds a paired-device token for this gateway ({} characters), and that is what it connects with — this field can stay empty.",
+                        "Van-Goal also holds a paired-device token for this gateway ({} characters), and that is what it connects with — this field can stay empty.",
                         stored.device_token_characters
                     )),
             )
@@ -791,7 +793,7 @@ fn credential_help(kind: crate::settings::BackendKind) -> &'static str {
     match kind {
         crate::settings::BackendKind::Hermes => "Local Hermes tokens are discovered automatically.",
         crate::settings::BackendKind::OpenClaw => {
-            "Use gateway.auth.token. Hermit stores it here and keeps the paired-device token the gateway issues in its local app-data file; clearing removes both."
+            "Use gateway.auth.token. Van-Goal stores it here and keeps the paired-device token the gateway issues in its local app-data file; clearing removes both."
         }
         crate::settings::BackendKind::OpenCode => {
             "Matches OPENCODE_SERVER_PASSWORD when server authentication is enabled."

@@ -12,7 +12,7 @@ pub struct SessionCacheStore {
 
 impl SessionCacheStore {
     pub fn new() -> Self {
-        let dir = dirs::app_support().join("HermitGPUI");
+        let dir = dirs::app_dir();
         let _ = std::fs::create_dir_all(&dir);
         Self {
             path: dir.join("SessionCache.json"),

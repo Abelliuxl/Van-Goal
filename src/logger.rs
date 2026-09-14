@@ -5,18 +5,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-/// Minimal debug logger writing to `~/Library/Application Support/HermitGPUI/Hermit.log`.
-/// Mirrors the SwiftUI HermitLogger: disabled by default, opt-in from Settings.
-pub struct HermitLogger {
+/// Minimal debug logger writing to `~/Library/Application Support/VanGoal/VanGoal.log`.
+/// Mirrors the SwiftUI sibling's logger: disabled by default, opt-in from Settings.
+pub struct VanGoalLogger {
     enabled: AtomicBool,
     path: PathBuf,
     handle: Mutex<Option<File>>,
 }
 
-impl HermitLogger {
+impl VanGoalLogger {
     fn log_dir() -> PathBuf {
-        let base = dirs::app_support();
-        base.join("HermitGPUI")
+        dirs::app_dir()
     }
 
     pub fn new() -> Self {
@@ -24,7 +23,7 @@ impl HermitLogger {
         let _ = std::fs::create_dir_all(&dir);
         Self {
             enabled: AtomicBool::new(false),
-            path: dir.join("Hermit.log"),
+            path: dir.join("VanGoal.log"),
             handle: Mutex::new(None),
         }
     }
@@ -71,9 +70,9 @@ impl HermitLogger {
     }
 }
 
-pub fn global_logger() -> &'static HermitLogger {
-    static LOGGER: std::sync::OnceLock<HermitLogger> = std::sync::OnceLock::new();
-    LOGGER.get_or_init(HermitLogger::new)
+pub fn global_logger() -> &'static VanGoalLogger {
+    static LOGGER: std::sync::OnceLock<VanGoalLogger> = std::sync::OnceLock::new();
+    LOGGER.get_or_init(VanGoalLogger::new)
 }
 
 #[macro_export]
@@ -88,6 +87,13 @@ macro_rules! log_debug {
 /// Small helper namespace so the rest of the app can locate support dirs.
 pub mod dirs {
     use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    /// App-data directory name. The app was called Hermit until it was renamed to
+    /// Van-Goal; the old directory is moved into place once so that settings, the
+    /// session cache and the OpenClaw device identity survive the rename.
+    const APP_DIR: &str = "VanGoal";
+    const LEGACY_APP_DIR: &str = "HermitGPUI";
 
     pub fn home() -> PathBuf {
         std::env::var("HOME")
@@ -95,7 +101,159 @@ pub mod dirs {
             .unwrap_or_else(|_| PathBuf::from("/"))
     }
 
+    /// Only the non-test path resolves through here, since tests redirect to a
+    /// temporary directory.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn app_support() -> PathBuf {
         home().join("Library/Application Support")
+    }
+
+    /// Directory holding settings, the session cache and the OpenClaw device
+    /// identity. Every caller goes through here, so the rename happens once,
+    /// before anything reads or creates the directory.
+    pub fn app_dir() -> PathBuf {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(resolve_app_dir).clone()
+    }
+
+    /// Unit tests must never touch the real app data. Building an `AppState`
+    /// loads and saves settings, so a test run would otherwise rewrite the
+    /// developer's own preferences and perform the rename migration for real.
+    #[cfg(test)]
+    fn resolve_app_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("van-goal-test-app-dir-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[cfg(not(test))]
+    fn resolve_app_dir() -> PathBuf {
+        migrate_app_dir(&app_support())
+    }
+
+    /// Resolve the app directory under `support`, moving the pre-rename
+    /// `HermitGPUI` directory into place the first time. Losing that directory
+    /// would mean losing the stored credentials, the session cache and the
+    /// OpenClaw device pairing — which the Gateway would have to approve again.
+    fn migrate_app_dir(support: &std::path::Path) -> PathBuf {
+        let current = support.join(APP_DIR);
+        let legacy = support.join(LEGACY_APP_DIR);
+        if !current.exists() && legacy.exists() && std::fs::rename(&legacy, &current).is_err() {
+            // A rename fails across volumes; copying still keeps the node's
+            // settings, cache and paired device identity.
+            let _ = copy_tree(&legacy, &current);
+        }
+        current
+    }
+
+    /// Test seam: [`app_dir`] caches its result in a `OnceLock`, so it cannot be
+    /// exercised more than once per process.
+    #[cfg(test)]
+    pub fn migrate_app_dir_for_test(support: &std::path::Path) -> PathBuf {
+        migrate_app_dir(support)
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dirs::migrate_app_dir_for_test;
+
+    struct TempSupport(std::path::PathBuf);
+
+    impl TempSupport {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("van-goal-dirs-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSupport {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Upgrading from the Hermit build must not orphan the settings, the session
+    /// cache or the OpenClaw device identity that live in the old directory.
+    #[test]
+    fn the_pre_rename_app_directory_is_moved_into_place() {
+        let support = TempSupport::new();
+        let legacy = support.path().join("HermitGPUI");
+        std::fs::create_dir_all(legacy.join("nested")).expect("legacy dir");
+        std::fs::write(
+            legacy.join("settings.json"),
+            b"{\"backend_kind\":\"OpenClaw\"}",
+        )
+        .expect("legacy settings");
+        std::fs::write(
+            legacy.join("nested/openclaw-device-identity.json"),
+            b"device",
+        )
+        .expect("legacy device identity");
+
+        let resolved = migrate_app_dir_for_test(support.path());
+
+        assert_eq!(resolved, support.path().join("VanGoal"));
+        assert_eq!(
+            std::fs::read(resolved.join("settings.json")).expect("moved settings"),
+            b"{\"backend_kind\":\"OpenClaw\"}"
+        );
+        assert_eq!(
+            std::fs::read(resolved.join("nested/openclaw-device-identity.json"))
+                .expect("moved device identity"),
+            b"device"
+        );
+        assert!(
+            !legacy.exists(),
+            "the old directory is moved, not copied, so nothing is left behind"
+        );
+    }
+
+    #[test]
+    fn an_existing_app_directory_is_never_overwritten() {
+        let support = TempSupport::new();
+        std::fs::create_dir_all(support.path().join("HermitGPUI")).expect("legacy dir");
+        std::fs::write(support.path().join("HermitGPUI/settings.json"), b"legacy")
+            .expect("legacy settings");
+        std::fs::create_dir_all(support.path().join("VanGoal")).expect("current dir");
+        std::fs::write(support.path().join("VanGoal/settings.json"), b"current")
+            .expect("current settings");
+
+        let resolved = migrate_app_dir_for_test(support.path());
+
+        assert_eq!(
+            std::fs::read(resolved.join("settings.json")).expect("current settings"),
+            b"current",
+            "an existing VanGoal directory must win over the legacy one"
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_just_gets_the_new_directory() {
+        let support = TempSupport::new();
+        assert_eq!(
+            migrate_app_dir_for_test(support.path()),
+            support.path().join("VanGoal")
+        );
     }
 }

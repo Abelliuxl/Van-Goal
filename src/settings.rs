@@ -126,7 +126,7 @@ impl BackendKind {
 }
 
 /// Persistent app settings. Stored as JSON in
-/// `~/Library/Application Support/HermitGPUI/settings.json`
+/// `~/Library/Application Support/VanGoal/settings.json`
 /// (UserDefaults equivalent for a non-bundled GPUI app).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -221,7 +221,7 @@ impl Default for Settings {
 
 impl Settings {
     fn path() -> PathBuf {
-        dirs::app_support().join("HermitGPUI/settings.json")
+        dirs::app_dir().join("settings.json")
     }
 
     pub fn load() -> Self {
@@ -454,7 +454,7 @@ impl Settings {
         format!("{}://{}:{}", scheme, host, self.resolved_port())
     }
 
-    /// Only loopback Hermes addresses are managed (auto-started) by Hermit.
+    /// Only loopback Hermes addresses are managed (auto-started) by Van-Goal.
     pub fn is_managed_local_backend(&self) -> bool {
         if self.backend_kind != BackendKind::Hermes
             || self.backend_use_tls
@@ -525,13 +525,13 @@ mod tests {
 
     /// A settings file in a private directory. Every test here goes through an
     /// explicit path, so none of them can touch the real
-    /// `~/Library/Application Support/HermitGPUI/settings.json`.
+    /// `~/Library/Application Support/VanGoal/settings.json`.
     struct TempSettings(std::path::PathBuf);
 
     impl TempSettings {
         fn new() -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("hermit-settings-test-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir()
+                .join(format!("van-goal-settings-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             Self(dir.join("settings.json"))
         }

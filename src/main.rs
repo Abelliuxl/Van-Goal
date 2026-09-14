@@ -20,7 +20,7 @@ use state::AppState;
 use ui::root::RootView;
 use ui::settings_window::OpenSettings;
 
-actions!(hermit, [NewSession, RefreshSessions, ToggleSidebar, Quit]);
+actions!(van_goal, [NewSession, RefreshSessions, ToggleSidebar, Quit]);
 
 struct StateGlobal(gpui::Entity<AppState>);
 impl gpui::Global for StateGlobal {}
@@ -40,7 +40,7 @@ fn open_main_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Hermit".into()),
+                title: Some("Van-Goal".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(12.0))),
             }),
@@ -165,13 +165,13 @@ fn main() {
         // Native menu bar.
         cx.set_menus(vec![
             Menu {
-                name: "Hermit".into(),
+                name: "Van-Goal".into(),
                 items: vec![
-                    MenuItem::action("About Hermit", OpenSettings),
+                    MenuItem::action("About Van-Goal", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::action("Settings", OpenSettings),
                     MenuItem::separator(),
-                    MenuItem::action("Quit Hermit", Quit),
+                    MenuItem::action("Quit Van-Goal", Quit),
                 ],
             },
             Menu {

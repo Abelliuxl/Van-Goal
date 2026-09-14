@@ -501,7 +501,7 @@ impl ChatView {
                                 .text_size(px(13.0))
                                 .text_color(Theme::text_secondary())
                                 .child(format!(
-                                    "Hermit is ready to use {backend_name}. Send a message or resume a session from the sidebar."
+                                    "Van-Goal is ready to use {backend_name}. Send a message or resume a session from the sidebar."
                                 )),
                         ),
                 )

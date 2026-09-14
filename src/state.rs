@@ -1862,18 +1862,18 @@ mod streaming_tests {
         assert!(needs_session_title(Some("")));
         assert!(needs_session_title(Some("  ")));
         assert!(needs_session_title(Some("New Chat")));
-        assert!(!needs_session_title(Some("Hermit GPUI")));
+        assert!(!needs_session_title(Some("Van-Goal")));
     }
 
     #[test]
     fn the_open_chat_survives_a_session_list_refresh() {
         let mut selected = AgentSession::default();
-        selected.id = "agent:main:hermit:brand-new".into();
+        selected.id = "agent:main:van-goal:brand-new".into();
         selected.title = Some("New Chat".into());
 
         let listed = AgentSession {
-            id: "agent:main:hermit:older".into(),
-            title: Some("Hermit GPUI".into()),
+            id: "agent:main:van-goal:older".into(),
+            title: Some("Van-Goal".into()),
             ..Default::default()
         };
 
@@ -1887,12 +1887,12 @@ mod streaming_tests {
         // Once the gateway lists it, the fetched (named) copy wins.
         let named = AgentSession {
             id: selected.id.clone(),
-            title: Some("Hermit GPUI".into()),
+            title: Some("Van-Goal".into()),
             ..Default::default()
         };
         let merged = merge_fetched_sessions(vec![named], Some(&selected));
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].title.as_deref(), Some("Hermit GPUI"));
+        assert_eq!(merged[0].title.as_deref(), Some("Van-Goal"));
     }
 
     #[test]

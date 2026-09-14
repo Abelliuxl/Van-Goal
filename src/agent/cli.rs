@@ -474,7 +474,7 @@ impl LocalCliBackend {
         self.request(
             "initialize",
             serde_json::json!({
-                "clientInfo": { "name": "hermit", "title": "Hermit", "version": "0.1.0" }
+                "clientInfo": { "name": "van-goal", "title": "Van-Goal", "version": "0.1.0" }
             }),
         )
         .await?;

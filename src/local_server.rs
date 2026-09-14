@@ -36,7 +36,7 @@ impl LocalHermesServer {
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
         {
-            self.set_message("Hermes server process is already managed by Hermit.");
+            self.set_message("Hermes server process is already managed by Van-Goal.");
             return;
         }
         let executable = hermes_executable_path().unwrap_or_else(|| PathBuf::from("hermes"));
