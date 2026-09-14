@@ -5,6 +5,10 @@ use gpui::{
     IntoElement, ParentElement, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 
+/// Session list width. Wide enough for a model name under a truncated title,
+/// narrow enough to leave the transcript the bulk of the window.
+const SIDEBAR_WIDTH: f32 = 244.0;
+
 /// Sidebar: status pill, batch actions, and the session list.
 pub struct SidebarView {
     state: Entity<AppState>,
@@ -49,7 +53,8 @@ impl Render for SidebarView {
             .flex()
             .flex_col()
             .h_full()
-            .w(gpui::px(272.0))
+            .w(gpui::px(SIDEBAR_WIDTH))
+            .debug_selector(|| "session-sidebar".into())
             .bg(crate::ui::theme::Theme::sidebar_bg())
             .border_r_1()
             .border_color(crate::ui::theme::Theme::border())
@@ -246,11 +251,17 @@ impl SidebarView {
                 let row_hash = hash_id(&session.id);
                 let archive_target = session.clone();
                 let delete_target = session.clone();
+                let group = format!("session-row-{row_hash}");
+                let has_metadata = session.message_count.is_some()
+                    || !session.profile.clone().unwrap_or_default().is_empty();
                 div()
                     .id(gpui::ElementId::NamedInteger(
                         "session-row".into(),
                         hash_id(&session.id),
                     ))
+                    .group(group.clone())
+                    .debug_selector(move || format!("session-row-{row_hash}"))
+                    .relative()
                     .px_3()
                     .py_2()
                     .flex()
@@ -281,28 +292,49 @@ impl SidebarView {
                                 .child(session.subtitle()),
                         )
                     })
+                    // Only spend a line on metadata when there is some. The row
+                    // actions are an overlay instead of another line, so a plain
+                    // session stays two lines tall and the title keeps its width.
+                    .when(has_metadata, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(10.0))
+                                .text_color(crate::ui::theme::Theme::text_tertiary())
+                                .children(
+                                    session
+                                        .message_count
+                                        .map(|count| div().child(format!("{count} messages"))),
+                                )
+                                .when(
+                                    !session.profile.clone().unwrap_or_default().is_empty(),
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .child(session.profile.clone().unwrap_or_default()),
+                                        )
+                                    },
+                                ),
+                        )
+                    })
                     .child(
                         div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
-                            .text_size(px(10.0))
-                            .text_color(crate::ui::theme::Theme::text_tertiary())
-                            .children(
-                                session
-                                    .message_count
-                                    .map(|count| div().child(format!("{count} messages"))),
-                            )
-                            .when(
-                                !session.profile.clone().unwrap_or_default().is_empty(),
-                                |this| {
-                                    this.child(
-                                        div().child(session.profile.clone().unwrap_or_default()),
-                                    )
-                                },
-                            )
-                            .child(div().flex_1())
+                            .gap_1()
+                            .pl_1()
+                            .pr_2()
+                            .bg(crate::ui::theme::Theme::surface_hover())
+                            .opacity(0.0)
+                            .group_hover(group.clone(), |style| style.opacity(1.0))
                             .child(session_row_action(
                                 format!("session-archive-{row_hash}"),
                                 "Archive",
@@ -443,5 +475,136 @@ fn pill_color(state: &ConnectionState) -> Hsla {
         ConnectionState::Disconnected => crate::ui::theme::Theme::text_tertiary(),
         ConnectionState::Degraded(_) => crate::ui::theme::Theme::warn(),
         ConnectionState::Failed(_) => crate::ui::theme::Theme::danger(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    /// A box to lay the sidebar out in: the test platform's window has no
+    /// intrinsic size.
+    struct SizedSidebar(Entity<SidebarView>);
+
+    impl Render for SizedSidebar {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(900.0))
+                .h(px(600.0))
+                .flex()
+                .flex_row()
+                .child(self.0.clone())
+        }
+    }
+
+    fn sidebar_with(
+        cx: &mut TestAppContext,
+        sessions: Vec<AgentSession>,
+    ) -> &mut VisualTestContext {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.messages = Vec::new();
+            state.sessions = sessions;
+        });
+        let (_host, cx) = cx
+            .add_window_view(|_window, cx| SizedSidebar(cx.new(|cx| SidebarView::new(state, cx))));
+        cx.run_until_parked();
+        cx
+    }
+
+    fn session(id: &str, title: &str, model: &str, messages: Option<i64>) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            title: Some(title.to_string()),
+            model: Some(model.to_string()),
+            message_count: messages,
+            ..AgentSession::default()
+        }
+    }
+
+    fn row_bounds(cx: &mut VisualTestContext, id: &str) -> gpui::Bounds<gpui::Pixels> {
+        let selector: &'static str =
+            Box::leak(format!("session-row-{}", hash_id(id)).into_boxed_str());
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("row for {id} was not laid out"))
+    }
+
+    #[gpui::test]
+    fn the_sidebar_keeps_its_configured_width(cx: &mut TestAppContext) {
+        let cx = sidebar_with(
+            cx,
+            vec![session(
+                "a-very-long-session-identifier-that-would-love-to-widen-the-list",
+                "Cron: 情话-晚间档 20:05 — a title long enough to want more room than it gets",
+                "deepseek/deepseek-v4.1-flash",
+                None,
+            )],
+        );
+        let sidebar = cx
+            .debug_bounds("session-sidebar")
+            .expect("sidebar was not laid out");
+        assert_eq!(
+            f32::from(sidebar.size.width),
+            SIDEBAR_WIDTH,
+            "a long title must not widen the sidebar"
+        );
+    }
+
+    /// A session with no message count and no profile is two lines: title and
+    /// model. The row actions are an overlay, so they must not add a line.
+    #[gpui::test]
+    fn a_plain_session_row_stays_two_lines_tall(cx: &mut TestAppContext) {
+        let cx = sidebar_with(
+            cx,
+            vec![session(
+                "plain",
+                "Cron: 情话-晚间档 20:05",
+                "deepseek/deepseek-v4.1-flash",
+                None,
+            )],
+        );
+        let row = row_bounds(cx, "plain");
+        let height = f32::from(row.size.height);
+        // Title + model + row padding measures 60px. A third line of metadata
+        // pushes it past 74px, so this bound is what keeps the actions from
+        // quietly becoming a line of their own again.
+        assert!(
+            height <= 66.0,
+            "a plain row should be title + model, but it is {height}px tall"
+        );
+    }
+
+    /// The actions must sit inside the row, not push it wider.
+    #[gpui::test]
+    fn every_row_fits_inside_the_sidebar(cx: &mut TestAppContext) {
+        let cx = sidebar_with(
+            cx,
+            vec![
+                session(
+                    "one",
+                    "First session",
+                    "deepseek/deepseek-v4.1-flash",
+                    Some(12),
+                ),
+                session(
+                    "two",
+                    "Second session",
+                    "deepseek/deepseek-v4.1-flash",
+                    None,
+                ),
+            ],
+        );
+        let sidebar = cx.debug_bounds("session-sidebar").expect("sidebar");
+        let sidebar_right = f32::from(sidebar.origin.x) + f32::from(sidebar.size.width);
+        for id in ["one", "two"] {
+            let row = row_bounds(cx, id);
+            let right = f32::from(row.origin.x) + f32::from(row.size.width);
+            assert!(
+                right <= sidebar_right + 0.5,
+                "row {id} runs past the sidebar: {right} > {sidebar_right}"
+            );
+        }
     }
 }

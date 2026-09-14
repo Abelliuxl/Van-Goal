@@ -22,6 +22,12 @@ const SCROLLBAR_TRACK_WIDTH: f32 = 11.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 /// Horizontal gutter between a message and the edge of the transcript.
 const MESSAGE_GUTTER: f32 = 24.0;
+/// Widest a user bubble may grow before its text wraps.
+const USER_BUBBLE_MAX_WIDTH: f32 = 640.0;
+const USER_BUBBLE_PADDING_X: f32 = 14.0;
+/// The width left for text inside a full-width bubble. Capping the text keeps
+/// the bubble's intrinsic height equal to its final wrapped height.
+const USER_BUBBLE_TEXT_MAX_WIDTH: f32 = USER_BUBBLE_MAX_WIDTH - USER_BUBBLE_PADDING_X * 2.0;
 /// Upper bound on how many messages the visibility probe walks per frame.
 const MAX_VISIBLE_PROBE: usize = 64;
 
@@ -1286,8 +1292,10 @@ fn render_message_bubble(
             .py_1()
             .child(
                 div()
-                    .max_w(px(640.0))
-                    .px(px(14.0))
+                    .id(gpui::ElementId::NamedInteger("user-bubble".into(), id_hash))
+                    .debug_selector(move || format!("user-bubble-{index}"))
+                    .max_w(px(USER_BUBBLE_MAX_WIDTH))
+                    .px(px(USER_BUBBLE_PADDING_X))
                     .py(px(10.0))
                     .rounded_lg()
                     .bg(Theme::user_bubble())
@@ -1302,6 +1310,19 @@ fn render_message_bubble(
                     }))
                     .child(
                         div()
+                            .id(gpui::ElementId::NamedInteger(
+                                "user-bubble-text".into(),
+                                id_hash,
+                            ))
+                            .debug_selector(move || format!("user-bubble-text-{index}"))
+                            // The bubble is sized by its content, so a plain
+                            // max-width on the bubble alone leaves this text
+                            // measured at its unwrapped width: the bubble then
+                            // reports the height of the *unwrapped* text and the
+                            // wrapped lines paint outside it, over the next
+                            // message. Capping the text as well means the
+                            // intrinsic pass already sees the final line count.
+                            .max_w(px(USER_BUBBLE_TEXT_MAX_WIDTH))
                             .text_size(px(13.0))
                             .text_color(Theme::text())
                             .child(render_blocks(&markdown::parse(&message.content))),
@@ -1954,5 +1975,117 @@ mod message_width_tests {
                 f32::from(item.size.width)
             );
         }
+    }
+
+    /// What a scheduled cron turn actually delivers: a long bracketed id, a file
+    /// path, CJK text and explicit newlines. The transcript used to lay the
+    /// following message on top of this bubble's last line, because the bubble
+    /// was measured narrower than it was finally laid out.
+    const CRON_PROMPT: &str = "[cron:057a3b4d-44ae-4d5e-9ec6-b81cb715369e 情话-晚间档 20:05] 运行每日情话任务（晚间档）：执行 python3 /home/liuxl/.openclaw/workspace/skills/flirt/scripts/send_love.py。脚本会生成情话并通过 macbridge 发 iMessage 给雪宝，自带日志和失败 Bark 告警。不要重复发送，只执行一次并确认日志写入\n。\nCurrent time: Monday, September 14th, 2026 - 8:05 PM (Asia/Shanghai)\nReference UTC: 2026-09-14 12:05 UTC";
+
+    fn render_roles<'a>(
+        cx: &'a mut TestAppContext,
+        messages: Vec<(MessageRole, &str)>,
+    ) -> &'a mut VisualTestContext {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.messages = messages
+                .into_iter()
+                .map(|(role, content)| ChatMessage::new(role, content.to_string()))
+                .collect();
+        });
+        let (_host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        cx.run_until_parked();
+        cx
+    }
+
+    fn message_bounds(cx: &mut VisualTestContext, index: usize) -> gpui::Bounds<gpui::Pixels> {
+        let selector: &'static str = Box::leak(format!("message-item-{index}").into_boxed_str());
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("message {index} was not laid out"))
+    }
+
+    #[gpui::test]
+    fn a_cron_prompt_does_not_overlap_the_next_message(cx: &mut TestAppContext) {
+        let cx = render_roles(
+            cx,
+            vec![
+                (MessageRole::User, CRON_PROMPT),
+                (
+                    MessageRole::Assistant,
+                    "[assistant turn failed before producing a message]",
+                ),
+            ],
+        );
+
+        let bubble_selector: &'static str = "user-bubble-0";
+        let text_selector: &'static str = "user-bubble-text-0";
+        let bubble = cx.debug_bounds(bubble_selector).expect("bubble");
+        let text = cx.debug_bounds(text_selector).expect("bubble text");
+        println!(
+            "bubble x={} w={} h={} bottom={} | text x={} w={} h={} bottom={}",
+            f32::from(bubble.origin.x),
+            f32::from(bubble.size.width),
+            f32::from(bubble.size.height),
+            f32::from(bubble.origin.y) + f32::from(bubble.size.height),
+            f32::from(text.origin.x),
+            f32::from(text.size.width),
+            f32::from(text.size.height),
+            f32::from(text.origin.y) + f32::from(text.size.height),
+        );
+        assert!(
+            f32::from(text.origin.y) + f32::from(text.size.height)
+                <= f32::from(bubble.origin.y) + f32::from(bubble.size.height) + 0.5,
+            "the prompt text paints below its own bubble"
+        );
+
+        let first = message_bounds(cx, 0);
+        let second = message_bounds(cx, 1);
+        let first_bottom = f32::from(first.origin.y) + f32::from(first.size.height);
+        assert!(
+            f32::from(second.origin.y) >= first_bottom - 0.5,
+            "the reply starts at {} but the prompt bubble runs to {first_bottom}",
+            f32::from(second.origin.y)
+        );
+    }
+
+    #[gpui::test]
+    fn a_short_prompt_still_gets_a_bubble_that_hugs_its_text(cx: &mut TestAppContext) {
+        let cx = render_roles(
+            cx,
+            vec![(MessageRole::User, "hi"), (MessageRole::Assistant, "hello")],
+        );
+
+        let bubble_selector: &'static str = "user-bubble-0";
+        let bubble = cx.debug_bounds(bubble_selector).expect("bubble");
+        assert!(
+            f32::from(bubble.size.width) < USER_BUBBLE_MAX_WIDTH,
+            "capping the text must not stretch a short bubble to the full width: {}",
+            f32::from(bubble.size.width)
+        );
+    }
+
+    /// A prompt that is one long unbreakable run: the bubble still has to
+    /// reserve the height its wrapped text needs.
+    #[gpui::test]
+    fn a_long_unbreakable_prompt_does_not_overlap_the_next_message(cx: &mut TestAppContext) {
+        let hash = "0ec691c7175f4e50f6e7f758fef99ebd7222482fa424c2a8c1d2";
+        let prompt =
+            format!("commit {hash} touched PHLDB1/COLEC10/RUNX5-12-22 and more text after it");
+        let cx = render_roles(
+            cx,
+            vec![(MessageRole::User, &prompt), (MessageRole::Assistant, "ok")],
+        );
+
+        let first = message_bounds(cx, 0);
+        let second = message_bounds(cx, 1);
+        let first_bottom = f32::from(first.origin.y) + f32::from(first.size.height);
+        assert!(
+            f32::from(second.origin.y) >= first_bottom - 0.5,
+            "the reply starts at {} but the prompt bubble runs to {first_bottom}",
+            f32::from(second.origin.y)
+        );
     }
 }
