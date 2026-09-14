@@ -612,6 +612,41 @@ async fn run_gateway(
     }
 }
 
+/// The session a Gateway frame is about, when the Gateway labels one. Versions
+/// spell this differently per method, so both known spellings are accepted.
+fn payload_session_key(payload: &serde_json::Value) -> Option<String> {
+    ["sessionKey", "key", "session_id", "sessionId"]
+        .iter()
+        .find_map(|field| json_str(payload, field))
+        .filter(|key| !key.is_empty())
+}
+
+/// Whether a frame belongs in the transcript the user is looking at.
+///
+/// One Gateway connection carries every session's traffic, and subscribing to a
+/// session does not unsubscribe from the ones opened before it. A cron job
+/// running in another session therefore arrives on the same socket, and its
+/// replies used to be appended to whatever chat happened to be open.
+fn is_for_active_session(
+    payload: &serde_json::Value,
+    active_session: &Arc<Mutex<Option<String>>>,
+) -> bool {
+    let active = active_session
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(active) = active else {
+        // Nothing subscribed yet, so there is nothing to compare against.
+        return true;
+    };
+    match payload_session_key(payload) {
+        Some(key) => key == active,
+        // An unlabelled frame is kept: dropping it could lose the active
+        // session's own stream, and the Gateway labels the traffic it fans out.
+        None => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     text: &str,
@@ -678,6 +713,16 @@ async fn handle_frame(
         return;
     };
     let payload = object.get("payload").cloned().unwrap_or_default();
+
+    // Message traffic for another session must not reach the open transcript.
+    if matches!(
+        event.as_str(),
+        "chat" | "session.message" | "session.tool" | "agent"
+    ) && !is_for_active_session(&payload, active_session)
+    {
+        log_debug!("openclaw", "event dropped for another session name={event}");
+        return;
+    }
 
     let events_for_emit = events.clone();
     let emit_event = move |event: AgentEvent| {
@@ -920,16 +965,20 @@ async fn handle_frame(
             log_debug!("openclaw", "event ignored name={event}");
         }
     }
-    let _ = active_session;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_send_params, is_unexpected_property_error, legacy_chat_send_params,
-        legacy_session_messages_subscribe_params, session_messages_subscribe_params,
-        sessions_create_params,
+        chat_send_params, is_for_active_session, is_unexpected_property_error,
+        legacy_chat_send_params, legacy_session_messages_subscribe_params, payload_session_key,
+        session_messages_subscribe_params, sessions_create_params,
     };
+    use std::sync::{Arc, Mutex};
+
+    fn active(key: Option<&str>) -> Arc<Mutex<Option<String>>> {
+        Arc::new(Mutex::new(key.map(str::to_string)))
+    }
 
     #[test]
     fn session_rpc_params_match_openclaw_v4_schema() {
@@ -969,6 +1018,58 @@ mod tests {
                 "OpenClaw RPC failed: invalid chat.send params: unexpected property 'idempotencyKey'"
             ),
             "idempotencyKey"
+        ));
+    }
+
+    /// The Gateway carries every session down one connection, so a cron job in
+    /// another session used to land in whatever chat was open.
+    #[test]
+    fn a_frame_for_another_session_is_rejected() {
+        let active = active(Some("agent:main:van-goal:mine"));
+
+        assert!(is_for_active_session(
+            &serde_json::json!({ "sessionKey": "agent:main:van-goal:mine" }),
+            &active
+        ));
+        assert!(!is_for_active_session(
+            &serde_json::json!({ "sessionKey": "agent:main:van-goal:cron" }),
+            &active
+        ));
+        assert!(!is_for_active_session(
+            &serde_json::json!({ "key": "agent:main:van-goal:cron" }),
+            &active
+        ));
+    }
+
+    /// Gateway versions disagree on the field name, so both are honoured.
+    #[test]
+    fn both_session_key_spellings_are_understood() {
+        let active = active(Some("key-a"));
+        for payload in [
+            serde_json::json!({ "key": "key-a" }),
+            serde_json::json!({ "sessionKey": "key-a" }),
+        ] {
+            assert_eq!(payload_session_key(&payload).as_deref(), Some("key-a"));
+            assert!(is_for_active_session(&payload, &active));
+        }
+    }
+
+    /// A frame that names no session is kept: dropping it could lose the active
+    /// session's own stream.
+    #[test]
+    fn an_unlabelled_frame_is_kept() {
+        let active = active(Some("key-a"));
+        let payload = serde_json::json!({ "deltaText": "hello" });
+        assert_eq!(payload_session_key(&payload), None);
+        assert!(is_for_active_session(&payload, &active));
+    }
+
+    #[test]
+    fn frames_pass_through_before_anything_is_subscribed() {
+        let active = active(None);
+        assert!(is_for_active_session(
+            &serde_json::json!({ "sessionKey": "anything" }),
+            &active
         ));
     }
 }

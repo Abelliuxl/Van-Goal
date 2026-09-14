@@ -584,6 +584,9 @@ impl ChatView {
         let chat = cx.entity();
         let state_entity = self.state.clone();
         let messages = state_entity.read(cx).messages.clone();
+        // The transcript belongs to the active backend, so that is what labels
+        // each reply. It used to be the literal "HERMES" whatever was running.
+        let author = state_entity.read(cx).backend_display_name().to_uppercase();
 
         let chat_for_list = chat.clone();
         let list = list(list_state, move |index, _window, cx| {
@@ -602,6 +605,7 @@ impl ChatView {
                 message,
                 expanded,
                 CopyButton { revealed, copied },
+                &author,
                 index,
                 chat_for_list.clone(),
                 state_entity.clone(),
@@ -1446,6 +1450,7 @@ fn render_message_bubble(
     message: &crate::models::ChatMessage,
     expanded: bool,
     copy: CopyButton,
+    author: &str,
     index: usize,
     chat: Entity<ChatView>,
     state: Entity<AppState>,
@@ -1457,7 +1462,7 @@ fn render_message_bubble(
             .flex()
             .flex_row()
             .justify_end()
-            .py_1()
+            .py_2()
             .child(
                 div()
                     .id(gpui::ElementId::NamedInteger("user-bubble".into(), id_hash))
@@ -1510,7 +1515,7 @@ fn render_message_bubble(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .py_1()
+                .py_2()
                 // The pointer has to be over the message itself, not over the
                 // button, for the button to appear — and leaving it starts a
                 // grace period rather than hiding straight away.
@@ -1529,13 +1534,17 @@ fn render_message_bubble(
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(
+                    .child({
+                        // The slug lets a test assert which backend the label
+                        // came from; the label itself used to be hardcoded.
+                        let slug = author.to_lowercase().replace(' ', "-");
                         div()
+                            .debug_selector(move || format!("message-author-{slug}"))
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Theme::text_secondary())
-                            .child("HERMES"),
-                    )
+                            .child(author.to_string())
+                    })
                     .when(message.is_streaming, |this| {
                         this.child(
                             div()
@@ -1543,25 +1552,6 @@ fn render_message_bubble(
                                 .text_color(Theme::accent())
                                 .child("streaming…"),
                         )
-                    })
-                    // Sits in the header row so revealing it costs no height:
-                    // reserving a line under every message would waste space in
-                    // the common case where nobody copies anything.
-                    .when(has_content, |this| {
-                        let chat = chat.clone();
-                        let message_id = message.id.clone();
-                        let content = message.content.clone();
-                        this.child(div().flex_1()).child(copy_button(
-                            copy,
-                            id_hash,
-                            move |_event, _window, cx| {
-                                let message_id = message_id.clone();
-                                let content = content.clone();
-                                chat.update(cx, |chat, cx| {
-                                    chat.copy_message(&message_id, content.clone(), cx)
-                                });
-                            },
-                        ))
                     }),
             );
 
@@ -1571,6 +1561,27 @@ fn render_message_bubble(
 
             if !message.content.trim().is_empty() {
                 bubble = bubble.child(render_blocks(&markdown::parse(&message.content)));
+            }
+
+            // Under the reply and against its left edge, so it sits next to the
+            // text it copies instead of drifting to the far side of the window.
+            // The row is always present, and doubles as the gap between
+            // messages; only its contents fade.
+            if has_content {
+                let chat = chat.clone();
+                let message_id = message.id.clone();
+                let content = message.content.clone();
+                bubble = bubble.child(div().flex().flex_row().pt_1().child(copy_button(
+                    copy,
+                    id_hash,
+                    move |_event, _window, cx| {
+                        let message_id = message_id.clone();
+                        let content = content.clone();
+                        chat.update(cx, |chat, cx| {
+                            chat.copy_message(&message_id, content.clone(), cx)
+                        });
+                    },
+                )));
             }
 
             let _ = state;
@@ -2392,6 +2403,66 @@ mod copy_button_tests {
         assert!(
             cx.debug_bounds("copy-button-revealed").is_some(),
             "the button hid even though the pointer was back on the message"
+        );
+    }
+
+    /// The reply header used to read "HERMES" no matter which backend was
+    /// running, so an OpenClaw transcript claimed to be Hermes.
+    #[gpui::test]
+    fn the_reply_header_names_the_active_backend(cx: &mut TestAppContext) {
+        let (view, _id, cx) = render_reply(cx);
+        assert!(
+            cx.debug_bounds("message-author-hermes").is_some(),
+            "the default backend should label its replies"
+        );
+
+        cx.update(|_window, cx| {
+            view.update(cx, |_chat, cx| {
+                let state = _chat.state.clone();
+                state.update(cx, |state, _cx| {
+                    state.settings.backend_kind = crate::settings::BackendKind::OpenClaw;
+                    state.backend_display_name = "OpenClaw";
+                });
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("message-author-openclaw").is_some(),
+            "the label did not follow the active backend"
+        );
+        assert!(
+            cx.debug_bounds("message-author-hermes").is_none(),
+            "the label is still hardcoded to Hermes"
+        );
+    }
+
+    /// The button used to sit in the header row, pushed to the far right of a
+    /// full-width row, miles away from the left-aligned reply it copies.
+    #[gpui::test]
+    fn the_copy_button_sits_under_the_reply_against_its_left_edge(cx: &mut TestAppContext) {
+        let (view, id, cx) = render_reply(cx);
+        hover(&view, Some(id), cx);
+
+        let column = cx
+            .debug_bounds("message-column-0")
+            .expect("the message column was not laid out");
+        let author = cx
+            .debug_bounds("message-author-hermes")
+            .expect("the reply header was not laid out");
+        let button = cx
+            .debug_bounds("copy-button-revealed")
+            .expect("the copy button was not revealed");
+
+        assert!(
+            f32::from(button.origin.y) >= f32::from(author.origin.y),
+            "the copy button is not under the reply"
+        );
+        let offset = f32::from(button.origin.x) - f32::from(column.origin.x);
+        assert!(
+            offset < 40.0,
+            "the copy button drifted {offset}px away from the reply's left edge"
         );
     }
 }

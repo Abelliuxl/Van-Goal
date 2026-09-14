@@ -169,8 +169,10 @@ pub struct AppState {
 
     backend: Arc<AsyncMutex<Backend>>,
     backend_id: &'static str,
-    backend_display_name: &'static str,
-    backend_caps: BackendCaps,
+    /// Also exposed by [`AppState::backend_display_name`]; crate-visible so a
+    /// test can point the label at a different backend.
+    pub(crate) backend_display_name: &'static str,
+    pub(crate) backend_caps: BackendCaps,
     cache_store: SessionCacheStore,
     cached_state: CachedState,
     live_gateway_session_id: Option<String>,
