@@ -749,7 +749,10 @@ async fn handle_codex(core: &Arc<CliCore>, object: &serde_json::Value) {
         "turn/started" => core.emit(AgentEvent::MessageStart),
         "item/agentMessage/delta" => {
             if let Some(delta) = json_str(&params, "delta") {
-                core.emit(AgentEvent::MessageDelta(delta));
+                core.emit(AgentEvent::MessageDelta {
+                    text: delta,
+                    source: DeltaSource::EventStream,
+                });
             }
         }
         "item/started" | "item/completed" => {
@@ -803,7 +806,10 @@ fn handle_claude(core: &Arc<CliCore>, object: &serde_json::Value) {
             if json_str(&event, "type").as_deref() == Some("content_block_delta") {
                 if let Some(delta) = event.get("delta") {
                     if let Some(text) = json_str(delta, "text") {
-                        core.emit(AgentEvent::MessageDelta(text));
+                        core.emit(AgentEvent::MessageDelta {
+                            text,
+                            source: DeltaSource::EventStream,
+                        });
                     }
                 }
             }
@@ -846,7 +852,10 @@ fn handle_pi(core: &Arc<CliCore>, object: &serde_json::Value) {
                 .unwrap_or_default();
             if json_str(&update, "type").as_deref() == Some("text_delta") {
                 if let Some(delta) = json_str(&update, "delta") {
-                    core.emit(AgentEvent::MessageDelta(delta));
+                    core.emit(AgentEvent::MessageDelta {
+                        text: delta,
+                        source: DeltaSource::EventStream,
+                    });
                 }
             }
         }

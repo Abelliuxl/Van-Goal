@@ -45,6 +45,62 @@ pub struct InlineMarkdown {
 /// Parse the inline Markdown used inside headings, paragraphs, list items,
 /// quotes and table cells. Delimiters are removed from the visible text while
 /// byte ranges are retained for GPUI text highlighting and link hit testing.
+/// Characters that already read as a break point for people: paths, ids and
+/// URLs break after them in every browser, so we let gpui break there too.
+const BREAK_AFTER: &[char] = &[
+    '/', '\\', '-', '_', '.', ':', '?', '&', '=', ',', ';', '+', '|', '~', '@', '#', '%',
+];
+
+/// Longest run without a separator before we force a break anyway. Keeps
+/// hashes and ids from being laid out as a single 500px line.
+const MAX_UNBREAKABLE_RUN: usize = 14;
+
+/// gpui's text wrapper only breaks at unicode line-break opportunities, so a
+/// long ASCII run without spaces (a path, a hash, a compacted id) is laid out as
+/// a single line, overflows the transcript and looks like "the message does not
+/// wrap". Inserting a zero-width space after punctuation and inside very long
+/// runs gives the wrapper somewhere to break. Zero width means the rendered text
+/// is unchanged.
+pub fn add_break_opportunities(text: &str) -> std::borrow::Cow<'_, str> {
+    const ZWSP: char = '\u{200b}';
+
+    if !text.contains(|c: char| c.is_ascii_alphanumeric()) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len() + text.len() / 8 + 8);
+    let mut run = 0usize;
+    let mut changed = false;
+    for c in text.chars() {
+        out.push(c);
+        if c.is_whitespace() || !c.is_ascii() {
+            // CJK and spaces are already break opportunities.
+            run = 0;
+            continue;
+        }
+        run += 1;
+        if BREAK_AFTER.contains(&c) {
+            // A separator ends the run whether or not we added a break, so a
+            // word like `D0/D3/D7` is already text the wrapper can break.
+            if run >= 4 {
+                out.push(ZWSP);
+                changed = true;
+            }
+            run = 0;
+        } else if run >= MAX_UNBREAKABLE_RUN {
+            out.push(ZWSP);
+            run = 0;
+            changed = true;
+        }
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub fn parse_inline(content: &str) -> InlineMarkdown {
     let mut output = InlineMarkdown::default();
     parse_inline_into(content, &mut output);
@@ -552,6 +608,37 @@ mod tests {
         }
     }
 
+    /// Table shapes that actually show up in agent transcripts, kept as a
+    /// regression net for the parser: one-dash separators, inline markup in
+    /// cells, emoji/checkmarks, CJK text, a table directly under a heading
+    /// (no blank line) and two tables in one message.
+    #[test]
+    fn parses_the_table_shapes_agents_actually_emit() {
+        let samples = [
+            "| 验证方式 | 结果 |\n|---|---|\n| `openclaw devices list` 表格 | Paired = **4** ✅ |\n| JSON 权威查询 | paired = 4，**不含** 43cbc108 ✅ |",
+            "## KernelBenchCUDA（4 个题目）\n| 模型 | 通过率 | GLM-5.2 Fused MoE | DeepSeek NSA |\n|---|---|---|---|\n| **DeepSeek V4 Flash (0731)** | 4/4 | 0.041 | 0.046 |\n| **GLM-5.3** | 1/1 | 0.100 | — |",
+            "| 项目 | 任务进度 | 进行中 |\n| :--- | ---: | :---: |\n| **nano-AgFe-抗氧化** | 6/9 | 测试ROS检测手段 |\n| PEEK亲水改性 | 4/4 ✅ | — |",
+            "text before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nmiddle\n\n| c | d |\n| --- | --- |\n| 3 | 4 |",
+        ];
+        for sample in samples {
+            let tables = parse(sample)
+                .into_iter()
+                .filter(|block| matches!(block, MarkdownBlock::Table(..)))
+                .count();
+            assert!(tables > 0, "no table parsed out of:\n{sample}");
+        }
+    }
+
+    #[test]
+    fn table_cells_keep_their_inline_markup() {
+        let blocks = parse("| a | b |\n| --- | --- |\n| **bold** | `code` |");
+        let MarkdownBlock::Table(headers, rows) = &blocks[0] else {
+            panic!("expected table, got {blocks:?}");
+        };
+        assert_eq!(headers.len(), 2);
+        assert_eq!(rows[0], vec!["**bold**".to_string(), "`code`".to_string()]);
+    }
+
     #[test]
     fn numbered_list_and_quote() {
         let blocks = parse("1. first\n2. second\n> quoted");
@@ -624,5 +711,71 @@ mod tests {
             "*literal* and snake_case plus https://example.com"
         );
         assert_eq!(inline.links.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod break_opportunity_tests {
+    use super::add_break_opportunities;
+
+    /// Whatever we insert must disappear again, i.e. the visible text is
+    /// unchanged.
+    fn strip(text: &str) -> String {
+        text.chars().filter(|c| *c != '\u{200b}').collect()
+    }
+
+    #[test]
+    fn short_and_cjk_text_is_left_alone() {
+        let cjk = "测试检测手段完成情况，三条未完成";
+        assert!(
+            matches!(add_break_opportunities(cjk), std::borrow::Cow::Borrowed(_)),
+            "pure CJK already wraps anywhere"
+        );
+        // Short ASCII words keep their own break points instead of gaining one.
+        assert!(matches!(
+            add_break_opportunities("nano ROS BMSC 24 孔板"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            add_break_opportunities("ROS 检测 D0/D3/D7"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn unbreakable_runs_gain_zero_width_breaks() {
+        let hash = "0ec691c7175f4e50f6e7f758fef99ebd7222482fa424c2a8c1d2";
+        let broken = add_break_opportunities(hash);
+        assert_ne!(broken.as_ref(), hash, "a 52 char hash needs break points");
+        assert_eq!(strip(&broken), hash, "visible text must not change");
+        assert!(broken.chars().filter(|c| *c == '\u{200b}').count() >= 3);
+    }
+
+    #[test]
+    fn paths_break_after_separators() {
+        let path = "PHLDB1/COLEC10/RUNX5-12-22";
+        let broken = add_break_opportunities(path);
+        assert_eq!(strip(&broken), path);
+        assert!(
+            broken.contains("PHLDB1/\u{200b}"),
+            "no break after the first slash"
+        );
+        assert!(broken.contains("COLEC10/\u{200b}"));
+    }
+
+    #[test]
+    fn markdown_syntax_still_parses() {
+        let source = "**bold** and `0ec691c7175f4e50f6e7f758fef99ebd7222482fa424c2a8c1d2` end";
+        let broken = add_break_opportunities(source);
+        assert_eq!(strip(&broken), source);
+        let parsed = super::parse_inline(&broken);
+        assert!(parsed
+            .spans
+            .iter()
+            .any(|span| span.style == super::InlineStyle::Strong));
+        assert!(parsed
+            .spans
+            .iter()
+            .any(|span| span.style == super::InlineStyle::Code));
     }
 }

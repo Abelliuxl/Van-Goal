@@ -466,7 +466,10 @@ fn handle_event_json(
             match json_str(part, "type").as_deref() {
                 Some("text") => {
                     if let Some(delta) = json_str(&properties, "delta").filter(|d| !d.is_empty()) {
-                        let _ = events.unbounded_send(AgentEvent::MessageDelta(delta));
+                        let _ = events.unbounded_send(AgentEvent::MessageDelta {
+                            text: delta,
+                            source: DeltaSource::EventStream,
+                        });
                     } else if let (Some(part_id), Some(full_text)) =
                         (json_str(part, "id"), json_str(part, "text"))
                     {
@@ -479,8 +482,10 @@ fn handle_event_json(
                         };
                         if let Some(delta) = full_text.strip_prefix(&previous) {
                             if !delta.is_empty() {
-                                let _ = events
-                                    .unbounded_send(AgentEvent::MessageDelta(delta.to_string()));
+                                let _ = events.unbounded_send(AgentEvent::MessageDelta {
+                                    text: delta.to_string(),
+                                    source: DeltaSource::EventStream,
+                                });
                             }
                         }
                     }

@@ -556,12 +556,18 @@ fn handle_gateway_frame(
                 let _ = events.unbounded_send(AgentEvent::SessionInfo(session_id));
             }
         }
+        "sessions.changed" | "session.created" | "session.updated" => {
+            let _ = events.unbounded_send(AgentEvent::SessionsChanged);
+        }
         "message.start" => {
             let _ = events.unbounded_send(AgentEvent::MessageStart);
         }
         "message.delta" => {
             if let Some(text) = json_str(&payload, "text") {
-                let _ = events.unbounded_send(AgentEvent::MessageDelta(text));
+                let _ = events.unbounded_send(AgentEvent::MessageDelta {
+                    text,
+                    source: DeltaSource::EventStream,
+                });
             }
         }
         "message.complete" => {

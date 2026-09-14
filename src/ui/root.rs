@@ -12,6 +12,8 @@ pub struct RootView {
     state: Entity<AppState>,
     sidebar: Entity<SidebarView>,
     chat: Entity<ChatView>,
+    /// The session list can be collapsed to give the transcript the full width.
+    sidebar_open: bool,
 }
 
 impl RootView {
@@ -28,7 +30,14 @@ impl RootView {
             state,
             sidebar,
             chat,
+            sidebar_open: true,
         }
+    }
+
+    /// Show or hide the session sidebar (toolbar button / ⌘B).
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
     }
 }
 
@@ -38,6 +47,8 @@ impl Render for RootView {
         let state = self.state.clone();
         let state_new = self.state.clone();
         let state_settings = self.state.clone();
+        let sidebar_open = self.sidebar_open;
+        let root = cx.entity();
         let (connection_label, pill_color, last_error) = {
             let state = state.read(cx);
             (
@@ -66,6 +77,9 @@ impl Render for RootView {
                     .border_b_1()
                     .border_color(Theme::border())
                     .bg(Theme::sidebar_bg())
+                    .child(sidebar_toggle(sidebar_open, move |_event, _window, cx| {
+                        root.update(cx, |root, cx| root.toggle_sidebar(cx));
+                    }))
                     .child(
                         div()
                             .text_size(px(15.0))
@@ -109,9 +123,11 @@ impl Render for RootView {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
-                    .child(self.sidebar.clone())
+                    .when(sidebar_open, |this| this.child(self.sidebar.clone()))
                     .child(
                         div()
+                            .id("content-column")
+                            .debug_selector(|| "content-column".into())
                             .flex_1()
                             .min_w_0()
                             .flex()
@@ -168,6 +184,32 @@ fn toolbar_button(
         .hover(|style| style.bg(Theme::surface_hover()).text_color(Theme::text()))
         .on_click(on_click)
         .child(label)
+}
+
+/// Collapse / expand control for the sidebar. Lives in the toolbar so it stays
+/// reachable while the sidebar is hidden.
+fn sidebar_toggle(
+    open: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("sidebar-toggle")
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .w(px(26.0))
+        .h(px(24.0))
+        .rounded_md()
+        .bg(Theme::surface())
+        .border_1()
+        .border_color(Theme::border())
+        .text_size(px(12.0))
+        .text_color(Theme::text_secondary())
+        .cursor_pointer()
+        .hover(|style| style.bg(Theme::surface_hover()).text_color(Theme::text()))
+        .on_click(on_click)
+        .child(if open { "◀" } else { "▶" })
 }
 
 fn pill_color(state: &crate::models::ConnectionState) -> gpui::Hsla {

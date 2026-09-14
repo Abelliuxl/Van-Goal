@@ -810,7 +810,10 @@ async fn handle_frame(
                 emit_event(AgentEvent::MessageStart);
             }
             if let Some(delta) = json_str(&payload, "deltaText").filter(|d| !d.is_empty()) {
-                emit_event(AgentEvent::MessageDelta(delta));
+                emit_event(AgentEvent::MessageDelta {
+                    text: delta,
+                    source: DeltaSource::Transcript,
+                });
             }
             if matches!(state.as_str(), "final" | "completed" | "done") {
                 emit_event(AgentEvent::MessageComplete(None));
@@ -823,6 +826,9 @@ async fn handle_frame(
                         .unwrap_or_else(|| "OpenClaw turn failed".into()),
                 ));
             }
+        }
+        "sessions.changed" | "session.created" | "session.updated" => {
+            emit_event(AgentEvent::SessionsChanged);
         }
         "session.tool" => {
             emit_event(AgentEvent::Tool(ToolCallRecord::new(
@@ -842,7 +848,10 @@ async fn handle_frame(
                 }
                 "assistant" => {
                     if let Some(delta) = json_str(&data, "delta") {
-                        emit_event(AgentEvent::MessageDelta(delta));
+                        emit_event(AgentEvent::MessageDelta {
+                            text: delta,
+                            source: DeltaSource::AgentStream,
+                        });
                     }
                 }
                 "tool" => {
@@ -872,7 +881,11 @@ async fn handle_frame(
                 session_id: json_str(&payload, "sessionKey"),
             });
         }
-        _ => {}
+        _ => {
+            // Worth knowing about: the gateway announces session list changes
+            // with its own event names.
+            log_debug!("openclaw", "event ignored name={event}");
+        }
     }
     let _ = active_session;
 }

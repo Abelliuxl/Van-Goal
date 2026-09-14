@@ -943,7 +943,7 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let editor = self.entity.read(cx);
-        let rows = editor.estimated_rows().min(8).max(1);
+        let rows = editor.estimated_rows().clamp(1, 8);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = px(ROW_HEIGHT * rows as f32).into();

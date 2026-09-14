@@ -20,7 +20,7 @@ use state::AppState;
 use ui::root::RootView;
 use ui::settings_window::OpenSettings;
 
-actions!(hermit, [NewSession, RefreshSessions, Quit]);
+actions!(hermit, [NewSession, RefreshSessions, ToggleSidebar, Quit]);
 
 struct StateGlobal(gpui::Entity<AppState>);
 impl gpui::Global for StateGlobal {}
@@ -118,6 +118,14 @@ fn main() {
             let state = cx.global::<StateGlobal>().0.clone();
             state.update(cx, |state, cx| state.refresh_sessions(true, cx));
         });
+        cx.on_action(|_: &ToggleSidebar, cx| {
+            let window = cx
+                .try_global::<MainWindowGlobal>()
+                .and_then(|global| global.0.clone());
+            if let Some(window) = window {
+                let _ = window.update(cx, |root, _window, cx| root.toggle_sidebar(cx));
+            }
+        });
         cx.on_action(|_: &OpenSettings, cx| {
             let existing = cx
                 .try_global::<SettingsWindowGlobal>()
@@ -149,6 +157,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-n", NewSession, None),
             KeyBinding::new("cmd-r", RefreshSessions, None),
+            KeyBinding::new("cmd-b", ToggleSidebar, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
@@ -171,7 +180,10 @@ fn main() {
             },
             Menu {
                 name: "View".into(),
-                items: vec![MenuItem::action("Refresh Sessions", RefreshSessions)],
+                items: vec![
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Refresh Sessions", RefreshSessions),
+                ],
             },
         ]);
 

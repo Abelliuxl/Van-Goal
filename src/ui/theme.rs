@@ -87,6 +87,13 @@ impl Theme {
     pub fn code_bg() -> Hsla {
         rgb(if Self::is_light() { 0xedeef2 } else { 0x1b1b20 }).into()
     }
+    /// Overlay scrollbar thumb (drawn on top of the content, fades out).
+    pub fn scrollbar_thumb() -> Hsla {
+        rgba_hex(if Self::is_light() { 0x1c1c21 } else { 0xffffff }, 0.30)
+    }
+    pub fn scrollbar_thumb_active() -> Hsla {
+        rgba_hex(if Self::is_light() { 0x1c1c21 } else { 0xffffff }, 0.45)
+    }
     pub fn quote_bar() -> Hsla {
         rgba_hex(if Self::is_light() { 0x000000 } else { 0xffffff }, 0.25)
     }

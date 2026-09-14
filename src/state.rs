@@ -7,7 +7,7 @@ use crate::{hermes_config, log_debug};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use gpui::Task;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,85 @@ pub fn tokio_spawn<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> tokio::task::JoinHandle<T> {
     cx.global::<TokioGlobal>().0.spawn(future)
+}
+
+/// A session is unnamed while it still carries the placeholder the client uses
+/// for chats it created itself.
+fn needs_session_title(title: Option<&str>) -> bool {
+    match title.map(str::trim) {
+        None | Some("") => true,
+        Some(title) => title == "New Chat",
+    }
+}
+
+/// Sessions as the gateway reports them, plus the one the user is looking at if
+/// the gateway has not listed it yet (a chat created here has no messages to
+/// report until its first turn ends).
+fn merge_fetched_sessions(
+    fetched: Vec<AgentSession>,
+    selected: Option<&AgentSession>,
+) -> Vec<AgentSession> {
+    let mut merged = fetched;
+    if let Some(selected) = selected {
+        if !merged.iter().any(|session| session.id == selected.id) {
+            merged.insert(0, selected.clone());
+        }
+    }
+    merged
+}
+
+/// Append a chunk to one stream's buffer. Gateways mix incremental deltas,
+/// cumulative snapshots, replayed overlaps and plain repeats on the same stream,
+/// so a chunk that already covers (or is covered by) the buffer is merged
+/// instead of concatenated.
+fn merge_stream_chunk(buffer: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if buffer.is_empty() || chunk.starts_with(buffer.as_str()) {
+        // A snapshot of everything this stream has produced so far.
+        buffer.clear();
+        buffer.push_str(chunk);
+        return;
+    }
+    if buffer.ends_with(chunk) {
+        // The same chunk delivered twice.
+        return;
+    }
+    // A replayed or re-chunked chunk usually starts where the buffer ends
+    // ("…五处落点" + "落点全部实时…"): keep the overlap once.
+    buffer.push_str(&chunk[overlap_with_suffix(buffer, chunk)..]);
+}
+
+/// Length of the longest suffix of `buffer` that is also a prefix of `chunk`.
+/// Overlaps shorter than `MIN_OVERLAP` are ignored: a single shared character is
+/// far more likely to be a coincidence than a replay.
+fn overlap_with_suffix(buffer: &str, chunk: &str) -> usize {
+    const MIN_OVERLAP: usize = 4;
+    const MAX_OVERLAP: usize = 512;
+    let limit = buffer.len().min(chunk.len()).min(MAX_OVERLAP);
+    let boundaries = chunk
+        .char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .rev();
+    for end in boundaries {
+        if end > limit {
+            continue;
+        }
+        if buffer.ends_with(&chunk[..end]) {
+            return if end >= MIN_OVERLAP { end } else { 0 };
+        }
+    }
+    0
+}
+
+/// The most complete text seen for the turn, across all streams.
+fn best_stream_text(streams: &BTreeMap<DeltaSource, String>) -> String {
+    streams
+        .values()
+        .max_by_key(|text| text.chars().count())
+        .cloned()
+        .unwrap_or_default()
 }
 
 struct ConnectOutcome {
@@ -63,6 +142,15 @@ pub struct AppState {
     pub expanded_tools: HashSet<(String, usize)>,
     /// Prompt held back because no live session existed when the user hit send.
     pub pending_after_start: Option<(String, Vec<ComposerAttachment>)>,
+    /// Text received per event stream for the turn in flight. One reply can
+    /// arrive on several streams at once (OpenClaw sends both a `session.message`
+    /// transcript and an `agent`/assistant stream); appending every stream into
+    /// one buffer interleaves two copies of the message, so each is buffered
+    /// separately and the most complete one is displayed.
+    streaming_text: BTreeMap<DeltaSource, String>,
+    /// A silent session-list refresh is in flight (debounces the gateway's
+    /// "sessions changed" hints).
+    sessions_refresh_inflight: bool,
 
     backend: Arc<AsyncMutex<Backend>>,
     backend_id: &'static str,
@@ -137,6 +225,8 @@ impl AppState {
             is_changing_permission_mode: false,
             expanded_tools: HashSet::new(),
             pending_after_start: None,
+            streaming_text: BTreeMap::new(),
+            sessions_refresh_inflight: false,
             backend: Arc::new(AsyncMutex::new(Backend::make(kind))),
             backend_id: backend_static_id(kind),
             backend_display_name: backend_static_name(kind),
@@ -376,11 +466,21 @@ impl AppState {
         .detach();
     }
 
+    /// Re-read the session list without touching the progress indicator. Used to
+    /// pick up names and state the gateway changed behind our back.
+    fn refresh_sessions_quietly(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.sessions_refresh_inflight {
+            return;
+        }
+        self.refresh_sessions(false, cx);
+    }
+
     pub fn refresh_sessions(&mut self, show_progress: bool, cx: &mut gpui::Context<Self>) {
         if show_progress {
             self.is_refreshing_sessions = true;
             cx.notify();
         }
+        self.sessions_refresh_inflight = true;
         let backend = self.backend.clone();
         let config = self.backend_config();
         let expects_history = self.backend_caps.contains(BackendCaps::SESSION_HISTORY);
@@ -398,6 +498,7 @@ impl AppState {
                 if show_progress {
                     state.is_refreshing_sessions = false;
                 }
+                state.sessions_refresh_inflight = false;
                 match result {
                     Ok(fetched) => {
                         if expects_history {
@@ -411,7 +512,9 @@ impl AppState {
                                     session
                                 })
                                 .collect();
-                            state.sessions = state.filter_visible(fetched);
+                            let selected = state.selected_session.clone();
+                            state.sessions = state
+                                .filter_visible(merge_fetched_sessions(fetched, selected.as_ref()));
                             state.sync_cached_sessions(backend_id);
                             state.update_cache_summary();
                             let cache = state.cache_store.clone();
@@ -545,6 +648,10 @@ impl AppState {
                             ids.live_id,
                             ids.stored_id
                         );
+                        // The gateway names a session itself (after the client
+                        // that created it); re-read the list so the sidebar
+                        // shows that name instead of the local placeholder.
+                        state.refresh_sessions_quietly(cx);
 
                         // Flush a prompt that was held back until a live
                         // session existed.
@@ -633,6 +740,7 @@ impl AppState {
         cx: &mut gpui::Context<Self>,
     ) {
         self.is_sending = true;
+        self.streaming_text.clear();
         let submitted = submitted_prompt(&text, &attachments);
         self.messages
             .push(ChatMessage::new(MessageRole::User, text));
@@ -1145,7 +1253,10 @@ impl AppState {
                     self.schedule_current_messages_cache_save(cx);
                 }
             }
-            AgentEvent::MessageDelta(text) => self.append_assistant_delta(text, cx),
+            AgentEvent::MessageDelta { text, source } => {
+                self.append_assistant_delta(text, source, cx)
+            }
+            AgentEvent::SessionsChanged => self.refresh_sessions_quietly(cx),
             AgentEvent::MessageComplete(text) => self.complete_assistant_message(text, cx),
             AgentEvent::TurnFailed(message) => {
                 self.last_error = Some(message.clone());
@@ -1197,19 +1308,36 @@ impl AppState {
         cx.notify();
     }
 
-    fn append_assistant_delta(&mut self, text: String, cx: &mut gpui::Context<Self>) {
+    fn append_assistant_delta(
+        &mut self,
+        text: String,
+        source: DeltaSource,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if text.is_empty() {
             return;
+        }
+        merge_stream_chunk(self.streaming_text.entry(source).or_default(), &text);
+        let streamed = best_stream_text(&self.streaming_text);
+        if streamed.is_empty() {
+            return;
+        }
+        if self.streaming_text.len() > 1 {
+            log_debug!(
+                "gateway",
+                "reply arriving on {} streams; showing the most complete one",
+                self.streaming_text.len()
+            );
         }
         if let Some(index) = self.messages.iter().rposition(|message| {
             message.role == MessageRole::Assistant
                 && message.is_streaming
                 && message.tool_calls.is_empty()
         }) {
-            self.messages[index].content.push_str(&text);
+            self.messages[index].content = streamed;
         } else {
             let mut message = ChatMessage::streaming(MessageRole::Assistant);
-            message.content = text;
+            message.content = streamed;
             self.messages.push(message);
         }
         self.schedule_current_messages_cache_save(cx);
@@ -1289,8 +1417,18 @@ impl AppState {
                 .push(ChatMessage::new(MessageRole::Assistant, final_text));
         }
         self.prune_empty_assistant_messages();
+        self.streaming_text.clear();
         self.is_sending = false;
         self.save_current_messages_to_cache();
+        // A chat created here is named by the gateway from its first prompt, and
+        // the name only shows up once the session list is re-read.
+        if self
+            .selected_session
+            .as_ref()
+            .is_some_and(|session| needs_session_title(session.title.as_deref()))
+        {
+            self.refresh_sessions_quietly(cx);
+        }
 
         // Auto-dequeue the next waiting prompt.
         if let Some(next) = self.pending_queue.first().cloned() {
@@ -1637,4 +1775,172 @@ fn model_order(lhs: &str, rhs: &str, current: &str) -> std::cmp::Ordering {
         return std::cmp::Ordering::Greater;
     }
     lhs.to_lowercase().cmp(&rhs.to_lowercase())
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn unnamed_sessions_are_recognised() {
+        assert!(needs_session_title(None));
+        assert!(needs_session_title(Some("")));
+        assert!(needs_session_title(Some("  ")));
+        assert!(needs_session_title(Some("New Chat")));
+        assert!(!needs_session_title(Some("Hermit GPUI")));
+    }
+
+    #[test]
+    fn the_open_chat_survives_a_session_list_refresh() {
+        let mut selected = AgentSession::default();
+        selected.id = "agent:main:hermit:brand-new".into();
+        selected.title = Some("New Chat".into());
+
+        let listed = AgentSession {
+            id: "agent:main:hermit:older".into(),
+            title: Some("Hermit GPUI".into()),
+            ..Default::default()
+        };
+
+        // The gateway has not listed the brand new chat yet: it must not vanish
+        // from the sidebar while the user is looking at it.
+        let merged = merge_fetched_sessions(vec![listed.clone()], Some(&selected));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, selected.id);
+        assert!(merged.iter().any(|session| session.id == listed.id));
+
+        // Once the gateway lists it, the fetched (named) copy wins.
+        let named = AgentSession {
+            id: selected.id.clone(),
+            title: Some("Hermit GPUI".into()),
+            ..Default::default()
+        };
+        let merged = merge_fetched_sessions(vec![named], Some(&selected));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].title.as_deref(), Some("Hermit GPUI"));
+    }
+
+    #[test]
+    fn incremental_chunks_accumulate() {
+        let mut buffer = String::new();
+        for chunk in ["科", "研", "模式已进入"] {
+            merge_stream_chunk(&mut buffer, chunk);
+        }
+        assert_eq!(buffer, "科研模式已进入");
+    }
+
+    #[test]
+    fn cumulative_snapshots_replace_instead_of_duplicating() {
+        let mut buffer = String::new();
+        merge_stream_chunk(&mut buffer, "科研");
+        merge_stream_chunk(&mut buffer, "科研模式");
+        merge_stream_chunk(&mut buffer, "科研模式已进入");
+        assert_eq!(buffer, "科研模式已进入");
+    }
+
+    #[test]
+    fn a_repeated_chunk_is_ignored() {
+        let mut buffer = String::new();
+        merge_stream_chunk(&mut buffer, "ab");
+        merge_stream_chunk(&mut buffer, "ab");
+        assert_eq!(buffer, "ab");
+    }
+
+    fn chunked(text: &str, size: usize) -> Vec<String> {
+        let characters: Vec<char> = text.chars().collect();
+        characters
+            .chunks(size)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    }
+
+    /// The OpenClaw regression: one reply is delivered by two streams at the same
+    /// time with different chunk boundaries. Appending them into one buffer
+    /// interleaved two copies of the text and broke the markdown tables inside
+    /// it, because the separator row ended up split across the two copies.
+    #[test]
+    fn two_streams_of_one_reply_do_not_interleave() {
+        let text = "刚把五处落点全部实时拉了一遍，当前状态如下：\n\n\
+                    | 项目 | 进度 | 进行中 |\n|---|---|---|\n\
+                    | **nano-AgFe-抗氧化** | 6/9 | 测试ROS检测手段 |\n\
+                    | PEEK亲水改性 | 4/4 ✅ | — |\n";
+        let first = chunked(text, 3);
+        let second = chunked(text, 7);
+        let mut streams: BTreeMap<DeltaSource, String> = BTreeMap::new();
+        for index in 0..first.len().max(second.len()) {
+            if let Some(chunk) = first.get(index) {
+                merge_stream_chunk(streams.entry(DeltaSource::Transcript).or_default(), chunk);
+            }
+            if let Some(chunk) = second.get(index) {
+                merge_stream_chunk(streams.entry(DeltaSource::AgentStream).or_default(), chunk);
+            }
+        }
+
+        // What the old code did: every stream appended into one buffer.
+        let mut naive = String::new();
+        for index in 0..first.len().max(second.len()) {
+            if let Some(chunk) = first.get(index) {
+                naive.push_str(chunk);
+            }
+            if let Some(chunk) = second.get(index) {
+                naive.push_str(chunk);
+            }
+        }
+        assert_ne!(naive, text, "the naive merge should reproduce the garbling");
+        assert!(
+            !crate::markdown::parse(&naive)
+                .iter()
+                .any(|block| matches!(block, crate::markdown::MarkdownBlock::Table(..))),
+            "the naive merge is what stopped tables from parsing"
+        );
+
+        let shown = best_stream_text(&streams);
+        assert_eq!(shown, text, "interleaved streams garbled the reply");
+        assert!(
+            shown.contains("|---|---|---|"),
+            "the table separator was split"
+        );
+        // The parser turns that separator into a real table.
+        let tables = crate::markdown::parse(&shown)
+            .into_iter()
+            .filter(|block| matches!(block, crate::markdown::MarkdownBlock::Table(..)))
+            .count();
+        assert_eq!(tables, 1, "table was not recognised after merging streams");
+    }
+
+    #[test]
+    fn replayed_overlap_is_merged_once() {
+        let mut buffer = String::new();
+        merge_stream_chunk(&mut buffer, "刚把五处落点");
+        merge_stream_chunk(&mut buffer, "落点全部实时拉了一遍");
+        assert_eq!(buffer, "刚把五处落点全部实时拉了一遍");
+    }
+
+    #[test]
+    fn a_one_character_coincidence_is_not_treated_as_an_overlap() {
+        let mut buffer = String::new();
+        merge_stream_chunk(&mut buffer, "好的");
+        merge_stream_chunk(&mut buffer, "的的确");
+        assert_eq!(buffer, "好的的的确");
+    }
+
+    #[test]
+    fn normal_chunks_are_not_trimmed() {
+        let mut buffer = String::new();
+        for chunk in ["项目", "总览：", "nano-AgFe", "-抗氧化"] {
+            merge_stream_chunk(&mut buffer, chunk);
+        }
+        assert_eq!(buffer, "项目总览：nano-AgFe-抗氧化");
+    }
+
+    #[test]
+    fn the_most_complete_stream_wins() {
+        let mut streams: BTreeMap<DeltaSource, String> = BTreeMap::new();
+        merge_stream_chunk(
+            streams.entry(DeltaSource::Transcript).or_default(),
+            "完整的一段话",
+        );
+        merge_stream_chunk(streams.entry(DeltaSource::AgentStream).or_default(), "完整");
+        assert_eq!(best_stream_text(&streams), "完整的一段话");
+    }
 }

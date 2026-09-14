@@ -395,14 +395,37 @@ bitflags_like! {
     }
 }
 
+/// Which event stream a streamed chunk of a reply arrived on.
+///
+/// A gateway can deliver the *same* reply over more than one stream at once
+/// (OpenClaw sends both a `session.message` transcript and an `agent`/assistant
+/// event stream). Appending all of them into one buffer interleaves two copies
+/// of the message, so chunks are tagged and buffered per stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeltaSource {
+    /// `session.message` / `chat` frames carrying `deltaText`.
+    Transcript,
+    /// `agent` frames with `stream: "assistant"` (`data.delta`).
+    AgentStream,
+    /// Item / event-log streams (`message.delta`, `message.part.updated`,
+    /// `item/agentMessage/delta`, …).
+    EventStream,
+}
+
 /// Events every backend normalizes into; consumed by AppState.
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
     Connected,
     SessionInfo(String),
     MessageStart,
-    MessageDelta(String),
+    MessageDelta {
+        text: String,
+        source: DeltaSource,
+    },
     MessageComplete(Option<String>),
+    /// The gateway's session list changed (renamed, created, finished a turn).
+    /// Carries no payload: it is a hint to re-list.
+    SessionsChanged,
     TurnFailed(String),
     Tool(ToolCallRecord),
     Clarify {
