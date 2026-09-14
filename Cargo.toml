@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/desktop"]
+members = ["crates/core", "crates/desktop", "crates/mobile"]
 
 # Shared by every member, so `env!("CARGO_PKG_VERSION")` — which the OpenClaw
 # handshake reports to the Gateway — is the same number whichever crate it is

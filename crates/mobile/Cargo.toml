@@ -1,0 +1,22 @@
+[package]
+name = "van-goal-mobile"
+description = "C ABI over van-goal-core, for the Flutter client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "van_goal_mobile"
+# `cdylib` is what Android loads as libvan_goal_mobile.so; `lib` keeps the crate
+# usable from Rust tests.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+van-goal-core = { path = "../core" }
+
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

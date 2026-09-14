@@ -93,13 +93,18 @@ macro_rules! log_debug {
 /// Small helper namespace so the rest of the app can locate support dirs.
 pub mod dirs {
     use std::path::PathBuf;
-    use std::sync::OnceLock;
+    use std::sync::RwLock;
 
     /// App-data directory name. The app was called Hermit until it was renamed to
     /// Van-Goal; the old directory is moved into place once so that settings, the
     /// session cache and the OpenClaw device identity survive the rename.
-    const APP_DIR: &str = "VanGoal";
-    const LEGACY_APP_DIR: &str = "HermitGPUI";
+    const APP_DIR_NAME: &str = "VanGoal";
+    const LEGACY_APP_DIR_NAME: &str = "HermitGPUI";
+
+    /// Where the app-data directory ended up, resolved once. `None` until
+    /// something asks, so a host that has a directory of its own to offer can
+    /// name it first.
+    static RESOLVED_APP_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
     pub fn home() -> PathBuf {
         std::env::var("HOME")
@@ -117,9 +122,38 @@ pub mod dirs {
     /// Directory holding settings, the session cache and the OpenClaw device
     /// identity. Every caller goes through here, so the rename happens once,
     /// before anything reads or creates the directory.
+    ///
+    /// On a platform with no `~/Library/Application Support` the host has to
+    /// name the directory first — see [`set_app_dir`].
     pub fn app_dir() -> PathBuf {
-        static DIR: OnceLock<PathBuf> = OnceLock::new();
-        DIR.get_or_init(resolve_app_dir).clone()
+        if let Some(dir) = RESOLVED_APP_DIR
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return dir;
+        }
+        let resolved = resolve_app_dir();
+        *RESOLVED_APP_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(resolved.clone());
+        resolved
+    }
+
+    /// Point the app-data directory at a location the host chooses.
+    ///
+    /// Android and iOS do not have `~/Library/Application Support`: an app is
+    /// given a private directory by the platform, and the mobile client passes
+    /// it here before anything reads [`app_dir`]. Returns `false` when the
+    /// directory has already been resolved, because the choice is made once and
+    /// remembered — a caller that gets `false` is telling the app to read and
+    /// write somewhere other than where it already has.
+    pub fn set_app_dir(path: PathBuf) -> bool {
+        let _ = std::fs::create_dir_all(&path);
+        let mut slot = RESOLVED_APP_DIR.write().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(path);
+        true
     }
 
     /// Unit tests must never touch the real app data. Building an `AppState`
@@ -158,8 +192,8 @@ pub mod dirs {
     /// which is the case in every test build.
     #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
     fn migrate_app_dir(support: &std::path::Path) -> PathBuf {
-        let current = support.join(APP_DIR);
-        let legacy = support.join(LEGACY_APP_DIR);
+        let current = support.join(APP_DIR_NAME);
+        let legacy = support.join(LEGACY_APP_DIR_NAME);
         if !current.exists() && legacy.exists() && std::fs::rename(&legacy, &current).is_err() {
             // A rename fails across volumes; copying still keeps the node's
             // settings, cache and paired device identity.

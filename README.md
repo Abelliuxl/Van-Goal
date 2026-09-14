@@ -116,6 +116,44 @@ cache and OpenClaw device identity.
 
 GPUI owns the main-thread UI executor. A multi-threaded tokio runtime is installed as a GPUI global; every backend operation runs on it and marshals results back onto the UI through GPUI entities. Backend events arrive on a single `futures::channel::mpsc` channel and are pumped into the state machine, mirroring the SwiftUI version's actor-based design.
 
+## Android
+
+`app/` is a Flutter client for the same Rust core, reached through
+`crates/mobile` — a small C ABI that owns a tokio runtime and drives a
+`Backend`, so Dart never blocks on the network. Dart owns the widgets; Rust owns
+the connection.
+
+The interface is three calls: a command goes in as JSON, an acknowledgement
+comes back, and everything the command produced arrives from `vg_poll()` as
+events. Streaming deltas coalesce in that queue, so a long reply costs one slot
+rather than one per token. See the module comment in `crates/mobile/src/lib.rs`
+for why the surface is shaped that way.
+
+### Only the network backends
+
+The phone build offers **Hermes, OpenCode, MiMoCode and OpenClaw**. Codex CLI,
+Claude Code and Pi are local subprocesses, and a managed `hermes serve` is
+launched as one — none of those binaries exist on a phone and an Android app
+cannot spawn them. `crates/mobile` refuses them at the edge rather than offering
+a connection that fails for a reason the user cannot act on.
+
+### Build
+
+The toolchain installs without `sudo`, under your own home directory:
+
+```bash
+Scripts/setup_android_toolchain.sh   # JDK, Flutter, Android SDK + NDK, Rust targets
+Scripts/build_android.sh             # cross-compile the core, then package the APK
+```
+
+`Scripts/android_env.sh` holds the environment both scripts use; source it to
+run `flutter` or `adb` by hand. It points `FLUTTER_STORAGE_BASE_URL` and
+`PUB_HOSTED_URL` at the Flutter team's mirrors, which are several times faster
+than the origin from here.
+
+The APK lands in `app/build/app/outputs/flutter-apk/app-release.apk`. Install it
+with `adb install -r` or by copying it to the phone.
+
 ## Differences from the SwiftUI Hermit
 
 - System, light, and dark appearance modes are available in Settings.
