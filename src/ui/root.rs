@@ -7,6 +7,9 @@ use gpui::{
     ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
 
+/// How long the window geometry has to hold still before it is written out.
+const WINDOW_SAVE_DELAY_MS: u64 = 400;
+
 /// Root shell: toolbar + sidebar + chat split.
 pub struct RootView {
     state: Entity<AppState>,
@@ -14,29 +17,86 @@ pub struct RootView {
     chat: Entity<ChatView>,
     /// The session list can be collapsed to give the transcript the full width.
     sidebar_open: bool,
+    /// Pending write of the window geometry. Resizing fires an event per frame,
+    /// so the file is only touched once the geometry stops changing.
+    window_save_task: Option<gpui::Task<()>>,
 }
 
 impl RootView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
         let chat = cx.new(|cx| ChatView::new(state.clone(), cx));
+        // Picks up where the last run left off rather than always opening the
+        // list.
+        let sidebar_open = state.read(cx).settings.sidebar_open;
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         cx.observe_window_appearance(window, |_, window, cx| {
             window.refresh();
             cx.notify();
         })
         .detach();
-        Self {
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.remember_window(window, cx);
+        })
+        .detach();
+        let mut view = Self {
             state,
             sidebar,
             chat,
-            sidebar_open: true,
-        }
+            sidebar_open,
+            window_save_task: None,
+        };
+        // The bounds observer only fires when the geometry *changes*, so record
+        // where the window opened too. Otherwise a first run that is never
+        // resized or moved would never write anything down.
+        view.remember_window(window, cx);
+        view
+    }
+
+    /// Remember where and how big the window is, so the next launch opens the
+    /// same way. Fires for every frame of a resize or move, so the write is
+    /// deferred until the geometry settles.
+    fn remember_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (bounds, maximized) = match window.window_bounds() {
+            gpui::WindowBounds::Windowed(bounds) => (bounds, false),
+            gpui::WindowBounds::Maximized(bounds) => (bounds, true),
+            // Opening straight into a full-screen space is disorienting, so only
+            // the size to restore to is kept.
+            gpui::WindowBounds::Fullscreen(bounds) => (bounds, false),
+        };
+        let saved = crate::settings::SavedWindow {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            maximized,
+        };
+        self.window_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(WINDOW_SAVE_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.window_save_task = None;
+                let state = this.state.clone();
+                state.update(cx, |state, _cx| {
+                    if state.settings.window != Some(saved) {
+                        state.settings.window = Some(saved);
+                        state.settings.save();
+                    }
+                });
+            });
+        }));
     }
 
     /// Show or hide the session sidebar (toolbar button / ⌘B).
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
+        let open = self.sidebar_open;
+        let state = self.state.clone();
+        state.update(cx, |state, _cx| {
+            state.settings.sidebar_open = open;
+            state.settings.save();
+        });
         cx.notify();
     }
 }
@@ -340,5 +400,83 @@ mod tests {
                 f32::from(icon.size.height)
             );
         }
+    }
+
+    fn sized_root(
+        cx: &mut TestAppContext,
+        state: Entity<AppState>,
+    ) -> (Entity<RootView>, &mut gpui::VisualTestContext) {
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| RootView::new(state, window, cx));
+            SizedRoot(view)
+        });
+        let view = host.read_with(cx, |host, _cx| host.0.clone());
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// The geometry observer fires for every frame of a resize, so the write is
+    /// deferred until the window settles.
+    #[gpui::test]
+    fn the_window_geometry_is_remembered_once_it_settles(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        let (_view, cx) = sized_root(cx, state.clone());
+
+        assert_eq!(
+            state.update(cx, |state, _cx| state.settings.window),
+            None,
+            "the geometry was written before the window settled"
+        );
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(WINDOW_SAVE_DELAY_MS + 50));
+        cx.run_until_parked();
+
+        let saved = state
+            .update(cx, |state, _cx| state.settings.window)
+            .expect("the window geometry was never remembered");
+        assert!(
+            saved.width > 0.0 && saved.height > 0.0 && saved.x.is_finite() && saved.y.is_finite(),
+            "nonsense geometry was saved: {saved:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn collapsing_the_sidebar_is_remembered(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        let (view, cx) = sized_root(cx, state.clone());
+
+        assert!(
+            view.read_with(cx, |view, _cx| view.sidebar_open),
+            "the sidebar should start open"
+        );
+
+        cx.update(|_window, cx| {
+            view.update(cx, |view, cx| view.toggle_sidebar(cx));
+        });
+
+        assert!(
+            !view.read_with(cx, |view, _cx| view.sidebar_open),
+            "the sidebar did not collapse"
+        );
+        assert!(
+            !state.update(cx, |state, _cx| state.settings.sidebar_open),
+            "the collapsed sidebar was not written down"
+        );
+    }
+
+    /// A reopened window has to come back the way it was left.
+    #[gpui::test]
+    fn a_remembered_collapsed_sidebar_reopens_collapsed(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.settings.sidebar_open = false;
+        });
+
+        let (view, _cx) = sized_root(cx, state);
+        assert!(
+            !view.read_with(_cx, |view, _cx| view.sidebar_open),
+            "the window ignored the remembered sidebar state"
+        );
     }
 }

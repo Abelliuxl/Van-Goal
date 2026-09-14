@@ -31,14 +31,42 @@ impl gpui::Global for MainWindowGlobal {}
 struct SettingsWindowGlobal(Option<gpui::WindowHandle<ui::settings_window::SettingsView>>);
 impl gpui::Global for SettingsWindowGlobal {}
 
+/// Window size for a first launch, before anything has been remembered.
+const DEFAULT_WINDOW_WIDTH: f32 = 1180.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 760.0;
+
+/// Where to open the window: the geometry from last time when it still makes
+/// sense, otherwise centred at the default size.
+fn initial_window_bounds(state: &gpui::Entity<AppState>, cx: &mut App) -> WindowBounds {
+    let saved = state.read(cx).settings.window.filter(|s| s.is_plausible());
+    match saved {
+        Some(saved) => {
+            let bounds = Bounds {
+                origin: point(px(saved.x), px(saved.y)),
+                size: size(px(saved.width), px(saved.height)),
+            };
+            if saved.maximized {
+                WindowBounds::Maximized(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
+            }
+        }
+        None => WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+            cx,
+        )),
+    }
+}
+
 fn open_main_window(
     state: gpui::Entity<AppState>,
     cx: &mut App,
 ) -> gpui::Result<gpui::WindowHandle<RootView>> {
-    let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+    let bounds = initial_window_bounds(&state, cx);
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(bounds),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("Van-Goal".into()),
                 appears_transparent: true,

@@ -157,6 +157,45 @@ pub struct Settings {
     pub debug_logging_enabled: bool,
     #[serde(default)]
     pub per_backend: std::collections::HashMap<String, PerBackendConnection>,
+    /// Whether the session list was showing when the app was last used.
+    #[serde(default = "default_true")]
+    pub sidebar_open: bool,
+    /// Where and how big the window was. `None` until it has been observed
+    /// once, so a fresh install opens centred at its default size.
+    #[serde(default)]
+    pub window: Option<SavedWindow>,
+}
+
+/// Window geometry remembered across launches. Kept as plain numbers so this
+/// module stays free of GPUI types and stays testable without a window.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedWindow {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// The window was zoomed. `width` and `height` still hold the size to
+    /// restore to when it is un-zoomed.
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl SavedWindow {
+    /// Reject geometry that would open the window unusably small or absurdly
+    /// large, which is what a stale file costs after the display setup changes.
+    /// A rejected record simply falls back to the default size.
+    pub fn is_plausible(&self) -> bool {
+        const MIN_WIDTH: f32 = 560.0;
+        const MIN_HEIGHT: f32 = 480.0;
+        const MAX: f32 = 20_000.0;
+        let size_ok = |value: f32, min: f32| value.is_finite() && (min..=MAX).contains(&value);
+        size_ok(self.width, MIN_WIDTH)
+            && size_ok(self.height, MIN_HEIGHT)
+            && self.x.is_finite()
+            && self.y.is_finite()
+            && self.x.abs() <= MAX
+            && self.y.abs() <= MAX
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -215,6 +254,8 @@ impl Default for Settings {
             backend_use_tls: false,
             debug_logging_enabled: false,
             per_backend: std::collections::HashMap::new(),
+            sidebar_open: true,
+            window: None,
         }
     }
 }
@@ -489,7 +530,7 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, Settings};
+    use super::{BackendKind, SavedWindow, Settings};
 
     #[test]
     fn full_websocket_url_preserves_reverse_proxy_path() {
@@ -750,5 +791,57 @@ mod tests {
         // Switching must not turn a backend on or off behind the user's back.
         assert!(settings.is_backend_enabled(BackendKind::OpenClaw));
         assert!(!settings.is_backend_enabled(BackendKind::Hermes));
+    }
+
+    #[test]
+    fn window_geometry_and_the_sidebar_survive_a_round_trip() {
+        let temp = TempSettings::new();
+        let settings = Settings {
+            sidebar_open: false,
+            window: Some(SavedWindow {
+                x: 120.0,
+                y: 80.0,
+                width: 1440.0,
+                height: 900.0,
+                maximized: true,
+            }),
+            ..Settings::default()
+        };
+        settings.save_to(temp.path());
+
+        let reloaded = Settings::load_from(temp.path());
+        assert_eq!(reloaded.window, settings.window);
+        assert!(
+            !reloaded.sidebar_open,
+            "the collapsed sidebar was forgotten"
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_opens_the_sidebar_and_centres_the_window() {
+        let settings = Settings::default();
+        assert!(settings.sidebar_open);
+        assert_eq!(
+            settings.window, None,
+            "with no geometry saved the window opens at its default size"
+        );
+    }
+
+    /// A saved position can outlive the display it was saved on, so geometry
+    /// that would open the window unusably is rejected rather than restored.
+    #[test]
+    fn implausible_window_geometry_is_rejected() {
+        let with_size = |width: f32, height: f32| SavedWindow {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            maximized: false,
+        };
+        assert!(with_size(1180.0, 760.0).is_plausible());
+        assert!(!with_size(100.0, 760.0).is_plausible(), "too narrow");
+        assert!(!with_size(1180.0, 100.0).is_plausible(), "too short");
+        assert!(!with_size(50_000.0, 760.0).is_plausible(), "absurdly wide");
+        assert!(!with_size(f32::NAN, 760.0).is_plausible(), "not a number");
     }
 }
