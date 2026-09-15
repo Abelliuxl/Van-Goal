@@ -1,4 +1,4 @@
-use super::session_scope::belongs_to_session;
+use super::session_scope::belongs_to_open_session;
 use super::{json_str, normalize_seconds, pretty_json};
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -419,10 +419,12 @@ fn handle_event_json(
 
     // The server's `/event` stream carries every session, including the ones the
     // user is not looking at: without this, another session's reply is written
-    // into the open transcript. See `session_scope`.
+    // into the open transcript. See `session_scope` — the strict form, because
+    // "no session subscribed yet" is the state of a client that has just
+    // reconnected, not a licence to accept everything.
     {
         let state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if !belongs_to_session(
+        if !belongs_to_open_session(
             state.active_session_id.as_deref(),
             event_session_id.as_deref(),
         ) {

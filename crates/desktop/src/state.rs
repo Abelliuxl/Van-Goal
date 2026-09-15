@@ -51,6 +51,28 @@ impl StoredCredential {
     }
 }
 
+/// A prompt typed before there was a live session to send it to.
+///
+/// `session` is the session it has to go to, and the distinction is the whole
+/// point: `Some` means the user was looking at an existing conversation, so the
+/// connection has to *resume* it — creating a session instead is how a prompt
+/// once landed in a conversation the user had never opened, which reads as one
+/// chat's messages turning up in another. `None` means a genuinely new chat,
+/// which is the only case that needs a session created.
+#[derive(Clone, Debug)]
+pub struct HeldPrompt {
+    pub session: Option<String>,
+    pub text: String,
+    pub attachments: Vec<ComposerAttachment>,
+}
+
+impl HeldPrompt {
+    /// The prompt as the composer should show it again, if it cannot be sent.
+    fn into_composer(self) -> (String, Vec<ComposerAttachment>) {
+        (self.text, self.attachments)
+    }
+}
+
 /// Single source of truth for sessions, messages, streaming and sending —
 /// the GPUI port of the SwiftUI AppState.
 pub struct AppState {
@@ -78,9 +100,9 @@ pub struct AppState {
     pub context_window_tokens: i64,
     pub permission_mode: PermissionMode,
     pub is_changing_permission_mode: bool,
-    /// (message id, tool index) pairs expanded in the activity pill.
-    /// Prompt held back because no live session existed when the user hit send.
-    pub pending_after_start: Option<(String, Vec<ComposerAttachment>)>,
+    /// A prompt typed before there was a live session to send it to, and the
+    /// session it belongs to — see [`HeldPrompt`].
+    pub pending_after_start: Option<HeldPrompt>,
     /// Text received per event stream for the turn in flight. One reply can
     /// arrive on several streams at once (OpenClaw sends both a `session.message`
     /// transcript and an `agent`/assistant stream); appending every stream into
@@ -546,6 +568,9 @@ impl AppState {
         let backend = self.backend.clone();
         let config = self.backend_config();
         let session_id = session.id.clone();
+        // Kept back for the task that reports the outcome: the id itself is
+        // moved into the resume below.
+        let resumed_id = session.id.clone();
         let join = tokio_spawn(cx, async move {
             backend
                 .lock()
@@ -557,21 +582,48 @@ impl AppState {
             let result = join
                 .await
                 .unwrap_or(Err(anyhow::anyhow!("resume task failed")));
-            let _ = this.update(cx, |state, _cx| match result {
-                Ok(ids) => {
-                    state.live_gateway_session_id = Some(ids.live_id.clone());
-                    state.stored_gateway_session_id =
-                        Some(ids.stored_id.unwrap_or_else(|| ids.live_id.clone()));
-                    state.transport_ready = true;
-                    let cache = state.cache_store.clone();
-                    let snapshot = state.cached_state.clone();
-                    cache.save(snapshot);
-                }
-                Err(error) => {
-                    state.last_error = Some(error.to_string());
-                    log_debug!("app", "resume gateway failed: {error}");
-                }
-            });
+            let _ =
+                this.update(cx, |state, cx| match result {
+                    Ok(ids) => {
+                        state.live_gateway_session_id = Some(ids.live_id.clone());
+                        state.stored_gateway_session_id =
+                            Some(ids.stored_id.unwrap_or_else(|| ids.live_id.clone()));
+                        state.transport_ready = true;
+                        let cache = state.cache_store.clone();
+                        let snapshot = state.cached_state.clone();
+                        cache.save(snapshot);
+                        // A prompt held for *this* session can go now. It was held
+                        // because the connection had no live session to send it to,
+                        // not because the user wanted to wait.
+                        let belongs_here = state.pending_after_start.as_ref().is_some_and(|held| {
+                            held.session.as_deref() == Some(ids.live_id.as_str())
+                        });
+                        let held = belongs_here
+                            .then(|| state.pending_after_start.take())
+                            .flatten();
+                        if let Some(held) = held {
+                            let (text, attachments) = held.into_composer();
+                            state.perform_send(text, attachments, ids.live_id.clone(), cx);
+                        }
+                    }
+                    Err(error) => {
+                        state.last_error = Some(error.to_string());
+                        // Give back a prompt that was waiting for this session, so
+                        // nothing the user typed is lost when the resume fails.
+                        let belongs_here = state.pending_after_start.as_ref().is_some_and(|held| {
+                            held.session.as_deref() == Some(resumed_id.as_str())
+                        });
+                        let held = belongs_here
+                            .then(|| state.pending_after_start.take())
+                            .flatten();
+                        if let Some(held) = held {
+                            let (text, attachments) = held.into_composer();
+                            state.composer_text = text;
+                            state.composer_attachments = attachments;
+                        }
+                        log_debug!("app", "resume gateway failed: {error}");
+                    }
+                });
         })
         .detach();
     }
@@ -641,12 +693,20 @@ impl AppState {
                         state.refresh_sessions_quietly(cx);
 
                         // Flush a prompt that was held back until a live
-                        // session existed.
-                        if let Some((text, attachments)) = state.pending_after_start.take() {
-                            if let Some(session_id) = state.live_gateway_session_id.clone() {
-                                state.composer_text = String::new();
-                                state.composer_attachments = Vec::new();
-                                state.perform_send(text, attachments, session_id, cx);
+                        // session existed — but only one that was waiting for a
+                        // *new* chat. A prompt held for a conversation the user
+                        // was reading belongs there, not in this new one.
+                        let held = state
+                            .pending_after_start
+                            .as_ref()
+                            .is_some_and(|held| held.session.is_none());
+                        if held {
+                            if let Some(held) = state.pending_after_start.take() {
+                                if let Some(session_id) = state.live_gateway_session_id.clone() {
+                                    state.composer_text = String::new();
+                                    state.composer_attachments = Vec::new();
+                                    state.perform_send(held.text, held.attachments, session_id, cx);
+                                }
                             }
                         }
                     }
@@ -655,10 +715,19 @@ impl AppState {
                         state.last_error = Some(error.to_string());
                         state.transport_ready = false;
                         // Give the held-back prompt back to the composer so
-                        // nothing the user typed is lost.
-                        if let Some((text, attachments)) = state.pending_after_start.take() {
-                            state.composer_text = text;
-                            state.composer_attachments = attachments;
+                        // nothing the user typed is lost. One held for another
+                        // conversation stays held: that session is still the
+                        // one it has to go to.
+                        let held = state
+                            .pending_after_start
+                            .as_ref()
+                            .is_some_and(|held| held.session.is_none());
+                        if held {
+                            if let Some(held) = state.pending_after_start.take() {
+                                let (text, attachments) = held.into_composer();
+                                state.composer_text = text;
+                                state.composer_attachments = attachments;
+                            }
                         }
                         log_debug!("app", "session.create failed: {error}");
                     }
@@ -690,13 +759,58 @@ impl AppState {
         }
 
         if !self.transport_ready || self.live_gateway_session_id.is_none() {
-            // No live session yet: create one first, then submit automatically.
-            // Keep the composer content visible until the prompt actually
-            // submits, so a failed session setup never eats the user's text.
-            self.pending_after_start = Some((text.clone(), attachments.clone()));
-            log_debug!("app", "no live session on send; creating fresh chat first");
-            self.start_fresh_chat(cx);
-            return;
+            // There is no live session to send to. Which one the prompt belongs
+            // to decides what happens next, and getting it wrong is invisible:
+            // a session created here would take the prompt while the window
+            // still shows the conversation the user was reading.
+            let existing = self.stored_gateway_session_id.clone().or_else(|| {
+                self.selected_session
+                    .as_ref()
+                    .map(|session| session.id.clone())
+            });
+            match existing {
+                Some(session) => {
+                    // The conversation on screen still exists on the backend; it
+                    // just is not subscribed to on this connection yet. Wait for
+                    // that, and send the prompt there.
+                    let session_row = self
+                        .selected_session
+                        .clone()
+                        .or_else(|| self.sessions.iter().find(|row| row.id == session).cloned());
+                    match session_row {
+                        Some(session_row) => {
+                            self.pending_after_start = Some(HeldPrompt {
+                                session: Some(session),
+                                text,
+                                attachments,
+                            });
+                            log_debug!("app", "no live session on send; resuming the open session");
+                            self.resume_session(session_row, cx);
+                        }
+                        None => {
+                            self.composer_text = text;
+                            self.composer_attachments = attachments;
+                            self.last_error = Some("That session is no longer in the list.".into());
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                None => {
+                    // No session on screen at all: a new chat, which does need
+                    // one created. Keep the composer content visible until the
+                    // prompt actually submits, so a failed session setup never
+                    // eats the user's text.
+                    self.pending_after_start = Some(HeldPrompt {
+                        session: None,
+                        text,
+                        attachments,
+                    });
+                    log_debug!("app", "no live session on send; creating fresh chat first");
+                    self.start_fresh_chat(cx);
+                    return;
+                }
+            }
         }
 
         if self.is_sending {

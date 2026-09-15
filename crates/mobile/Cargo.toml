@@ -20,3 +20,9 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# `cfg(test)` does not reach a dependency, so a test that writes a preference
+# has to ask core for its throwaway app-data directory explicitly. Without this
+# a test run rewrites the developer's real settings.
+van-goal-core = { path = "../core", features = ["testing"] }

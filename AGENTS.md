@@ -21,6 +21,25 @@ Scripts/           toolchain setup and packaging
 docs/              architecture, sessions, mobile
 ```
 
+`crates/core/examples/gateway_probe.rs` is the wire-level diagnostic for the
+Gateway. Session isolation is decided by what a frame says about *which* session
+it belongs to, and that cannot be reasoned about from the source — every fact in
+[docs/sessions.md](docs/sessions.md) about what a Gateway sends was measured with
+this. It connects with the same device identity the app uses and prints each
+frame with the label the adapter would read off it, then scores the whole
+capture with both session rules:
+
+```bash
+cargo run -p van-goal-core --example gateway_probe -- --list
+cargo run -p van-goal-core --example gateway_probe -- --history agent:main:some-session
+cargo run -p van-goal-core --example gateway_probe -- --poke     # traffic in a session of its own
+```
+
+`--poke` creates `agent:main:van-goal-probe:isolation-probe` and puts one turn in
+it, which is how a leak is reproduced on purpose. Removing it needs the
+`operator.admin` scope, which this client is not granted, so a poked session has
+to be deleted from the Gateway's own side.
+
 ## Rules that are not negotiable
 
 **`crates/core` must not import a UI toolkit.** That is the whole reason the
@@ -35,10 +54,25 @@ client once had its own version and it produced one "Thinking…" bubble per eve
 plus a spinner that never stopped.
 
 **Every adapter whose events carry a session id calls
-`session_scope::belongs_to_session`.** One connection carries many sessions; the
-failure mode is another session's reply appearing in the open chat, which does
-not look like a failure. See [docs/sessions.md](docs/sessions.md) for the rule
-and for what the frontends add on top.
+`session_scope::belongs_to_open_session` for turn traffic.** One connection
+carries many sessions; the failure mode is another session's reply appearing in
+the open chat, which does not look like a failure. A Gateway pushes every
+session to every client — measured, and `sessions.messages.subscribe` does not
+change it — so "nothing subscribed yet" must not mean "accept everything": that
+is the state a client is in for the whole window after a reconnect. See
+[docs/sessions.md](docs/sessions.md).
+
+**A prompt goes to the session on screen, or nowhere.** Having no live
+connection to it is not the same as having no session: it is the state after
+every reconnect. Resume it and send, rather than creating a session the user
+never opened — that is the difference between a chat that keeps its context and
+one that looks like messages are landing in the wrong conversation.
+
+**A client comes back to the session it had open.** An app that starts on an
+empty chat makes the first thing typed create another session, and on a phone,
+whose socket drops constantly, that is the normal case rather than the
+exception. `Settings::last_session` is that memory on mobile; `new_session`
+clears it.
 
 **Tests must never touch real app data.** `crates/core` has a `testing` feature
 that redirects the app-data directory to a throwaway temp directory; a crate that
@@ -103,6 +137,11 @@ adb install -r app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 after a single-ABI build: the other ABIs still hold the previous version's
 `.so` files. Build the split APKs (`--split-per-abi`) or rebuild every ABI.
 
+`app/pubspec.yaml` says `0.1.0+1` while the installed app reports a version code
+in the thousands, so a plain `flutter build apk --release` is **refused as a
+downgrade** over an install made with `--build-number`. Pass a higher one:
+`flutter build apk --release --build-number=2003`.
+
 ## Things that surprise people
 
 * **`vg_set_data_dir` must be the first call** on mobile. The app-data directory
@@ -115,7 +154,12 @@ after a single-ABI build: the other ABIs still hold the previous version's
   explicitly there.
 * **OpenClaw identifies the device as `darwin`/`desktop`** from compile-time
   constants (`agent/device_identity.rs`), so a phone looks like a Mac in
-  `openclaw devices list`.
+  `openclaw devices list`. The name it *calls itself* is separate and **is**
+  per-frontend (`OPENCLAW_DISPLAY_NAME`, `OPENCLAW_SESSION_NAMESPACE`): the
+  Gateway titles a session after the client that created it, so one shared name
+  fills the session list with identical entries and picking the wrong one is
+  indistinguishable from a client that crossed two conversations. Measured:
+  ten sessions all titled "Van-Goal".
 * **`chat.history` carries no tool calls.** Tool activity is only known for turns
   this client watched; reopening a session merges back what the client recorded
   (`Conversation::merge_transcript`) and nothing more.

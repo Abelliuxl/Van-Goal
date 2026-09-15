@@ -11,6 +11,36 @@ pub const OPENCLAW_SCOPES: &[&str] = &["operator.read", "operator.write", "opera
 pub const OPENCLAW_PLATFORM: &str = "darwin";
 pub const OPENCLAW_DEVICE_FAMILY: &str = "desktop";
 
+/// What this frontend calls itself on the Gateway.
+///
+/// The Gateway titles a session after the client that created it, and it reads
+/// that name from the handshake rather than from the session key — measured: a
+/// session created under the key `agent:main:van-goal:isolation-probe` by a
+/// client whose `displayName` was "Van-Goal probe" came back titled
+/// **"Van-Goal probe"**. So two frontends sharing one name fill the session
+/// list with identical entries (ten of them read "Van-Goal" on the Gateway this
+/// was measured against), and picking the wrong one is indistinguishable from a
+/// client that crossed two conversations.
+///
+/// `displayName` is not part of the signed device payload, so naming the
+/// frontend here does not disturb an existing device pairing.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Mobile";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Desktop";
+
+/// The namespace a session key this frontend proposes is filed under.
+///
+/// The rest of a key the client proposes is its own to choose — another client
+/// pins the fixed key `agent:main:main` — and this third segment is what the
+/// Gateway's own records and logs name the origin by. Keeping it per-frontend
+/// means a session whose title has not been set still shows a readable id
+/// instead of one that could belong to either client.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const OPENCLAW_SESSION_NAMESPACE: &str = "van-goal-mobile";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub const OPENCLAW_SESSION_NAMESPACE: &str = "van-goal-desktop";
+
 /// Stable Ed25519 device identity persisted in Van-Goal's local app data, used to answer
 /// the OpenClaw Gateway connect challenge (port of OpenClawDeviceIdentity).
 pub struct OpenClawDeviceIdentity {

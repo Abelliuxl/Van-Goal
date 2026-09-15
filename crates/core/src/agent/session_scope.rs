@@ -11,6 +11,14 @@
 //! This is one rule, so it lives in one place and every adapter calls it. An
 //! adapter that gains a session-labelled stream must call it too — see
 //! `docs/sessions.md`.
+//!
+//! There are two forms of it, and the difference matters. [`belongs_to_session`]
+//! is the lenient one, for streams that carry the announcement of which session
+//! the client is on: with nothing subscribed yet it keeps everything, because
+//! there is nothing to compare against. [`belongs_to_open_session`] is the strict
+//! one, for *turn* traffic: a labelled frame belongs to the session on screen or
+//! to nobody. A Gateway delivers every session to every client, so the lenient
+//! form applied to turn traffic is the leak this module exists to prevent.
 
 /// Whether an event labelled `event_session` belongs to the session this client
 /// subscribed to.
@@ -39,6 +47,33 @@ pub fn belongs_to_session<'a>(
     match event_session {
         None => true,
         Some(event) => first == event || subscribed.any(|id| id == event),
+    }
+}
+
+/// Whether a frame that carries *turn* traffic belongs to the session on screen.
+///
+/// This is the strict half of [`belongs_to_session`], and the difference is the
+/// empty scope. A Gateway fans out every session it knows about to every
+/// connected client — measured on a live Gateway, a socket that had subscribed
+/// to nothing received two different sessions' `chat` and `agent` frames inside
+/// thirty seconds — and `sessions.messages.subscribe` does not change that. So
+/// "this client is on no session yet" cannot mean "accept all of them": that is
+/// precisely the state a client is in right after a reconnect, and on a phone
+/// that is most of the time. A labelled turn frame with nothing on screen
+/// belongs to somebody else.
+///
+/// An unlabelled frame is still kept. A backend that labels the traffic it fans
+/// out may leave its own single-session stream unlabelled, and dropping those
+/// would lose the active session's own reply — the worse of the two failures.
+/// Every turn frame on the Gateway this was measured against carried its
+/// `sessionKey`, so in practice nothing is lost by requiring the label to match.
+pub fn belongs_to_open_session<'a>(
+    subscribed: impl IntoIterator<Item = &'a str>,
+    event_session: Option<&str>,
+) -> bool {
+    match event_session {
+        None => true,
+        Some(event) => subscribed.into_iter().any(|id| id == event),
     }
 }
 
@@ -86,5 +121,45 @@ mod tests {
         assert!(belongs_to_session(["live-1", "stored-1"], Some("live-1")));
         assert!(belongs_to_session(["live-1", "stored-1"], Some("stored-1")));
         assert!(!belongs_to_session(["live-1", "stored-1"], Some("live-2")));
+    }
+
+    /// The bug this strict form exists for: a Gateway pushes every session to
+    /// every client, so a client that is on no session yet — which is what a
+    /// client looks like for the whole window after a reconnect — must not treat
+    /// "nothing to compare against" as "everything is mine".
+    #[test]
+    fn turn_traffic_for_another_session_is_dropped_even_with_nothing_open() {
+        assert!(!belongs_to_open_session(
+            [],
+            Some("agent:main:van-goal:someone-else"),
+        ));
+        assert!(!belongs_to_open_session(
+            std::iter::empty(),
+            Some("agent:main:any"),
+        ));
+    }
+
+    #[test]
+    fn turn_traffic_for_the_open_session_is_kept() {
+        assert!(belongs_to_open_session(
+            ["agent:main:mine"],
+            Some("agent:main:mine")
+        ));
+        assert!(belongs_to_open_session(
+            ["live-1", "stored-1"],
+            Some("stored-1")
+        ));
+        assert!(!belongs_to_open_session(
+            ["live-1", "stored-1"],
+            Some("live-2")
+        ));
+    }
+
+    /// The lenient and strict forms still agree that an unlabelled frame is the
+    /// active session's own: dropping it could lose the reply being awaited.
+    #[test]
+    fn an_unlabelled_turn_frame_is_kept_by_both_rules() {
+        assert!(belongs_to_open_session(["agent:main:mine"], None));
+        assert!(belongs_to_open_session(std::iter::empty(), None));
     }
 }

@@ -1,4 +1,4 @@
-use super::session_scope::belongs_to_session;
+use super::session_scope::belongs_to_open_session;
 use super::{json_str, pretty_json};
 use crate::log_debug;
 use crate::models::*;
@@ -597,13 +597,18 @@ fn handle_gateway_frame(
     // session on screen, so another one's reply cannot be written into the open
     // transcript. The bookkeeping is exempt because one of those events is how
     // the client learns which session it is on.
+    //
+    // The check is the strict form: a labelled frame belongs to the session on
+    // screen or to nobody. A connection that has not subscribed yet is not a
+    // reason to accept every session's traffic — it is the state a client is in
+    // for the whole window after a reconnect.
     let is_bookkeeping = matches!(
         event_type.as_str(),
         "session.info" | "sessions.changed" | "session.created" | "session.updated"
     );
     if !is_bookkeeping {
         let subscribed = subscribed.lock().unwrap_or_else(|e| e.into_inner());
-        if !belongs_to_session(subscribed.iter().map(String::as_str), session_id.as_deref()) {
+        if !belongs_to_open_session(subscribed.iter().map(String::as_str), session_id.as_deref()) {
             log_debug!(
                 "gateway",
                 "event dropped for another session type={event_type}"
@@ -810,19 +815,39 @@ mod tests {
         assert_eq!(delta_text(&events).as_deref(), Some("自己的话"));
     }
 
-    /// Nothing subscribed yet means nothing to compare against — and the event
-    /// that says which session we are on arrives before the client knows it.
+    /// The bug this strict rule closes. Nothing subscribed yet is not "nothing
+    /// to compare against", it is the state a client is in for the whole window
+    /// after a reconnect — and a gateway fans out every session on this socket,
+    /// so a labelled delta accepted in that window is another session's reply
+    /// written into the open transcript. The session is learned from the
+    /// bookkeeping, which is exempt from the filter (see
+    /// [`session_info_is_kept_and_teaches_the_filter`]).
     #[test]
-    fn nothing_is_filtered_before_a_session_is_subscribed() {
+    fn another_sessions_traffic_is_dropped_before_a_session_is_subscribed() {
         let events = feed(
             &frame(
                 "message.delta",
                 Some("live-9"),
-                serde_json::json!({ "text": "还没订阅" }),
+                serde_json::json!({ "text": "别人的话" }),
             ),
             &subscribed_to(&[]),
         );
-        assert_eq!(delta_text(&events).as_deref(), Some("还没订阅"));
+        assert!(events.is_empty(), "{events:#?}");
+    }
+
+    /// Once the session on screen is known, its own traffic is delivered — the
+    /// strict rule must not cost the client the reply it is waiting for.
+    #[test]
+    fn the_subscribed_sessions_traffic_is_delivered() {
+        let events = feed(
+            &frame(
+                "message.delta",
+                Some("live-9"),
+                serde_json::json!({ "text": "自己的话" }),
+            ),
+            &subscribed_to(&["live-9"]),
+        );
+        assert_eq!(delta_text(&events).as_deref(), Some("自己的话"));
     }
 
     /// Dropping an unlabelled frame could lose the active session's own stream.

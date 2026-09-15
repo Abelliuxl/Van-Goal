@@ -30,7 +30,7 @@ use van_goal_core::agent::Backend;
 use van_goal_core::chat::{Conversation, ConversationChange};
 use van_goal_core::markdown::{self, MarkdownBlock};
 use van_goal_core::models::{AgentEvent, BackendConfig, ChatMessage, MessageRole, SessionIDs};
-use van_goal_core::settings::{BackendKind, FontSize, Settings};
+use van_goal_core::settings::{BackendKind, FontSize, SavedSession, Settings};
 
 /// The one connection the app has. Flutter has a single foreground client, so a
 /// handle-passing API would only add a way to get it wrong.
@@ -85,7 +85,10 @@ async fn establish(
 
 pub struct Client {
     runtime: tokio::runtime::Runtime,
-    settings: Mutex<Settings>,
+    /// Shared with the background tasks that learn which session is on screen,
+    /// so the one this device had open survives a restart — see
+    /// [`remember_session`].
+    settings: Arc<Mutex<Settings>>,
     /// The backend, together with the kind it was built for: a `Backend` does
     /// not expose its own kind, and switching backends has to build a new one.
     backend: Mutex<Option<(BackendKind, Arc<AsyncMutex<Backend>>)>>,
@@ -151,6 +154,122 @@ impl OpenSession {
     }
 }
 
+/// Where a prompt is about to be sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SendTarget {
+    /// The connection already has a live session.
+    Live(String),
+    /// The session on screen has no live connection, but it exists on the
+    /// backend under this key: attach to it again.
+    Resume(String),
+    /// No session on screen at all, so this really is a new chat.
+    Create,
+}
+
+/// Decide where a prompt goes, from the two ids this client holds.
+///
+/// The distinction between [`SendTarget::Resume`] and [`SendTarget::Create`] is
+/// the whole of it. A session whose live connection is missing — the normal
+/// state after a reconnect, and the state a phone is in most of the time — used
+/// to be treated as "no session", which created a new one and sent the prompt
+/// there. The user was reading one conversation and the prompt went into
+/// another, which is exactly what makes a client look like it is crossing
+/// sessions. Only a chat with no session on screen at all needs one created.
+fn send_target(live: Option<&str>, stored: Option<&str>) -> SendTarget {
+    match (live, stored) {
+        (Some(live), _) => SendTarget::Live(live.to_string()),
+        (None, Some(stored)) => SendTarget::Resume(stored.to_string()),
+        (None, None) => SendTarget::Create,
+    }
+}
+
+/// Remember the session on screen, so the next launch comes back to it.
+///
+/// A phone is closed and reopened constantly, and an app that comes up on an
+/// empty chat makes the user's first message create *another* session: the
+/// conversation they were having is still on the backend, but the client is no
+/// longer in it, which reads as the session having changed underneath them.
+fn remember_session(settings: &Mutex<Settings>, id: &str) {
+    let mut settings = settings.lock().unwrap();
+    let saved = SavedSession {
+        backend: settings.backend_kind.id().to_string(),
+        id: id.to_string(),
+    };
+    if settings.last_session.as_ref() == Some(&saved) {
+        return;
+    }
+    settings.last_session = Some(saved);
+    settings.save();
+}
+
+/// The session this device had open, if it was open on the configured backend.
+/// A key means nothing to a backend that did not issue it.
+fn saved_session(settings: &Mutex<Settings>) -> Option<String> {
+    let settings = settings.lock().unwrap();
+    settings
+        .last_session
+        .as_ref()
+        .filter(|saved| saved.backend == settings.backend_kind.id())
+        .map(|saved| saved.id.clone())
+}
+
+/// Stop coming back to a session, because the user asked for a new chat.
+fn forget_session(settings: &Mutex<Settings>) {
+    let mut settings = settings.lock().unwrap();
+    if settings.last_session.take().is_some() {
+        settings.save();
+    }
+}
+
+/// Show a session's transcript and attach this connection to it.
+///
+/// Both halves matter and the order is the point: the messages are shown *before*
+/// the session is resumed, so the conversation on screen and the session the next
+/// prompt goes to are the same one. Resuming without showing leaves an empty
+/// transcript sending into a live session; showing without resuming leaves the
+/// screen on a session the connection is not attached to. Either way the user
+/// sees one chat and writes into another.
+///
+/// Shared by the user opening a session and by the reconnect that brings back
+/// the one that was open, which are the same operation.
+async fn open_on(
+    backend: &Arc<AsyncMutex<Backend>>,
+    config: &BackendConfig,
+    events: &Arc<Mutex<Vec<Value>>>,
+    open: &Arc<Mutex<OpenSession>>,
+    id: &str,
+) {
+    {
+        let mut session = open.lock().unwrap();
+        session.switch_to(Some(id));
+        // Not attached to it yet: `accepts_turn_events` holds turn traffic off
+        // until the backend confirms, which is why the live id is cleared here.
+        session.live_id = None;
+        session.stored_id = Some(id.to_string());
+    }
+    // What this client already drew for the session, tool calls and all, before
+    // the backend has said anything.
+    push_transcript(events, open);
+
+    if let Ok(messages) = backend.lock().await.messages(config, id).await {
+        // A turn the client watched is richer than what the backend reports, so
+        // the two are merged rather than replaced.
+        open.lock().unwrap().conversation.merge_transcript(messages);
+        push_transcript(events, open);
+    }
+    match backend.lock().await.resume_session(config, id).await {
+        Ok(ids) => {
+            {
+                let mut session = open.lock().unwrap();
+                session.live_id = Some(ids.live_id.clone());
+                session.stored_id = ids.stored_id.clone().or(Some(id.to_string()));
+            }
+            push(events, json!({ "event": "session", "id": ids.live_id }));
+        }
+        Err(error) => push_error(events, format!("could not resume the session: {error}")),
+    }
+}
+
 impl Client {
     fn new() -> Self {
         // Two worker threads: one turn at a time plus the event pump, which is
@@ -162,7 +281,7 @@ impl Client {
             .expect("failed to build the tokio runtime");
         Self {
             runtime,
-            settings: Mutex::new(Settings::default()),
+            settings: Arc::new(Mutex::new(Settings::default())),
             backend: Mutex::new(None),
             events: Arc::new(Mutex::new(Vec::new())),
             open: Arc::new(Mutex::new(OpenSession::default())),
@@ -171,7 +290,6 @@ impl Client {
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
-
     /// Handle one command from Dart. The reply carries a payload for the few
     /// commands whose answer is a value rather than an event.
     pub fn run(&self, command: &str) -> Result<Option<Value>> {
@@ -377,6 +495,7 @@ impl Client {
         let live = self.live.clone();
         let wanted = self.wanted.clone();
         let current = self.generation.clone();
+        let saved = saved_session(&self.settings);
 
         self.runtime.spawn(async move {
             let mut attempt = 0usize;
@@ -415,12 +534,12 @@ impl Client {
                 } else {
                     live.store(true, Ordering::SeqCst);
                     attempt = 0;
-                    // Ask for the session that was open again: a gateway only
-                    // delivers a session's frames to a connection that
-                    // subscribed to it.
                     let reopened = { open.lock().unwrap().stored_id.clone() };
-                    if let Some(id) = reopened {
-                        match backend.lock().await.resume_session(&config, &id).await {
+                    match reopened {
+                        // A session is already on screen: put the subscription
+                        // back. A gateway only delivers a session's frames to a
+                        // connection that subscribed to it.
+                        Some(id) => match backend.lock().await.resume_session(&config, &id).await {
                             Ok(ids) => {
                                 open.lock().unwrap().live_id = Some(ids.live_id.clone());
                                 push(&events, json!({ "event": "session", "id": ids.live_id }));
@@ -429,6 +548,16 @@ impl Client {
                                 &events,
                                 format!("could not resume the session: {error}"),
                             ),
+                        },
+                        // Nothing on screen: this is the first connection of a
+                        // launch, and the session this device had open is the
+                        // one to come back to. Showing it, rather than
+                        // subscribing quietly, is what keeps the transcript and
+                        // the session the next prompt goes to in agreement.
+                        None => {
+                            if let Some(id) = saved.clone() {
+                                open_on(&backend, &config, &events, &open, &id).await;
+                            }
                         }
                     }
                     // Drain the backend's events for as long as the stream lives.
@@ -531,40 +660,14 @@ impl Client {
     }
 
     fn open_session(&self, id: String) {
+        // Opened on purpose: this is the conversation to come back to.
+        remember_session(&self.settings, &id);
         let config = self.config();
         let backend = self.backend();
         let events = self.events.clone();
         let open = self.open.clone();
         self.runtime.spawn(async move {
-            {
-                // Bring back what this client already drew for the session, tool
-                // calls and all, before the backend has said anything.
-                let mut open = open.lock().unwrap();
-                open.switch_to(Some(&id));
-                open.live_id = None;
-                open.stored_id = Some(id.clone());
-            }
-            push_transcript(&events, &open);
-
-            // The transcript as the backend has it, so there is something to
-            // show while the live session is being resumed.
-            if let Ok(messages) = backend.lock().await.messages(&config, &id).await {
-                // A turn the client watched is richer than what the backend
-                // reports, so the two are merged rather than replaced.
-                open.lock().unwrap().conversation.merge_transcript(messages);
-                push_transcript(&events, &open);
-            }
-            match backend.lock().await.resume_session(&config, &id).await {
-                Ok(ids) => {
-                    {
-                        let mut open = open.lock().unwrap();
-                        open.live_id = Some(ids.live_id.clone());
-                        open.stored_id = ids.stored_id.clone().or(Some(id));
-                    }
-                    push(&events, json!({ "event": "session", "id": ids.live_id }));
-                }
-                Err(error) => push_error(&events, format!("could not resume the session: {error}")),
-            }
+            open_on(&backend, &config, &events, &open, &id).await;
         });
     }
 
@@ -577,6 +680,9 @@ impl Client {
             open.live_id = None;
             open.stored_id = None;
         }
+        // The user asked for a new chat, so that — not the conversation they
+        // were in — is what a relaunch should come back to.
+        forget_session(&self.settings);
         let events = self.events.clone();
         let open = self.open.clone();
         push_transcript(&events, &open);
@@ -599,11 +705,38 @@ impl Client {
 
         let config = self.config();
         let backend = self.backend();
+        let settings = self.settings.clone();
         self.runtime.spawn(async move {
-            let existing = open.lock().unwrap().live_id.clone();
-            let live = match existing {
-                Some(live) => live,
-                None => match backend.lock().await.create_session(&config).await {
+            let (existing, stored) = {
+                let open = open.lock().unwrap();
+                (open.live_id.clone(), open.stored_id.clone())
+            };
+            let live = match send_target(existing.as_deref(), stored.as_deref()) {
+                SendTarget::Live(live) => live,
+                // There is no live connection to the session on screen. It still
+                // exists on the backend, so resume it: creating one here is how a
+                // prompt ended up in a conversation the user had never opened,
+                // which is indistinguishable from one session's messages
+                // appearing in another.
+                SendTarget::Resume(stored) => {
+                    match backend.lock().await.resume_session(&config, &stored).await {
+                        Ok(ids) => {
+                            let mut open = open.lock().unwrap();
+                            open.live_id = Some(ids.live_id.clone());
+                            open.stored_id = ids.stored_id.clone().or(Some(stored));
+                            ids.live_id
+                        }
+                        Err(error) => {
+                            push_error(&events, format!("could not resume the session: {error}"));
+                            open.lock().unwrap().conversation.finish_turn();
+                            push_transcript(&events, &open);
+                            return;
+                        }
+                    }
+                }
+                // A chat with no session at all: the only case that needs one
+                // created.
+                SendTarget::Create => match backend.lock().await.create_session(&config).await {
                     Ok(SessionIDs { live_id, stored_id }) => {
                         let mut open = open.lock().unwrap();
                         open.live_id = Some(live_id.clone());
@@ -618,6 +751,9 @@ impl Client {
                     }
                 },
             };
+            // The prompt goes to this session, so this is the conversation a
+            // relaunch has to come back to.
+            remember_session(&settings, &live);
             if let Err(error) = backend.lock().await.submit_prompt(&live, &body).await {
                 push_error(&events, format!("could not send the prompt: {error}"));
                 open.lock().unwrap().conversation.finish_turn();
@@ -1177,5 +1313,79 @@ mod tests {
         assert_eq!(kinds, vec!["heading", "bullet", "code"]);
         assert_eq!(parsed[0]["level"], 1);
         assert_eq!(parsed[2]["text"], "代码");
+    }
+
+    /// The bug that made one chat's messages appear in another: with no live
+    /// connection to the session on screen, the bridge started a *new* session
+    /// and sent the prompt there. The user was reading one conversation and the
+    /// prompt went into a different one — on a phone, whose socket drops
+    /// constantly, this happened often enough to look like sessions crossing.
+    #[test]
+    fn a_prompt_goes_to_the_session_on_screen_not_to_a_new_one() {
+        assert_eq!(
+            send_target(None, Some("agent:main:van-goal:mine")),
+            SendTarget::Resume("agent:main:van-goal:mine".into()),
+            "a session that exists on the backend must be resumed, never replaced"
+        );
+        assert_eq!(
+            send_target(Some("live-9"), Some("stored-9")),
+            SendTarget::Live("live-9".into())
+        );
+        assert_eq!(
+            send_target(None, None),
+            SendTarget::Create,
+            "only a chat with nothing on screen needs a session created"
+        );
+    }
+
+    /// Coming back to the conversation the user was in, rather than to an empty
+    /// chat whose first message would create yet another session.
+    #[test]
+    fn the_open_session_is_remembered_and_forgotten() {
+        let dir = std::env::temp_dir().join(format!("van-goal-remember-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let settings = Mutex::new(Settings {
+            backend_kind: BackendKind::OpenClaw,
+            ..Settings::default()
+        });
+
+        assert_eq!(saved_session(&settings), None, "nothing is open yet");
+
+        remember_session(&settings, "agent:main:van-goal:a");
+        assert_eq!(
+            saved_session(&settings).as_deref(),
+            Some("agent:main:van-goal:a")
+        );
+
+        remember_session(&settings, "agent:main:van-goal:b");
+        assert_eq!(
+            saved_session(&settings).as_deref(),
+            Some("agent:main:van-goal:b")
+        );
+
+        forget_session(&settings);
+        assert_eq!(
+            saved_session(&settings),
+            None,
+            "a new chat forgets the old one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session key is only meaningful to the backend that issued it, so a key
+    /// left over from another backend must not be resumed here.
+    #[test]
+    fn a_saved_session_from_another_backend_is_not_reopened() {
+        let settings = Mutex::new(Settings {
+            backend_kind: BackendKind::OpenClaw,
+            last_session: Some(SavedSession {
+                backend: "hermes".into(),
+                id: "live-7".into(),
+            }),
+            ..Settings::default()
+        });
+
+        assert_eq!(saved_session(&settings), None);
     }
 }

@@ -2,7 +2,8 @@ use super::session_scope;
 use super::{json_str, pretty_json};
 use crate::agent::device_identity::{
     OpenClawDeviceIdentity, OPENCLAW_CLIENT_ID, OPENCLAW_CLIENT_MODE, OPENCLAW_DEVICE_FAMILY,
-    OPENCLAW_PLATFORM, OPENCLAW_ROLE, OPENCLAW_SCOPES,
+    OPENCLAW_DISPLAY_NAME, OPENCLAW_PLATFORM, OPENCLAW_ROLE, OPENCLAW_SCOPES,
+    OPENCLAW_SESSION_NAMESPACE,
 };
 use crate::log_debug;
 use crate::models::*;
@@ -147,7 +148,7 @@ impl OpenClawBackend {
 
     pub async fn create_session(&mut self, config: &BackendConfig) -> Result<SessionIDs> {
         self.ensure_connected(config).await?;
-        let proposed = format!("agent:main:van-goal:{}", uuid::Uuid::new_v4());
+        let proposed = proposed_session_key();
         let result = self
             .gateway
             .request("sessions.create", sessions_create_params(&proposed))
@@ -324,6 +325,21 @@ pub fn forget_device_token(base_url: &str) -> bool {
 
 fn sessions_create_params(key: &str) -> serde_json::Value {
     serde_json::json!({ "key": key })
+}
+
+/// The key a session this client starts is filed under.
+///
+/// The namespace names the frontend, so a desktop session and a phone session
+/// are told apart in the Gateway's own records even before either has a title —
+/// see [`OPENCLAW_SESSION_NAMESPACE`]. The id is random per session: two
+/// sessions under one namespace are still two different conversations, which is
+/// why the filter compares the whole key and never the namespace.
+fn proposed_session_key() -> String {
+    format!(
+        "agent:main:{}:{}",
+        OPENCLAW_SESSION_NAMESPACE,
+        uuid::Uuid::new_v4()
+    )
 }
 
 fn session_messages_subscribe_params(key: &str) -> serde_json::Value {
@@ -625,13 +641,18 @@ fn payload_session_key(payload: &serde_json::Value) -> Option<String> {
 /// Whether a frame belongs in the transcript the user is looking at.
 ///
 /// One Gateway connection carries every session's traffic, and subscribing to a
-/// session does not unsubscribe from the ones opened before it. A cron job
-/// running in another session therefore arrives on the same socket, and its
-/// replies used to be appended to whatever chat happened to be open.
+/// session does not unsubscribe from the ones opened before it. This was
+/// measured against a live Gateway rather than assumed: a socket that had
+/// subscribed to nothing received turn frames for *two* different sessions
+/// inside thirty seconds, every one of them labelled with its `sessionKey` at
+/// the top of the payload. `sessions.messages.subscribe` therefore does not
+/// scope delivery, and filtering here is the only thing that does.
 ///
-/// The rule itself is shared with the other adapters, so this only has to name
-/// the key the Gateway puts on a frame — see
-/// [`session_scope::belongs_to_session`].
+/// That makes the empty case the dangerous one. A client that has not resumed a
+/// session yet — the whole window after a reconnect, which on a phone is most
+/// of the time — used to accept everything, so every session's reply was
+/// appended to whatever chat was open. Turn traffic uses the strict rule: see
+/// [`session_scope::belongs_to_open_session`].
 fn is_for_active_session(
     payload: &serde_json::Value,
     active_session: &Arc<Mutex<Option<String>>>,
@@ -640,7 +661,10 @@ fn is_for_active_session(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    session_scope::belongs_to_session(active.as_deref(), payload_session_key(payload).as_deref())
+    session_scope::belongs_to_open_session(
+        active.as_deref(),
+        payload_session_key(payload).as_deref(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,7 +809,7 @@ async fn handle_frame(
                 "maxProtocol": 4,
                 "client": {
                     "id": OPENCLAW_CLIENT_ID,
-                    "displayName": "Van-Goal",
+                    "displayName": OPENCLAW_DISPLAY_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
                     "platform": OPENCLAW_PLATFORM,
                     "deviceFamily": OPENCLAW_DEVICE_FAMILY,
@@ -968,8 +992,9 @@ mod tests {
     use super::{
         chat_send_params, is_for_active_session, is_unexpected_property_error,
         legacy_chat_send_params, legacy_session_messages_subscribe_params, payload_session_key,
-        session_messages_subscribe_params, sessions_create_params,
+        proposed_session_key, session_messages_subscribe_params, sessions_create_params,
     };
+    use crate::agent::device_identity::{OPENCLAW_DISPLAY_NAME, OPENCLAW_SESSION_NAMESPACE};
     use std::sync::{Arc, Mutex};
 
     fn active(key: Option<&str>) -> Arc<Mutex<Option<String>>> {
@@ -1060,12 +1085,76 @@ mod tests {
         assert!(is_for_active_session(&payload, &active));
     }
 
+    /// The window after a reconnect is the one that leaks, because that is when
+    /// the client has no active session and the Gateway is still pushing every
+    /// session to it. "Nothing subscribed yet" must not mean "accept everybody".
     #[test]
-    fn frames_pass_through_before_anything_is_subscribed() {
+    fn a_frame_for_another_session_is_rejected_before_anything_is_subscribed() {
         let active = active(None);
-        assert!(is_for_active_session(
-            &serde_json::json!({ "sessionKey": "anything" }),
+        assert!(!is_for_active_session(
+            &serde_json::json!({ "sessionKey": "agent:main:van-goal:someone-else" }),
             &active
         ));
+        assert!(!is_for_active_session(
+            &serde_json::json!({ "sessionKey": "agent:main:van-goal:cron" }),
+            &active
+        ));
+    }
+
+    /// An unlabelled frame is still kept when no session is open, so a Gateway
+    /// that leaves its own stream unlabelled does not lose the reply.
+    #[test]
+    fn an_unlabelled_frame_is_kept_before_anything_is_subscribed() {
+        let active = active(None);
+        assert!(is_for_active_session(
+            &serde_json::json!({ "deltaText": "hello" }),
+            &active
+        ));
+    }
+
+    /// The namespace names the frontend; the id must still be random, because
+    /// two sessions under one namespace are two conversations and the filter
+    /// compares the whole key.
+    #[test]
+    fn a_proposed_key_names_the_frontend_and_is_unique_per_session() {
+        let key = proposed_session_key();
+        let prefix = format!("agent:main:{OPENCLAW_SESSION_NAMESPACE}:");
+        assert!(
+            key.starts_with(&prefix),
+            "{key} should be filed under {prefix}"
+        );
+        assert!(
+            key.len() > prefix.len(),
+            "{key} carries no session id after the namespace"
+        );
+        assert_ne!(
+            proposed_session_key(),
+            key,
+            "two sessions must not share a key"
+        );
+    }
+
+    /// The two frontends must not present themselves by the same name, or the
+    /// session list they share fills with identical entries and picking the
+    /// wrong one is indistinguishable from a client that crossed two
+    /// conversations. This is the whole reason the constants are per-platform,
+    /// so the test states it even though it can only see one side of it.
+    #[test]
+    fn the_client_names_itself_distinctly_from_the_other_frontend() {
+        assert!(!OPENCLAW_DISPLAY_NAME.trim().is_empty());
+        assert!(
+            OPENCLAW_SESSION_NAMESPACE.starts_with("van-goal"),
+            "{OPENCLAW_SESSION_NAMESPACE} should still say which app it is"
+        );
+        // The name each frontend used before this was split, and the reason ten
+        // sessions on the measured Gateway were all called "Van-Goal".
+        assert_ne!(OPENCLAW_DISPLAY_NAME, "Van-Goal");
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Mobile");
+            assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-mobile");
+        } else {
+            assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Desktop");
+            assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-desktop");
+        }
     }
 }

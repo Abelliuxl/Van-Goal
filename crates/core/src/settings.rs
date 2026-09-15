@@ -229,6 +229,22 @@ pub struct Settings {
     /// once, so a fresh install opens centred at its default size.
     #[serde(default)]
     pub window: Option<SavedWindow>,
+    /// The session this client had open last, so a phone that was closed, locked
+    /// or disconnected comes back to the conversation the user was in. Without
+    /// it every launch starts an empty chat, and the first thing typed creates
+    /// *another* session — which is how one conversation's context goes missing
+    /// and looks like messages landing in the wrong chat.
+    #[serde(default)]
+    pub last_session: Option<SavedSession>,
+}
+
+/// The session a client had open, and the backend that issued its key. A
+/// session key means nothing to a backend that did not create it, so the pair
+/// travels together and is only restored onto the backend that made it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSession {
+    pub backend: String,
+    pub id: String,
 }
 
 /// Window geometry remembered across launches. Kept as plain numbers so this
@@ -323,6 +339,7 @@ impl Default for Settings {
             sidebar_open: true,
             show_tool_calls: true,
             window: None,
+            last_session: None,
         }
     }
 }
