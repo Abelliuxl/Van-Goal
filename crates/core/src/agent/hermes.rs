@@ -1,3 +1,4 @@
+use super::session_scope::belongs_to_session;
 use super::{json_str, pretty_json};
 use crate::log_debug;
 use crate::models::*;
@@ -218,9 +219,15 @@ impl HermesBackend {
         let result = self.gateway.request("session.create", params).await?;
         let session_id = json_str(&result, "session_id")
             .ok_or_else(|| anyhow!("session.create returned no session_id"))?;
+        let stored_id = json_str(&result, "stored_session_id");
+        self.gateway.set_subscribed(
+            [Some(session_id.clone()), stored_id.clone()]
+                .into_iter()
+                .flatten(),
+        );
         Ok(SessionIDs {
             live_id: session_id,
-            stored_id: json_str(&result, "stored_session_id"),
+            stored_id,
         })
     }
 
@@ -239,13 +246,17 @@ impl HermesBackend {
             params["profile"] = serde_json::Value::String(profile.to_string());
         }
         let result = self.gateway.request("session.resume", params).await?;
+        let live_id = json_str(&result, "session_id").unwrap_or_else(|| session_id.to_string());
+        let stored_id = json_str(&result, "session_key")
+            .or_else(|| json_str(&result, "resumed"))
+            .unwrap_or_else(|| session_id.to_string());
+        // The id asked for counts too: a gateway is free to label its events
+        // with the key it was given rather than the live id it answered with.
+        self.gateway
+            .set_subscribed([live_id.clone(), stored_id.clone(), session_id.to_string()]);
         Ok(SessionIDs {
-            live_id: json_str(&result, "session_id").unwrap_or_else(|| session_id.to_string()),
-            stored_id: Some(
-                json_str(&result, "session_key")
-                    .or_else(|| json_str(&result, "resumed"))
-                    .unwrap_or_else(|| session_id.to_string()),
-            ),
+            live_id,
+            stored_id: Some(stored_id),
         })
     }
 
@@ -339,6 +350,10 @@ enum GatewayCommand {
 struct GatewayHandle {
     command_tx: Arc<Mutex<Option<UnboundedSender<GatewayCommand>>>>,
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Every id the session on screen is known by — see
+    /// [`belongs_to_session`]. Shared with the reader task, which is where
+    /// another session's traffic has to be turned away.
+    subscribed: Arc<Mutex<Vec<String>>>,
 }
 
 impl GatewayHandle {
@@ -365,7 +380,16 @@ impl GatewayHandle {
         let ws_url = build_ws_url(base_url, "/api/ws", token)?;
         let (command_tx, command_rx) = unbounded::<GatewayCommand>();
         *self.command_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(command_tx.clone());
-        let task = tokio::spawn(run_gateway(ws_url, command_rx, events));
+        self.subscribed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let task = tokio::spawn(run_gateway(
+            ws_url,
+            command_rx,
+            events,
+            self.subscribed.clone(),
+        ));
         *self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         Ok(())
     }
@@ -392,8 +416,24 @@ impl GatewayHandle {
         }
     }
 
+    /// Forget the session that was on screen and remember the one the client
+    /// just asked for, by every id it may be named by.
+    fn set_subscribed(&self, ids: impl IntoIterator<Item = String>) {
+        self.subscribed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        for id in ids {
+            remember_session(&self.subscribed, &id);
+        }
+    }
+
     fn close(&mut self) {
         log_debug!("gateway", "disconnect gateway");
+        self.subscribed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(sender) = self
             .command_tx
             .lock()
@@ -426,6 +466,7 @@ async fn run_gateway(
     ws_url: url::Url,
     mut command_rx: UnboundedReceiver<GatewayCommand>,
     events: UnboundedSender<AgentEvent>,
+    subscribed: Arc<Mutex<Vec<String>>>,
 ) {
     let connect = tokio_tungstenite::connect_async(ws_url.as_str()).await;
     let (ws_stream, _response) = match connect {
@@ -478,7 +519,7 @@ async fn run_gateway(
             frame = stream.next() => {
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        handle_gateway_frame(&text, &pending, &events);
+                        handle_gateway_frame(&text, &pending, &events, &subscribed);
                     }
                     Some(Ok(Message::Close(frame))) => {
                         log_debug!("gateway", "gateway ws closed frame={frame:?}");
@@ -509,6 +550,7 @@ fn handle_gateway_frame(
     text: &str,
     pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value>>>>>,
     events: &UnboundedSender<AgentEvent>,
+    subscribed: &Arc<Mutex<Vec<String>>>,
 ) {
     log_debug!("gateway", "gateway frame sample={}", frame_sample(text));
     let Ok(object) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -549,9 +591,33 @@ fn handle_gateway_frame(
     let session_id = json_str(params, "session_id");
     let payload = params.get("payload").cloned().unwrap_or_default();
 
+    // A gateway can carry more than one session down this socket — a cron job in
+    // another session is the usual one — and its events say which session they
+    // are about. Everything but the session bookkeeping is checked against the
+    // session on screen, so another one's reply cannot be written into the open
+    // transcript. The bookkeeping is exempt because one of those events is how
+    // the client learns which session it is on.
+    let is_bookkeeping = matches!(
+        event_type.as_str(),
+        "session.info" | "sessions.changed" | "session.created" | "session.updated"
+    );
+    if !is_bookkeeping {
+        let subscribed = subscribed.lock().unwrap_or_else(|e| e.into_inner());
+        if !belongs_to_session(subscribed.iter().map(String::as_str), session_id.as_deref()) {
+            log_debug!(
+                "gateway",
+                "event dropped for another session type={event_type}"
+            );
+            return;
+        }
+    }
+
     match event_type.as_str() {
         "session.info" => {
             if let Some(session_id) = session_id {
+                // The gateway names the session it put us on, which is not
+                // always the id that was asked for.
+                remember_session(subscribed, &session_id);
                 log_debug!("gateway", "session info live={session_id}");
                 let _ = events.unbounded_send(AgentEvent::SessionInfo(session_id));
             }
@@ -620,6 +686,18 @@ fn frame_sample(value: &str) -> String {
     prefix.replace('\n', "\\n")
 }
 
+/// Add an id the session on screen is known by.
+///
+/// Ids accumulate rather than replace: the client knows the session by the key it
+/// asked for and the gateway may announce a different live id, and both have to
+/// be accepted or the subscriber's own traffic starts being refused.
+fn remember_session(subscribed: &Arc<Mutex<Vec<String>>>, id: &str) {
+    let mut ids = subscribed.lock().unwrap_or_else(|e| e.into_inner());
+    if !id.is_empty() && !ids.iter().any(|known| known == id) {
+        ids.push(id.to_string());
+    }
+}
+
 fn is_tool_event(event_type: &str, payload: &serde_json::Value) -> bool {
     if event_type.starts_with("tool.") {
         return true;
@@ -649,4 +727,156 @@ fn tool_record(
         payload
     };
     ToolCallRecord::new(name, status, pretty_json(source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(event_type: &str, session_id: Option<&str>, payload: serde_json::Value) -> String {
+        let mut params = serde_json::json!({ "type": event_type, "payload": payload });
+        if let Some(id) = session_id {
+            params["session_id"] = serde_json::json!(id);
+        }
+        serde_json::json!({ "jsonrpc": "2.0", "method": "event", "params": params }).to_string()
+    }
+
+    fn feed(text: &str, subscribed: &Arc<Mutex<Vec<String>>>) -> Vec<AgentEvent> {
+        let (sender, mut receiver) = unbounded::<AgentEvent>();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        handle_gateway_frame(text, &pending, &sender, subscribed);
+        let mut out = Vec::new();
+        while let Ok(Some(event)) = receiver.try_next() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn subscribed_to(ids: &[&str]) -> Arc<Mutex<Vec<String>>> {
+        Arc::new(Mutex::new(ids.iter().map(|id| id.to_string()).collect()))
+    }
+
+    fn delta_text(events: &[AgentEvent]) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            AgentEvent::MessageDelta { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    /// The regression: a gateway carries every session down one socket, so a
+    /// cron job in another session used to have its replies written into
+    /// whatever chat happened to be open.
+    #[test]
+    fn another_sessions_reply_is_dropped() {
+        let subscribed = subscribed_to(&["live-1"]);
+        let events = feed(
+            &frame(
+                "message.delta",
+                Some("live-2"),
+                serde_json::json!({ "text": "别人会话的话" }),
+            ),
+            &subscribed,
+        );
+        assert!(events.is_empty(), "{events:#?}");
+    }
+
+    #[test]
+    fn the_subscribed_sessions_reply_is_kept() {
+        let subscribed = subscribed_to(&["live-1"]);
+        let events = feed(
+            &frame(
+                "message.delta",
+                Some("live-1"),
+                serde_json::json!({ "text": "自己的话" }),
+            ),
+            &subscribed,
+        );
+        assert_eq!(delta_text(&events).as_deref(), Some("自己的话"));
+    }
+
+    /// A gateway may label events with the key it was given rather than the live
+    /// id it answered with, so every id the session is known by is accepted.
+    #[test]
+    fn either_id_the_session_is_known_by_is_accepted() {
+        let subscribed = subscribed_to(&["live-1", "stored-1"]);
+        let events = feed(
+            &frame(
+                "message.delta",
+                Some("stored-1"),
+                serde_json::json!({ "text": "自己的话" }),
+            ),
+            &subscribed,
+        );
+        assert_eq!(delta_text(&events).as_deref(), Some("自己的话"));
+    }
+
+    /// Nothing subscribed yet means nothing to compare against — and the event
+    /// that says which session we are on arrives before the client knows it.
+    #[test]
+    fn nothing_is_filtered_before_a_session_is_subscribed() {
+        let events = feed(
+            &frame(
+                "message.delta",
+                Some("live-9"),
+                serde_json::json!({ "text": "还没订阅" }),
+            ),
+            &subscribed_to(&[]),
+        );
+        assert_eq!(delta_text(&events).as_deref(), Some("还没订阅"));
+    }
+
+    /// Dropping an unlabelled frame could lose the active session's own stream.
+    #[test]
+    fn an_unlabelled_frame_is_kept() {
+        let events = feed(
+            &frame(
+                "message.delta",
+                None,
+                serde_json::json!({ "text": "没有标签" }),
+            ),
+            &subscribed_to(&["live-1"]),
+        );
+        assert_eq!(delta_text(&events).as_deref(), Some("没有标签"));
+    }
+
+    /// The bookkeeping names the session, so it must survive the filter — and
+    /// what it names is remembered.
+    #[test]
+    fn session_info_is_kept_and_teaches_the_filter() {
+        let subscribed = subscribed_to(&["asked-for"]);
+        let events = feed(
+            &frame("session.info", Some("live-7"), serde_json::json!({})),
+            &subscribed,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SessionInfo(id) if id == "live-7")),
+            "{events:#?}"
+        );
+
+        let after = feed(
+            &frame(
+                "message.delta",
+                Some("live-7"),
+                serde_json::json!({ "text": "现在认得它了" }),
+            ),
+            &subscribed,
+        );
+        assert_eq!(delta_text(&after).as_deref(), Some("现在认得它了"));
+    }
+
+    #[test]
+    fn tool_traffic_is_filtered_too() {
+        let subscribed = subscribed_to(&["live-1"]);
+        let events = feed(
+            &frame(
+                "tool.started",
+                Some("live-2"),
+                serde_json::json!({ "tool": "bash" }),
+            ),
+            &subscribed,
+        );
+        assert!(events.is_empty(), "{events:#?}");
+    }
 }

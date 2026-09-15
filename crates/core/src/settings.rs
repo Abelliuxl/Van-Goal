@@ -66,6 +66,12 @@ impl FontSize {
         }
     }
 
+    /// Read back an [`Self::id`], for a frontend that hands the choice over as
+    /// a string rather than as a serialized enum.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|size| size.id() == id)
+    }
+
     /// Multiplier applied to every design-time font size. The steps stay modest
     /// on purpose: only the panes that are sized around their text (the sidebar,
     /// the settings label column) grow with the scale, so a larger jump starts
@@ -214,6 +220,11 @@ pub struct Settings {
     /// Whether the session list was showing when the app was last used.
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
+    /// Whether the transcript draws the tool calls a turn ran, or only the text
+    /// it produced. A long turn can run dozens of them, and on a phone they take
+    /// more room than the reply they belong to.
+    #[serde(default = "default_true")]
+    pub show_tool_calls: bool,
     /// Where and how big the window was. `None` until it has been observed
     /// once, so a fresh install opens centred at its default size.
     #[serde(default)]
@@ -310,6 +321,7 @@ impl Default for Settings {
             debug_logging_enabled: false,
             per_backend: std::collections::HashMap::new(),
             sidebar_open: true,
+            show_tool_calls: true,
             window: None,
         }
     }

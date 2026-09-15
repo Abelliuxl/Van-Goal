@@ -8,6 +8,7 @@ pub mod device_identity;
 pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
+pub mod session_scope;
 
 /// Backend-neutral facade consumed by AppState. Each variant translates its
 /// native protocol (REST, WebSocket, SSE, subprocess JSONL) into AgentEvent.

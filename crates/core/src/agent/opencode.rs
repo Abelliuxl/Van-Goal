@@ -1,3 +1,4 @@
+use super::session_scope::belongs_to_session;
 use super::{json_str, normalize_seconds, pretty_json};
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -416,14 +417,16 @@ fn handle_event_json(
                 .and_then(|info| json_str(info, "sessionID"))
         });
 
+    // The server's `/event` stream carries every session, including the ones the
+    // user is not looking at: without this, another session's reply is written
+    // into the open transcript. See `session_scope`.
     {
         let state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if let (Some(active), Some(event_id)) =
-            (state.active_session_id.clone(), event_session_id.clone())
-        {
-            if active != event_id {
-                return;
-            }
+        if !belongs_to_session(
+            state.active_session_id.as_deref(),
+            event_session_id.as_deref(),
+        ) {
+            return;
         }
     }
 

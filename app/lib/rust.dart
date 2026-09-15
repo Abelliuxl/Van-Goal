@@ -71,6 +71,20 @@ class RustCore {
     }
   }
 
+  /// Parse one message's markdown into the blocks the transcript draws.
+  ///
+  /// A local call, so the answer comes back in the reply instead of through
+  /// [poll]: parsing is instant and needs no network, and routing it through the
+  /// event queue would mean matching a request to an event for no gain.
+  List<Map<String, dynamic>> markdown(String text) {
+    final reply = send({'cmd': 'markdown', 'text': text});
+    final blocks = reply['blocks'];
+    if (blocks is! List) {
+      return const [];
+    }
+    return blocks.whereType<Map<String, dynamic>>().toList(growable: false);
+  }
+
   /// Take everything that has happened since the previous call.
   List<Map<String, dynamic>> poll() {
     final decoded = jsonDecode(_take(_poll()));

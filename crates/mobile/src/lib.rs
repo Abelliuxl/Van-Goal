@@ -77,7 +77,11 @@ pub unsafe extern "C" fn vg_set_data_dir(path: *const c_char) -> *mut c_char {
 /// Run one command. Returns `{"ok":true}` or `{"ok":false,"error":"…"}`.
 ///
 /// The command's actual result — sessions, a transcript, an error from the
-/// gateway — arrives later through [`vg_poll`].
+/// gateway — arrives later through [`vg_poll`]. The few commands whose answer is
+/// a value rather than an event (the saved preferences, the markdown blocks of a
+/// message) put it in the reply next to `ok`, because it is computed here and
+/// instantly: routing it through the queue would mean matching a request to an
+/// event for no gain.
 ///
 /// # Safety
 ///
@@ -90,7 +94,17 @@ pub unsafe extern "C" fn vg_command(json: *const c_char) -> *mut c_char {
     };
     let outcome = catch_unwind(AssertUnwindSafe(|| client().run(&command)));
     match outcome {
-        Ok(Ok(())) => reply(serde_json::json!({ "ok": true })),
+        Ok(Ok(payload)) => {
+            let mut answer = serde_json::json!({ "ok": true });
+            if let (Some(answer), Some(payload)) = (answer.as_object_mut(), payload) {
+                if let Some(fields) = payload.as_object() {
+                    for (key, value) in fields {
+                        answer.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            reply(answer)
+        }
         Ok(Err(error)) => reply(serde_json::json!({ "ok": false, "error": error.to_string() })),
         Err(_) => reply(serde_json::json!({
             "ok": false,

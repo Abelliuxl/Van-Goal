@@ -1,3 +1,4 @@
+use super::session_scope;
 use super::{json_str, pretty_json};
 use crate::agent::device_identity::{
     OpenClawDeviceIdentity, OPENCLAW_CLIENT_ID, OPENCLAW_CLIENT_MODE, OPENCLAW_DEVICE_FAMILY,
@@ -627,6 +628,10 @@ fn payload_session_key(payload: &serde_json::Value) -> Option<String> {
 /// session does not unsubscribe from the ones opened before it. A cron job
 /// running in another session therefore arrives on the same socket, and its
 /// replies used to be appended to whatever chat happened to be open.
+///
+/// The rule itself is shared with the other adapters, so this only has to name
+/// the key the Gateway puts on a frame — see
+/// [`session_scope::belongs_to_session`].
 fn is_for_active_session(
     payload: &serde_json::Value,
     active_session: &Arc<Mutex<Option<String>>>,
@@ -635,16 +640,7 @@ fn is_for_active_session(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
-    let Some(active) = active else {
-        // Nothing subscribed yet, so there is nothing to compare against.
-        return true;
-    };
-    match payload_session_key(payload) {
-        Some(key) => key == active,
-        // An unlabelled frame is kept: dropping it could lose the active
-        // session's own stream, and the Gateway labels the traffic it fans out.
-        None => true,
-    }
+    session_scope::belongs_to_session(active.as_deref(), payload_session_key(payload).as_deref())
 }
 
 #[allow(clippy::too_many_arguments)]

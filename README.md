@@ -81,6 +81,15 @@ OpenClaw connections create a stable Ed25519 device identity in Van-Goal's local
 3. On the first connection, run `openclaw devices list` on the Gateway host and approve Van-Goal's exact pending request with `openclaw devices approve <requestId>`.
 4. Switch OpenClaw on again. Van-Goal stores the issued device token in its local app-data directory and keeps each backend's connection settings separate; Settings reports that stored token, which is why the gateway-token field can stay empty once the device is paired.
 
+## Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [`AGENTS.md`](AGENTS.md) | The rules of the codebase, how to build and test each target, and the traps |
+| [`docs/architecture.md`](docs/architecture.md) | The whole system: layers, the event model, storage, threading |
+| [`docs/sessions.md`](docs/sessions.md) | One connection carrying many sessions, and the rule that keeps them apart |
+| [`docs/mobile.md`](docs/mobile.md) | The Android client: the C ABI, the queue, reconnecting, building |
+
 ## Architecture
 
 Van-Goal is deliberately a thin frontend — all agent capability lives in the backend.

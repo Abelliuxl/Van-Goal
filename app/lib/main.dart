@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 
+import 'markdown.dart';
 import 'state.dart';
+import 'tools.dart';
+import 'waiting.dart';
 
 void main() {
   runApp(const VanGoalApp());
@@ -16,6 +19,9 @@ const _inkSoft = Color(0xFF9B9BA6);
 const _inkFaint = Color(0xFF6D6D78);
 const _accent = Color(0xFF4F8CFF);
 
+const _body = TextStyle(fontSize: 15, height: 1.45, color: _ink);
+const _mono = 'monospace';
+
 class VanGoalApp extends StatefulWidget {
   const VanGoalApp({super.key});
 
@@ -24,13 +30,28 @@ class VanGoalApp extends StatefulWidget {
 }
 
 class _VanGoalAppState extends State<VanGoalApp> {
+  final _app = AppState.instance;
+
   @override
   void initState() {
     super.initState();
+    _app.addListener(_onChanged);
     // Naming the data directory has to happen before anything reads it, so the
     // client is started here rather than lazily from the first screen that
     // needs it.
-    AppState.instance.start();
+    _app.start();
+  }
+
+  @override
+  void dispose() {
+    _app.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  void _onChanged() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   @override
@@ -46,6 +67,15 @@ class _VanGoalAppState extends State<VanGoalApp> {
           brightness: Brightness.dark,
         ).copyWith(surface: _surface),
         scaffoldBackgroundColor: _surface,
+      ),
+      // One text-size preference scales every font in the app at once, the way
+      // the desktop client does it. Sizes below are therefore design sizes: none
+      // of them is scaled by hand.
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(
+          textScaler: TextScaler.linear(_app.fontSize.scale),
+        ),
+        child: child ?? const SizedBox.shrink(),
       ),
       home: const ChatPage(),
     );
@@ -110,6 +140,7 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
+    final offline = _app.link != LinkState.online;
     return Scaffold(
       appBar: AppBar(
         backgroundColor: _panel,
@@ -124,16 +155,44 @@ class _ChatPageState extends State<ChatPage> {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 16),
             ),
-            Text(
-              _linkLabel(_app),
-              style: TextStyle(
-                fontSize: 11,
-                color: _app.link == LinkState.online ? _accent : _inkFaint,
-              ),
+            // The state is the part that has to survive a narrow header: at the
+            // larger text sizes a long backend name pushed it off the end and
+            // left "connec…", which reads as either "connecting" or
+            // "connected". The name is allowed to shorten instead.
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _linkState(_app),
+                  maxLines: 1,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: _app.link == LinkState.online ? _accent : _inkFaint,
+                  ),
+                ),
+                Flexible(
+                  child: Text(
+                    ' · ${_app.backend.label}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: _inkFaint),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
         actions: [
+          // Reconnecting is otherwise a trip through Settings, which is a long
+          // way to go for something the app does to itself several times a day.
+          if (offline)
+            IconButton(
+              tooltip: 'Reconnect',
+              onPressed: _app.retry,
+              icon: Icon(Icons.sync, color: _app.link == LinkState.connecting
+                  ? _inkFaint
+                  : _accent),
+            ),
           IconButton(
             tooltip: 'New chat',
             onPressed: _app.newChat,
@@ -156,7 +215,8 @@ class _ChatPageState extends State<ChatPage> {
       drawer: _SessionDrawer(app: _app),
       body: Column(
         children: [
-          if (_app.error != null) _ErrorBanner(message: _app.error!),
+          if (_app.error != null)
+            _ErrorBanner(message: _app.error!, onDismiss: _app.dismissError),
           Expanded(child: _Transcript(app: _app, controller: _scroll)),
           if (_app.clarifyQuestion != null) _ClarifyCard(app: _app),
           _Composer(controller: _composer, app: _app, onSend: _send),
@@ -165,16 +225,16 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  static String _linkLabel(AppState app) {
+  static String _linkState(AppState app) {
     switch (app.link) {
       case LinkState.online:
-        return '${app.backend.label} · connected';
+        return 'connected';
       case LinkState.connecting:
-        return '${app.backend.label} · connecting…';
+        return 'connecting…';
       case LinkState.failed:
-        return '${app.backend.label} · ${app.linkDetail ?? 'failed'}';
+        return app.linkDetail ?? 'failed';
       case LinkState.offline:
-        return '${app.backend.label} · offline';
+        return 'offline';
     }
   }
 }
@@ -187,14 +247,21 @@ class _Transcript extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (app.messages.isEmpty) {
+    if (app.messages.isEmpty && !app.sending) {
       return _EmptyState(app: app);
     }
+    // The reply gets a bubble of its own before the gateway has said anything,
+    // so a wait always has something moving on screen — see `withWaitingBubble`.
+    final messages = withWaitingBubble(app.messages, app.sending);
     return ListView.builder(
       controller: controller,
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
-      itemCount: app.messages.length,
-      itemBuilder: (context, index) => _Bubble(message: app.messages[index]),
+      itemCount: messages.length,
+      itemBuilder: (context, index) => _Bubble(
+        key: ValueKey(messages[index].id),
+        message: messages[index],
+        showToolCalls: app.showToolCalls,
+      ),
     );
   }
 }
@@ -230,6 +297,15 @@ class _EmptyState extends StatelessWidget {
               textAlign: TextAlign.center,
               style: const TextStyle(color: _inkSoft, height: 1.5),
             ),
+            if (app.link == LinkState.failed ||
+                app.link == LinkState.offline) ...[
+              const SizedBox(height: 18),
+              FilledButton.tonalIcon(
+                onPressed: app.retry,
+                icon: const Icon(Icons.sync, size: 18),
+                label: const Text('Reconnect'),
+              ),
+            ],
           ],
         ),
       ),
@@ -238,13 +314,23 @@ class _EmptyState extends StatelessWidget {
 }
 
 class _Bubble extends StatelessWidget {
-  const _Bubble({required this.message});
+  const _Bubble({
+    super.key,
+    required this.message,
+    required this.showToolCalls,
+  });
 
   final Message message;
+  final bool showToolCalls;
 
   @override
   Widget build(BuildContext context) {
     final isUser = message.fromUser;
+    final tools = message.tools;
+    // A turn that has only run tools so far is working, not empty: as long as
+    // the message is streaming and has no text, the dots show there is more
+    // coming, whether or not a tool call has already been recorded.
+    final waiting = message.streaming && message.text.isEmpty;
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -262,15 +348,14 @@ class _Bubble extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            for (final tool in message.tools) _ToolChip(tool: tool),
-            if (message.tools.isNotEmpty) const SizedBox(height: 8),
-            if (message.text.isEmpty && message.streaming)
-              const _Thinking()
-            else
-              SelectableText(
-                message.text,
-                style: const TextStyle(fontSize: 15, height: 1.45, color: _ink),
-              ),
+            if (showToolCalls && tools.isNotEmpty) ...[
+              ToolCallsView(tools: tools),
+              if (!waiting || message.text.isNotEmpty) const SizedBox(height: 8),
+            ],
+            if (waiting)
+              const WaitingDots()
+            else if (message.text.isNotEmpty)
+              _MarkdownView(message: message),
           ],
         ),
       ),
@@ -278,76 +363,204 @@ class _Bubble extends StatelessWidget {
   }
 }
 
-class _Thinking extends StatelessWidget {
-  const _Thinking();
+/// A message drawn from the blocks the Rust core parsed it into.
+///
+/// The core owns the parser — the desktop renderer draws the same blocks — so
+/// the two clients cannot disagree about what a message says. While a reply is
+/// still streaming it is drawn as plain text instead: re-parsing a table on
+/// every token would make the layout jump around as it arrives.
+class _MarkdownView extends StatelessWidget {
+  const _MarkdownView({required this.message});
+
+  final Message message;
 
   @override
   Widget build(BuildContext context) {
-    return const Row(
+    final blocks = message.blocks;
+    if (blocks == null || blocks.isEmpty) {
+      return SelectableText(message.text, style: _body);
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        SizedBox(
-          width: 12,
-          height: 12,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        ),
-        SizedBox(width: 10),
-        Text('Thinking…', style: TextStyle(color: _inkSoft, fontSize: 14)),
+        for (final block in blocks) _block(block),
       ],
     );
   }
-}
 
-class _ToolChip extends StatelessWidget {
-  const _ToolChip({required this.tool});
+  Widget _block(Map<String, dynamic> block) {
+    switch (block['kind']) {
+      case 'heading':
+        final level = (block['level'] as num?)?.toInt() ?? 1;
+        final size = switch (level) {
+          1 => 19.0,
+          2 => 17.0,
+          3 => 16.0,
+          _ => 15.0,
+        };
+        return Padding(
+          padding: const EdgeInsets.only(top: 10, bottom: 4),
+          child: SelectableText.rich(
+            _span(block['runs'], _body.copyWith(
+              fontSize: size,
+              fontWeight: FontWeight.w600,
+              height: 1.3,
+            )),
+          ),
+        );
+      case 'bullet':
+        return _row('•', block['runs']);
+      case 'numbered':
+        return _row('${block['number'] ?? ''}.', block['runs']);
+      case 'quote':
+        return Container(
+          width: double.infinity,
+          margin: const EdgeInsets.symmetric(vertical: 3),
+          padding: const EdgeInsets.only(left: 10),
+          decoration: const BoxDecoration(
+            border: Border(left: BorderSide(color: _line, width: 3)),
+          ),
+          child: SelectableText.rich(
+            _span(block['runs'], _body.copyWith(color: _inkSoft)),
+          ),
+        );
+      case 'code':
+        return Container(
+          width: double.infinity,
+          margin: const EdgeInsets.symmetric(vertical: 6),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: _surface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: _line),
+          ),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: SelectableText(
+              (block['text'] as String?) ?? '',
+              style: const TextStyle(
+                fontSize: 13,
+                height: 1.35,
+                color: _ink,
+                fontFamily: _mono,
+              ),
+            ),
+          ),
+        );
+      case 'table':
+        return _table(block);
+      case 'separator':
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Divider(height: 1, color: _line),
+        );
+      default:
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 3),
+          child: SelectableText.rich(_span(block['runs'], _body)),
+        );
+    }
+  }
 
-  final ToolCall tool;
-
-  @override
-  Widget build(BuildContext context) {
-    final detail = tool.detail.trim();
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: _panel,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: _line),
-      ),
+  Widget _row(String marker, Object? runs) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.build_outlined, size: 13, color: _inkFaint),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              detail.isEmpty ? tool.name : '${tool.name} · $detail',
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12, color: _inkSoft),
-            ),
+          SizedBox(
+            width: 22,
+            child: Text(marker, style: _body.copyWith(color: _inkSoft)),
           ),
+          Expanded(child: SelectableText.rich(_span(runs, _body))),
         ],
       ),
     );
   }
+
+  Widget _table(Map<String, dynamic> block) {
+    final headers = (block['headers'] as List?) ?? const [];
+    final rows = (block['rows'] as List?) ?? const [];
+    if (headers.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Table(
+          border: TableBorder.all(color: _line, width: 1),
+          defaultColumnWidth: const IntrinsicColumnWidth(),
+          children: [
+            TableRow(
+              decoration: const BoxDecoration(color: _panel),
+              children: [
+                for (final header in headers)
+                  _cell(header, bold: true),
+              ],
+            ),
+            for (final row in rows.whereType<List>())
+              TableRow(
+                children: [
+                  for (var index = 0; index < headers.length; index++)
+                    _cell(index < row.length ? row[index] : null),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _cell(Object? runs, {bool bold = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: SelectableText.rich(
+        _span(
+          runs,
+          _body.copyWith(
+            fontSize: 13.5,
+            height: 1.35,
+            fontWeight: bold ? FontWeight.w600 : FontWeight.w400,
+          ),
+        ),
+      ),
+    );
+  }
+
+  static TextSpan _span(Object? runs, TextStyle base) =>
+      markdownSpan(runs, base);
 }
 
 class _ErrorBanner extends StatelessWidget {
-  const _ErrorBanner({required this.message});
+  const _ErrorBanner({required this.message, required this.onDismiss});
 
   final String message;
+  final VoidCallback onDismiss;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
       color: const Color(0xFF43201E),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      child: Text(
-        message,
-        style: const TextStyle(color: Color(0xFFFFB4AB), fontSize: 13),
+      padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(color: Color(0xFFFFB4AB), fontSize: 13),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Dismiss',
+            onPressed: onDismiss,
+            iconSize: 18,
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.close, color: Color(0xFFFFB4AB)),
+          ),
+        ],
       ),
     );
   }
@@ -578,6 +791,8 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   late final TextEditingController _token = TextEditingController(
     text: _app.credential,
   );
+  late FontSize _fontSize = _app.fontSize;
+  late bool _showToolCalls = _app.showToolCalls;
 
   @override
   void dispose() {
@@ -589,6 +804,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final connected = _app.link == LinkState.online;
     return Padding(
       padding: EdgeInsets.only(
         left: 20,
@@ -668,6 +884,15 @@ class _SettingsSheetState extends State<_SettingsSheet> {
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                if (connected)
+                  TextButton(
+                    onPressed: () {
+                      _app.disconnect();
+                      Navigator.of(context).pop();
+                    },
+                    child: const Text('Disconnect'),
+                  ),
+                const Spacer(),
                 TextButton(
                   onPressed: () => Navigator.of(context).pop(),
                   child: const Text('Cancel'),
@@ -681,10 +906,56 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                     _app.connect();
                     Navigator.of(context).pop();
                   },
-                  child: const Text('Connect'),
+                  child: Text(connected ? 'Reconnect' : 'Connect'),
                 ),
               ],
             ),
+
+            const SizedBox(height: 26),
+            const Divider(height: 1, color: _line),
+            const SizedBox(height: 18),
+            const Text(
+              'Interface',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 14),
+            DropdownButtonFormField<FontSize>(
+              initialValue: _fontSize,
+              decoration: const InputDecoration(
+                labelText: 'Text size',
+                helperText: 'Scales every font in the app at once.',
+                helperMaxLines: 2,
+              ),
+              items: [
+                for (final size in FontSize.values)
+                  DropdownMenuItem(value: size, child: Text(size.label)),
+              ],
+              onChanged: (size) {
+                if (size == null) {
+                  return;
+                }
+                setState(() => _fontSize = size);
+                _app.setFontSize(size);
+              },
+            ),
+            const SizedBox(height: 6),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: _showToolCalls,
+              title: const Text(
+                'Show tool calls',
+                style: TextStyle(fontSize: 14),
+              ),
+              subtitle: const Text(
+                'Off draws only the replies, with the tool calls a turn ran left out.',
+                style: TextStyle(fontSize: 11, color: _inkFaint),
+              ),
+              onChanged: (value) {
+                setState(() => _showToolCalls = value);
+                _app.setShowToolCalls(value);
+              },
+            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),

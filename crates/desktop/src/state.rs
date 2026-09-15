@@ -518,6 +518,13 @@ impl AppState {
     pub fn resume_session(&mut self, session: AgentSession, cx: &mut gpui::Context<Self>) {
         self.selected_session = Some(session.clone());
         self.pending_clarify = None;
+        // The session on screen is not the one this connection is subscribed to
+        // until the gateway says so: until then the messages being loaded belong
+        // to a subscription that is about to be replaced, and anything arriving
+        // is the previous session's. Dropping the live id is what makes
+        // `accepts_turn_events` hold events off for that window.
+        self.live_gateway_session_id = None;
+        self.stored_gateway_session_id = Some(session.id.clone());
         let key = cache_key(&session, self.settings.backend_kind.id());
         self.cached_state.selected_session_id = Some(key.clone());
         if let Some(cached) = self
@@ -1231,6 +1238,24 @@ impl AppState {
     // ------------------------------------------------------------------
 
     pub fn handle_event(&mut self, event: AgentEvent, cx: &mut gpui::Context<Self>) {
+        // A turn's traffic is only the open transcript's while a session is
+        // subscribed. During a switch the session being left is still streaming
+        // into this connection, and its reply would be written into the chat the
+        // user just opened — see `accepts_turn_events`.
+        if matches!(
+            &event,
+            AgentEvent::MessageStart
+                | AgentEvent::MessageDelta { .. }
+                | AgentEvent::MessageComplete(_)
+                | AgentEvent::Tool(_)
+                | AgentEvent::TurnFailed(_)
+        ) && !accepts_turn_events(
+            self.live_gateway_session_id.as_deref(),
+            self.stored_gateway_session_id.as_deref(),
+        ) {
+            log_debug!("app", "turn event dropped while a session is opening");
+            return;
+        }
         match event {
             AgentEvent::Connected => {
                 self.transport_ready = true;
@@ -1778,4 +1803,54 @@ fn model_order(lhs: &str, rhs: &str, current: &str) -> std::cmp::Ordering {
         return std::cmp::Ordering::Greater;
     }
     lhs.to_lowercase().cmp(&rhs.to_lowercase())
+}
+
+/// Whether an event that belongs to a turn may be folded into the messages on
+/// screen.
+///
+/// A connection is subscribed to one session at a time, and a gateway carries
+/// every session down it: without this, the reply of the session being left is
+/// written into the transcript the user just opened. The question the rule
+/// answers is "does anything on screen belong to the session this connection is
+/// subscribed to?":
+///
+/// * **A live session** — yes, the events are its own.
+/// * **No session at all** — a chat that has not been created yet has nothing to
+///   mismatch, so its first turn must not be held off.
+/// * **A session being opened** — the stored id is known but the subscription is
+///   not confirmed, which is exactly the window where the previous session's
+///   traffic arrives. Held off until the gateway answers.
+fn accepts_turn_events(live: Option<&str>, stored: Option<&str>) -> bool {
+    live.is_some() || stored.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subscribed_session_takes_its_own_traffic() {
+        assert!(accepts_turn_events(Some("live-1"), Some("stored-1")));
+    }
+
+    /// The window a switch opens: the id on screen is known, the subscription is
+    /// not established yet, and anything arriving belongs to the session being
+    /// left.
+    #[test]
+    fn a_session_being_opened_holds_traffic_off() {
+        assert!(!accepts_turn_events(None, Some("stored-2")));
+    }
+
+    /// A chat that does not exist yet has nothing to mismatch: holding its first
+    /// turn off would leave a fresh chat that never answers.
+    #[test]
+    fn a_chat_with_no_session_yet_takes_its_first_turn() {
+        assert!(accepts_turn_events(None, None));
+    }
+
+    /// The live id alone is enough: the stored key is not always known.
+    #[test]
+    fn a_live_session_without_a_stored_key_still_takes_its_traffic() {
+        assert!(accepts_turn_events(Some("live-1"), None));
+    }
 }

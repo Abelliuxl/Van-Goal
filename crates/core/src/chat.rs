@@ -1,14 +1,16 @@
 //! Client-side chat state that every frontend needs, regardless of toolkit.
 //!
-//! Two things live here because they are subtle enough that a second frontend
+//! Three things live here because they are subtle enough that a second frontend
 //! must not reimplement them:
 //!
 //! * merging a reply that arrives as a stream of chunks, possibly on several
 //!   streams at once ([`merge_stream_chunk`], [`best_stream_text`]);
 //! * keeping the chat the user is looking at in the session list while the
-//!   gateway still has not listed it ([`merge_fetched_sessions`]).
+//!   gateway still has not listed it ([`merge_fetched_sessions`]);
+//! * folding the events of a turn into the message list a frontend draws
+//!   ([`Conversation`]).
 
-use crate::models::{AgentSession, DeltaSource};
+use crate::models::{now_unix, AgentEvent, AgentSession, ChatMessage, DeltaSource, MessageRole};
 use std::collections::BTreeMap;
 
 /// A session is unnamed while it still carries the placeholder the client uses
@@ -94,6 +96,286 @@ pub fn best_stream_text(streams: &BTreeMap<DeltaSource, String>) -> String {
         .max_by_key(|text| text.chars().count())
         .cloned()
         .unwrap_or_default()
+}
+
+/// What folding one event did to the message list.
+///
+/// A frontend that draws the list itself wants to know whether only the text
+/// being streamed moved (cheap to redraw) or something was added, removed or
+/// gained a tool call (the whole list has to be re-read).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConversationChange {
+    None,
+    /// The text of one streaming message moved.
+    Streaming {
+        id: String,
+        text: String,
+    },
+    /// Messages were added, removed, completed or gained a tool call.
+    Structure,
+}
+
+/// The messages of one chat, folded from the events of a turn.
+///
+/// The rules are not obvious — when a placeholder appears, which tool event is
+/// a repeat of one already shown, when a reply stops streaming — and a frontend
+/// that guesses them ends up with the failure modes the mobile client had: one
+/// "Thinking…" bubble per event, a spinner that never stops because the turn
+/// failed, and the same tool call listed once per status update. They are ported
+/// from the desktop `AppState` and live here so both frontends share them.
+#[derive(Default)]
+pub struct Conversation {
+    messages: Vec<ChatMessage>,
+    streams: BTreeMap<DeltaSource, String>,
+    /// Whether a prompt has been submitted and its turn has not finished. Only
+    /// used to decide whether an empty placeholder is worth creating: an event
+    /// that arrives with no turn in flight is still drawn, it just does not get
+    /// a bubble of its own to live in.
+    sending: bool,
+}
+
+impl Conversation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    pub fn is_sending(&self) -> bool {
+        self.sending
+    }
+
+    /// A prompt was submitted: the next assistant message gets a placeholder
+    /// straight away, so the user sees the turn start before any text arrives.
+    ///
+    /// The prompt itself is recorded here rather than left to the frontend to
+    /// draw, because the message list is what a transcript reload replaces: a
+    /// message the client only drew locally would vanish on the next one.
+    pub fn begin_turn_with(&mut self, prompt: &str) {
+        self.messages
+            .push(ChatMessage::new(MessageRole::User, prompt));
+        self.sending = true;
+        self.streams.clear();
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.sending = true;
+        self.streams.clear();
+    }
+
+    /// Replace the transcript with what the backend reports.
+    pub fn set_transcript(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
+        self.streams.clear();
+    }
+
+    /// Replace the transcript, keeping tool activity this client watched happen.
+    ///
+    /// `chat.history` reports a turn as one block of text and carries no tool
+    /// calls, so a session reopened in the app would otherwise lose them. The two
+    /// lists do not line up message for message: the client draws a turn's tool
+    /// calls as a bubble of their own, while the backend reports the turn as the
+    /// text that followed them. So each reported message is matched to the local
+    /// message with the same role and text, and collects the tool calls of every
+    /// assistant message the client drew between them.
+    pub fn merge_transcript(&mut self, messages: Vec<ChatMessage>) {
+        let local = std::mem::take(&mut self.messages);
+        let mut cursor = 0usize;
+        let mut merged = Vec::with_capacity(messages.len());
+
+        for mut message in messages {
+            let matched = local[cursor..]
+                .iter()
+                .position(|candidate| {
+                    candidate.role == message.role
+                        && candidate.content.trim() == message.content.trim()
+                })
+                .map(|offset| cursor + offset);
+
+            if let Some(index) = matched {
+                if message.role == MessageRole::Assistant {
+                    for candidate in &local[cursor..=index] {
+                        for call in &candidate.tool_calls {
+                            if !message.tool_calls.iter().any(|kept| kept.id == call.id) {
+                                message.tool_calls.push(call.clone());
+                            }
+                        }
+                    }
+                }
+                cursor = index + 1;
+            }
+            merged.push(message);
+        }
+
+        self.set_transcript(merged);
+    }
+
+    /// End the turn: nothing is streaming any more and the empty shells some
+    /// events leave behind are removed.
+    pub fn finish_turn(&mut self) {
+        let completed_at = now_unix();
+        for message in self.messages.iter_mut() {
+            if message.role == MessageRole::Assistant && message.is_streaming {
+                message.is_streaming = false;
+                message.completed_at = Some(completed_at);
+            }
+        }
+        self.prune_empty_assistant_messages();
+        self.streams.clear();
+        self.sending = false;
+    }
+
+    pub fn apply(&mut self, event: &AgentEvent) -> ConversationChange {
+        match event {
+            AgentEvent::MessageStart => self.start_message(),
+            AgentEvent::MessageDelta { text, source } => self.apply_delta(text, *source),
+            AgentEvent::MessageComplete(text) => self.complete_message(text.as_deref()),
+            AgentEvent::Tool(record) => self.append_tool_call(record),
+            AgentEvent::TurnFailed(_) => {
+                self.finish_turn();
+                ConversationChange::Structure
+            }
+            _ => ConversationChange::None,
+        }
+    }
+
+    fn start_message(&mut self) -> ConversationChange {
+        // A turn that opens a tool call and then a second message would
+        // otherwise leave one placeholder spinning for every event.
+        let needs_placeholder = self.sending
+            && self
+                .messages
+                .last()
+                .map(|last| last.role != MessageRole::Assistant || !last.is_streaming)
+                .unwrap_or(true);
+        if !needs_placeholder {
+            return ConversationChange::None;
+        }
+        self.messages
+            .push(ChatMessage::streaming(MessageRole::Assistant));
+        ConversationChange::Structure
+    }
+
+    fn apply_delta(&mut self, text: &str, source: DeltaSource) -> ConversationChange {
+        if text.is_empty() {
+            return ConversationChange::None;
+        }
+        merge_stream_chunk(self.streams.entry(source).or_default(), text);
+        let streamed = best_stream_text(&self.streams);
+        if streamed.is_empty() {
+            return ConversationChange::None;
+        }
+        // The reply belongs to the message that is streaming *text*: a message
+        // holding tool calls is a separate bubble and must not swallow it.
+        let index = match self.messages.iter().rposition(|message| {
+            message.role == MessageRole::Assistant
+                && message.is_streaming
+                && message.tool_calls.is_empty()
+        }) {
+            Some(index) => {
+                self.messages[index].content = streamed.clone();
+                index
+            }
+            None => {
+                let mut message = ChatMessage::streaming(MessageRole::Assistant);
+                message.content = streamed.clone();
+                self.messages.push(message);
+                self.messages.len() - 1
+            }
+        };
+        ConversationChange::Streaming {
+            id: self.messages[index].id.clone(),
+            text: streamed,
+        }
+    }
+
+    fn complete_message(&mut self, text: Option<&str>) -> ConversationChange {
+        let final_text = text
+            .map(str::to_string)
+            .unwrap_or_else(|| best_stream_text(&self.streams));
+        let final_text = final_text.trim().to_string();
+
+        let active = self
+            .messages
+            .iter()
+            .rposition(|message| message.role == MessageRole::Assistant && message.is_streaming);
+        let completed_at = now_unix();
+        for message in self.messages.iter_mut() {
+            if message.role == MessageRole::Assistant && message.is_streaming {
+                message.is_streaming = false;
+                message.completed_at = Some(completed_at);
+            }
+        }
+
+        match active {
+            Some(index) => {
+                // An empty final text must not wipe what already streamed in.
+                if !final_text.is_empty() {
+                    if self.messages[index].tool_calls.is_empty() {
+                        self.messages[index].content = final_text;
+                    } else {
+                        self.messages
+                            .push(ChatMessage::new(MessageRole::Assistant, final_text));
+                    }
+                }
+            }
+            None if !final_text.is_empty() => {
+                self.messages
+                    .push(ChatMessage::new(MessageRole::Assistant, final_text));
+            }
+            None => {}
+        }
+
+        self.finish_turn();
+        ConversationChange::Structure
+    }
+
+    fn append_tool_call(&mut self, record: &crate::models::ToolCallRecord) -> ConversationChange {
+        // Deduplicate within the current turn: a gateway reports a tool once when
+        // it starts and again when it finishes, and re-sends the same status on
+        // reconnect. Repeats are dropped, a changed status is kept.
+        let turn_start = self
+            .messages
+            .iter()
+            .rposition(|message| message.role == MessageRole::User)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let duplicate = self.messages[turn_start..].iter().any(|message| {
+            message.tool_calls.iter().any(|call| {
+                call.name == record.name
+                    && call.status == record.status
+                    && call.detail == record.detail
+            })
+        });
+        if duplicate {
+            return ConversationChange::None;
+        }
+
+        // Tool activity joins the streaming bubble that has no text yet, so a
+        // run of calls reads as one block instead of one bubble per call.
+        let target = self.messages.iter().rposition(|message| {
+            message.role == MessageRole::Assistant
+                && message.is_streaming
+                && message.content.trim().is_empty()
+        });
+        match target {
+            Some(index) => self.messages[index].tool_calls.push(record.clone()),
+            None => {
+                let mut message = ChatMessage::streaming(MessageRole::Assistant);
+                message.tool_calls.push(record.clone());
+                self.messages.push(message);
+            }
+        }
+        ConversationChange::Structure
+    }
+
+    /// Drop assistant bubbles that hold nothing: they are placeholders that no
+    /// text and no tool call ever arrived for.
+    fn prune_empty_assistant_messages(&mut self) {
+        self.messages.retain(|message| !message.is_empty_shell());
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +532,193 @@ mod tests {
             merge_stream_chunk(&mut buffer, chunk);
         }
         assert_eq!(buffer, "项目总览：nano-AgFe-抗氧化");
+    }
+
+    // ------------------------------------------------------------ conversation
+
+    fn tool(name: &str, status: &str) -> AgentEvent {
+        AgentEvent::Tool(crate::models::ToolCallRecord::new(name, status, ""))
+    }
+
+    /// Adapters put the call's own JSON in `detail`, so two calls to the same
+    /// tool are told apart by it.
+    fn tool_on(name: &str, status: &str, target: &str) -> AgentEvent {
+        AgentEvent::Tool(crate::models::ToolCallRecord::new(
+            name,
+            status,
+            format!(r#"{{"path":"{target}"}}"#),
+        ))
+    }
+
+    fn delta(text: &str) -> AgentEvent {
+        AgentEvent::MessageDelta {
+            text: text.to_string(),
+            source: DeltaSource::AgentStream,
+        }
+    }
+
+    fn user_message(text: &str) -> ChatMessage {
+        ChatMessage::new(MessageRole::User, text)
+    }
+
+    /// A turn opens a placeholder, streams text and finishes. One bubble, and it
+    /// is not left streaming.
+    #[test]
+    fn a_plain_turn_leaves_one_finished_message() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("你好")]);
+        conversation.begin_turn();
+
+        conversation.apply(&AgentEvent::MessageStart);
+        conversation.apply(&delta("你好呀"));
+        conversation.apply(&AgentEvent::MessageComplete(Some("你好呀".into())));
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 2, "{messages:#?}");
+        assert_eq!(messages[1].content, "你好呀");
+        assert!(
+            !messages[1].is_streaming,
+            "the reply never stopped streaming"
+        );
+        assert!(!conversation.is_sending());
+    }
+
+    /// The regression the mobile client was rebuilt for: a turn that runs four
+    /// tools used to draw four bubbles and four "Thinking…" spinners, because
+    /// every event started a placeholder of its own.
+    #[test]
+    fn a_turn_with_tool_calls_draws_one_bubble_for_the_calls() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("看看目录")]);
+        conversation.begin_turn();
+
+        for (name, target) in [("read", "a.rs"), ("bash", "-"), ("read", "b.rs")] {
+            conversation.apply(&AgentEvent::MessageStart);
+            conversation.apply(&tool_on(name, "running", target));
+            conversation.apply(&tool_on(name, "ok", target));
+        }
+        conversation.apply(&AgentEvent::MessageStart);
+        conversation.apply(&delta("目录里有三个文件。"));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        // Three calls, each reported once when it started and once when it
+        // finished: six records, in one bubble.
+        assert_eq!(messages[1].tool_calls.len(), 6, "tool calls were split up");
+        assert!(messages[1].content.is_empty());
+        assert_eq!(messages[2].content, "目录里有三个文件。");
+        assert!(
+            messages.iter().all(|message| !message.is_streaming),
+            "a spinner was left running: {messages:#?}"
+        );
+    }
+
+    /// A gateway reports a tool when it starts and again when it finishes. The
+    /// status change is worth showing; the identical repeat is not.
+    #[test]
+    fn a_repeated_tool_event_is_dropped_but_a_status_change_is_kept() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("看看目录")]);
+        conversation.begin_turn();
+
+        conversation.apply(&tool("read", "running"));
+        conversation.apply(&tool("read", "running"));
+        conversation.apply(&tool("read", "ok"));
+
+        let calls = &conversation.messages()[1].tool_calls;
+        assert_eq!(calls.len(), 2, "{calls:#?}");
+        assert_eq!(calls[0].status, "running");
+        assert_eq!(calls[1].status, "ok");
+    }
+
+    /// A failed turn used to leave the last bubble streaming forever, which is
+    /// the spinner that never stopped.
+    #[test]
+    fn a_failed_turn_stops_the_spinner() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("你好")]);
+        conversation.begin_turn();
+
+        conversation.apply(&AgentEvent::MessageStart);
+        conversation.apply(&AgentEvent::TurnFailed("gateway closed".into()));
+
+        assert!(
+            conversation
+                .messages()
+                .iter()
+                .all(|message| !message.is_streaming),
+            "a failed turn left a message streaming"
+        );
+        assert!(!conversation.is_sending());
+    }
+
+    /// The final text of a turn arrives with the completion event, and a turn
+    /// that produced tool calls reports it separately from the calls.
+    #[test]
+    fn a_completion_without_text_keeps_what_streamed() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("你好")]);
+        conversation.begin_turn();
+
+        conversation.apply(&delta("已经流出来的正文"));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+
+        assert_eq!(conversation.messages()[1].content, "已经流出来的正文");
+    }
+
+    /// `chat.history` carries no tool calls, so reopening a session must not
+    /// throw away the ones the client watched happen.
+    #[test]
+    fn reopening_a_session_keeps_the_tool_calls_the_client_saw() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("看看目录")]);
+        conversation.begin_turn();
+        conversation.apply(&tool("read", "ok"));
+        conversation.apply(&delta("目录里有三个文件。"));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+
+        // What the backend reports for the same turn: text only.
+        let fetched = vec![
+            user_message("看看目录"),
+            ChatMessage::new(MessageRole::Assistant, "目录里有三个文件。"),
+        ];
+        conversation.merge_transcript(fetched);
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 2, "{messages:#?}");
+        assert_eq!(
+            messages[1].tool_calls.len(),
+            1,
+            "the tool call was dropped when the session was re-read"
+        );
+    }
+
+    /// A session the client has never seen loads as the backend reports it.
+    #[test]
+    fn a_transcript_the_client_never_saw_loads_unchanged() {
+        let mut conversation = Conversation::new();
+        conversation.merge_transcript(vec![
+            user_message("你好"),
+            ChatMessage::new(MessageRole::Assistant, "你好呀"),
+        ]);
+        assert_eq!(conversation.messages().len(), 2);
+        assert!(conversation.messages()[1].tool_calls.is_empty());
+    }
+
+    /// Only a turn in flight gets a placeholder: an event that arrives with no
+    /// prompt outstanding must not push an empty bubble that never fills.
+    #[test]
+    fn no_placeholder_appears_without_a_turn_in_flight() {
+        let mut conversation = Conversation::new();
+        conversation.set_transcript(vec![user_message("你好")]);
+        conversation.apply(&AgentEvent::MessageStart);
+        assert_eq!(conversation.messages().len(), 1);
+
+        // Text that arrives anyway is still drawn.
+        conversation.apply(&delta("迟到的回复"));
+        assert_eq!(conversation.messages().len(), 2);
+        assert_eq!(conversation.messages()[1].content, "迟到的回复");
     }
 
     #[test]
