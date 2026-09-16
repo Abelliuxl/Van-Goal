@@ -110,6 +110,7 @@ fn main() {
     app.run(move |cx: &mut App| {
         cx.set_global(state::TokioGlobal(runtime));
         ui::editor::bind_editor_keys(cx);
+        ui::chat::bind_chat_keys(cx);
 
         let state = cx.new(|cx| AppState::new(cx));
         cx.set_global(StateGlobal(state.clone()));

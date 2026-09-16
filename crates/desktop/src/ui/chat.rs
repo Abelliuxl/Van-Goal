@@ -1,13 +1,15 @@
 use crate::state::AppState;
 use crate::ui::editor::{Editor, EditorEvent};
-use crate::ui::markdown_view::render_blocks;
+use crate::ui::markdown_view::{render_blocks, SelectionBlock};
+use crate::ui::selectable_text::SelectionHost;
 use crate::ui::theme::Theme;
 use gpui::{
-    div, list, point, prelude::*, px, AnyElement, Context, Entity, Focusable, FontWeight,
-    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
+    actions, div, list, point, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
 };
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 use van_goal_core::markdown;
@@ -15,6 +17,8 @@ use van_goal_core::markdown::MarkdownBlock;
 use van_goal_core::models::{
     compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
 };
+
+actions!(chat, [CopySelection]);
 
 /// Smallest overlay-scrollbar thumb, as a fraction of the track.
 const MIN_THUMB_FRACTION: f32 = 0.06;
@@ -141,6 +145,30 @@ pub struct ChatView {
     /// with: the observer only fires on later changes, so the first render
     /// calls the sync once itself.
     list_synced: bool,
+    /// Focus for the transcript area: clicking a message moves focus here so
+    /// ⌘C copies the selection instead of the composer's content.
+    transcript_focus_handle: FocusHandle,
+    /// The one active text selection across every block the transcript draws.
+    text_selection: Option<TextSelection>,
+}
+
+/// What a selected range in one markdown block holds while it is live.
+struct TextSelection {
+    /// Which block the selection belongs to: a SelectableText only paints a
+    /// range whose key matches its own.
+    key: u64,
+    range: Range<usize>,
+    text: String,
+}
+
+/// Bind the transcript's own keys. Called beside `bind_editor_keys`, since a
+/// key binding lives in the context that is focused when it should fire.
+pub fn bind_chat_keys(cx: &mut gpui::App) {
+    cx.bind_keys([gpui::KeyBinding::new(
+        "cmd-c",
+        CopySelection,
+        Some("Transcript"),
+    )]);
 }
 
 impl ChatView {
@@ -221,6 +249,8 @@ impl ChatView {
             copied_reset_task: None,
             markdown_memo: HashMap::new(),
             list_synced: false,
+            transcript_focus_handle: cx.focus_handle(),
+            text_selection: None,
         }
     }
 
@@ -549,6 +579,56 @@ impl ChatView {
     }
 }
 
+impl ChatView {
+    fn copy_text_selection(
+        &mut self,
+        _: &CopySelection,
+        _: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection.as_ref() else {
+            return;
+        };
+        if !selection.text.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(selection.text.clone()));
+        }
+        cx.notify();
+    }
+}
+
+/// The transcript is the selection's home: every selectable markdown block
+/// stores and reads its range through here.
+impl SelectionHost for Entity<ChatView> {
+    fn selection(&self, cx: &gpui::App) -> Option<(u64, std::ops::Range<usize>)> {
+        self.read(cx)
+            .text_selection
+            .as_ref()
+            .map(|selection| (selection.key, selection.range.clone()))
+    }
+
+    fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut gpui::App) {
+        self.update(cx, |chat, cx| {
+            chat.text_selection = Some(TextSelection { key, range, text });
+            cx.notify();
+        });
+    }
+
+    fn clear_selection(&self, cx: &mut gpui::App) {
+        self.update(cx, |chat, cx| {
+            if chat.text_selection.take().is_some() {
+                cx.notify();
+            }
+        });
+    }
+
+    fn focus_transcript(&self, window: &mut gpui::Window, cx: &mut gpui::App) {
+        self.update(cx, |chat, _cx| {
+            let handle = chat.transcript_focus_handle.clone();
+            window.focus(&handle);
+        });
+    }
+}
+
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Focus the composer once on first paint so typing works immediately.
@@ -675,6 +755,11 @@ impl ChatView {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
+            // The transcript holds the text selection: while it is focused a
+            // ⌘C copies the selection through the host, not the composer.
+            .key_context("Transcript")
+            .track_focus(&self.transcript_focus_handle)
+            .on_action(cx.listener(ChatView::copy_text_selection))
             .on_hover(move |hovered, _window, cx| {
                 chat.update(cx, |chat, cx| chat.set_list_hovered(*hovered, cx));
             })
@@ -1503,6 +1588,10 @@ fn render_message_bubble(
     chat: Entity<ChatView>,
 ) -> AnyElement {
     let id_hash = crate::ui::hash_id(&message.id);
+    let selection = SelectionBlock {
+        message_id: message.id.clone(),
+        host: Rc::new(chat.clone()),
+    };
     let bubble = match message.role {
         MessageRole::User => div()
             .w_full()
@@ -1545,7 +1634,7 @@ fn render_message_bubble(
                             .max_w(px(USER_BUBBLE_TEXT_MAX_WIDTH))
                             .text_size(Theme::text_px(13.0))
                             .text_color(Theme::text())
-                            .child(render_blocks(&blocks)),
+                            .child(render_blocks(&blocks, Some(&selection))),
                     ),
             )
             .into_any(),
@@ -1607,7 +1696,7 @@ fn render_message_bubble(
             }
 
             if !message.content.trim().is_empty() {
-                bubble = bubble.child(render_blocks(&blocks));
+                bubble = bubble.child(render_blocks(&blocks, Some(&selection)));
             }
 
             // Under the reply and against its left edge, so it sits next to the

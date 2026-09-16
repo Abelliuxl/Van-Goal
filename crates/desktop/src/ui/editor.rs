@@ -747,6 +747,86 @@ mod tests {
         assert_eq!(selected, content.len()..content.len());
         assert_eq!(marked, None);
     }
+
+    /// A drag across part of the content selects exactly those characters, and
+    /// ⌘C puts them on the clipboard. Reported broken on the real app; this is
+    /// the interaction pinned down so the fix is a matter of record.
+    #[gpui::test]
+    fn mouse_drag_selects_text_and_cmd_c_copies_it(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(cx);
+            editor.set_text("hello brave world", cx);
+            editor
+        });
+        struct EditorRoot(Entity<Editor>);
+        impl Render for EditorRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().w(px(320.0)).h(px(60.0)).child(self.0.clone())
+            }
+        }
+        let (root, cx) = cx.add_window_view(|_window, _cx| EditorRoot(editor.clone()));
+        // The tests bypass the app entry, so the editor's key bindings have to
+        // be registered for ⌘C to reach the Copy action.
+        cx.update(|_window, cx| bind_editor_keys(cx));
+        // A couple of frames settle the layout before positions are probed.
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let hitbox: &'static str = Box::leak(
+            editor
+                .read_with(cx, |editor, _cx| editor.hitbox_id.clone())
+                .to_string()
+                .into_boxed_str(),
+        );
+        let bounds = cx
+            .debug_bounds(&hitbox)
+            .unwrap_or_else(|| panic!("{hitbox} was not laid out"));
+        let modifiers = gpui::Modifiers::default();
+
+        // Pixel positions of two byte offsets, from the shaped lines.
+        let (start, end) = editor.read_with(cx, |editor, _cx| {
+            let entry = &editor.lines[0];
+            (
+                entry.line.position_for_index(6, px(row_height())).unwrap(),
+                entry.line.position_for_index(11, px(row_height())).unwrap(),
+            )
+        });
+        let at = |local: gpui::Point<Pixels>| {
+            gpui::point(
+                bounds.origin.x + local.x,
+                bounds.origin.y + local.y + px(row_height() / 2.0),
+            )
+        };
+
+        // Drag over "brave" (bytes 6..11).
+        cx.simulate_mouse_down(at(start), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(at(end), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(at(end), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+
+        let (content, selected, _) = editor_state(&editor, cx);
+        assert_eq!(
+            &content[selected.clone()],
+            "brave",
+            "drag did not select 'brave'"
+        );
+
+        cx.simulate_keystrokes("cmd-c");
+        cx.run_until_parked();
+        let copied = cx.update(|_window, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text().map(|text| text.to_string()))
+        });
+        assert_eq!(copied.as_deref(), Some("brave"));
+
+        let _ = root;
+    }
 }
 
 impl Focusable for Editor {
@@ -1176,8 +1256,10 @@ impl Render for Editor {
         let entity = cx.entity();
         let single_line = self.single_line;
         let wrap_long_lines = self.wrap_long_lines;
+        let hitbox_id = self.hitbox_id.clone();
         div()
             .id(self.hitbox_id.clone())
+            .debug_selector(move || hitbox_id.to_string())
             .flex()
             .key_context("Editor")
             .track_focus(&self.focus_handle(cx))

@@ -117,6 +117,11 @@ impl Theme {
     pub fn scrollbar_thumb() -> Hsla {
         rgba_hex(if Self::is_light() { 0x1c1c21 } else { 0xffffff }, 0.30)
     }
+    /// The highlight under selected message text. Same blue the accent uses,
+    /// translucent, so selected glyphs stay readable on every fill they sit on.
+    pub fn selection() -> Hsla {
+        rgba_hex(if Self::is_light() { 0x276df1 } else { 0x4f8cff }, 0.30)
+    }
     pub fn scrollbar_thumb_active() -> Hsla {
         rgba_hex(if Self::is_light() { 0x1c1c21 } else { 0xffffff }, 0.45)
     }

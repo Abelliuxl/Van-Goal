@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::ui::theme::Theme;
 use gpui::{
     combine_highlights, div, prelude::*, px, relative, AnyElement, Div, FontStyle, FontWeight,
@@ -6,8 +8,28 @@ use gpui::{
 };
 use van_goal_core::markdown::{InlineStyle, MarkdownBlock};
 
+use crate::ui::selectable_text::{SelectableText, SelectionHost};
+
 const MAX_TABLE_COLUMNS: usize = 8;
 const MAX_TABLE_ROWS: usize = 80;
+
+/// Makes one message's markdown blocks selectable, handed down by the chat
+/// view. `None` keeps the plain renderer, which is what tests and non-chat
+/// callers use.
+#[derive(Clone)]
+pub struct SelectionBlock {
+    /// The id of the message the blocks belong to; keys the transcript's
+    /// active selection under, one key per (message, block).
+    pub message_id: String,
+    pub host: Rc<dyn SelectionHost>,
+}
+
+impl SelectionBlock {
+    /// The key one block's selection is stored under.
+    fn key(&self, seed: u64) -> u64 {
+        crate::ui::hash_id(&format!("{}:{}", self.message_id, seed))
+    }
+}
 
 /// Room above a heading, on top of the uniform gap between blocks. Headings are
 /// what a reader navigates by, so they need more air before them than the
@@ -23,7 +45,7 @@ const PARAGRAPH_SPACE: f32 = 4.0;
 
 /// Render parsed markdown blocks as div-based layout. Strings wrap natively;
 /// code blocks scroll horizontally and tables get a simple grid.
-pub fn render_blocks(blocks: &[MarkdownBlock]) -> Div {
+pub fn render_blocks(blocks: &[MarkdownBlock], selection: Option<&SelectionBlock>) -> Div {
     div()
         .w_full()
         .min_w(px(0.0))
@@ -36,14 +58,19 @@ pub fn render_blocks(blocks: &[MarkdownBlock]) -> Div {
                 .w_full()
                 .min_w(px(0.0))
                 .debug_selector(move || format!("markdown-block-{seed}"))
-                .child(render_block(block, seed, index == 0))
+                .child(render_block(block, seed, index == 0, selection))
         }))
 }
 
 /// `is_first` suppresses the space a block would leave above itself. A reply
 /// that opens with a heading should not start with a hole at the top of its
 /// bubble; the gap only exists to separate blocks from each other.
-fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement {
+fn render_block(
+    block: &MarkdownBlock,
+    seed: u64,
+    is_first: bool,
+    selection: Option<&SelectionBlock>,
+) -> AnyElement {
     match block {
         MarkdownBlock::Heading(level, text) => {
             // Sized against the 13px body text: a heading has to read as a
@@ -62,7 +89,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
                 .font_weight(weight)
                 .text_size(Theme::text_px(size))
                 .text_color(Theme::text())
-                .child(render_inline(text, seed))
+                .child(render_inline(text, seed, selection))
                 .into_any()
         }
         MarkdownBlock::Paragraph(text) => div()
@@ -70,7 +97,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
             .my(Theme::text_px(PARAGRAPH_SPACE))
             .text_size(Theme::text_px(13.0))
             .text_color(Theme::text())
-            .child(render_inline(text, seed))
+            .child(render_inline(text, seed, selection))
             .into_any(),
         MarkdownBlock::Bullet(text) => div()
             .min_w(px(0.0))
@@ -89,7 +116,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
-                    .child(render_inline(text, seed)),
+                    .child(render_inline(text, seed, selection)),
             )
             .into_any(),
         MarkdownBlock::Numbered(number, text) => div()
@@ -110,7 +137,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
-                    .child(render_inline(text, seed)),
+                    .child(render_inline(text, seed, selection)),
             )
             .into_any(),
         MarkdownBlock::Quote(text) => div()
@@ -120,7 +147,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
             .pl_2()
             .text_size(Theme::text_px(13.0))
             .text_color(crate::ui::theme::Theme::text_secondary())
-            .child(render_inline(text, seed))
+            .child(render_inline(text, seed, selection))
             .into_any(),
         MarkdownBlock::Code(text) => div()
             .id(gpui::ElementId::NamedInteger(
@@ -139,10 +166,28 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
                     .font_family("Menlo")
                     .text_size(Theme::text_px(12.0))
                     .text_color(crate::ui::theme::Theme::text())
-                    .child(text.clone()),
+                    .child(if let Some(selection) = selection {
+                        SelectableText::new(
+                            gpui::ElementId::NamedInteger(
+                                "code-block-text".into(),
+                                crate::ui::hash_id(text),
+                            ),
+                            selection.key(seed),
+                            text.clone(),
+                            Vec::new(),
+                            Vec::new(),
+                            Some(selection.host.clone()),
+                        )
+                        .without_wrap()
+                        .into_any()
+                    } else {
+                        div().child(text.clone()).into_any()
+                    }),
             )
             .into_any(),
-        MarkdownBlock::Table(headers, rows) => render_table(headers, rows, seed).into_any(),
+        MarkdownBlock::Table(headers, rows) => {
+            render_table(headers, rows, seed, selection).into_any()
+        }
         MarkdownBlock::Separator => div()
             .h(px(1.0))
             .w_full()
@@ -152,7 +197,7 @@ fn render_block(block: &MarkdownBlock, seed: u64, is_first: bool) -> AnyElement 
     }
 }
 
-fn render_inline(source: &str, seed: u64) -> AnyElement {
+fn render_inline(source: &str, seed: u64, selection: Option<&SelectionBlock>) -> AnyElement {
     // Give the text wrapper break opportunities before parsing, so highlight
     // ranges stay aligned with the bytes we actually render.
     let with_breaks = van_goal_core::markdown::add_break_opportunities(source);
@@ -195,6 +240,29 @@ fn render_inline(source: &str, seed: u64) -> AnyElement {
         )
     });
     let highlights = combine_highlights(span_highlights, link_highlights).collect::<Vec<_>>();
+
+    // With a selection host the block becomes mouse-selectable: same runs,
+    // same link handling, one more layer underneath for the highlight.
+    if let Some(selection) = selection {
+        let links = parsed
+            .links
+            .iter()
+            .map(|link| (link.range.clone(), link.url.clone()))
+            .collect::<Vec<_>>();
+        return SelectableText::new(
+            gpui::ElementId::NamedInteger(
+                "markdown-inline".into(),
+                crate::ui::hash_id(source).wrapping_add(seed),
+            ),
+            selection.key(seed),
+            parsed.text,
+            highlights,
+            links,
+            Some(selection.host.clone()),
+        )
+        .into_any();
+    }
+
     let styled = StyledText::new(parsed.text).with_highlights(highlights);
 
     if parsed.links.is_empty() {
@@ -226,7 +294,12 @@ fn render_inline(source: &str, seed: u64) -> AnyElement {
     .into_any()
 }
 
-fn render_table(headers: &[String], rows: &[Vec<String>], seed: u64) -> AnyElement {
+fn render_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    seed: u64,
+    selection: Option<&SelectionBlock>,
+) -> AnyElement {
     let column_count = headers
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0))
@@ -248,6 +321,7 @@ fn render_table(headers: &[String], rows: &[Vec<String>], seed: u64) -> AnyEleme
             0,
             true,
             seed.wrapping_mul(1000),
+            selection,
         )
         .into_any(),
     );
@@ -261,6 +335,7 @@ fn render_table(headers: &[String], rows: &[Vec<String>], seed: u64) -> AnyEleme
                 false,
                 seed.wrapping_mul(1000)
                     .wrapping_add(((row_index + 1) * column_count) as u64),
+                selection,
             )
             .into_any(),
         );
@@ -320,6 +395,7 @@ fn table_row(
     row_index: usize,
     is_header: bool,
     seed: u64,
+    selection: Option<&SelectionBlock>,
 ) -> gpui::Div {
     div()
         .flex()
@@ -334,6 +410,7 @@ fn table_row(
                 is_header,
                 fractions.len(),
                 seed.wrapping_add(column as u64),
+                selection,
             )
         }))
 }
@@ -347,6 +424,7 @@ fn table_cell(
     is_header: bool,
     column_count: usize,
     seed: u64,
+    selection: Option<&SelectionBlock>,
 ) -> gpui::AnyElement {
     let mut cell = div()
         .id(gpui::ElementId::NamedInteger(
@@ -379,7 +457,7 @@ fn table_cell(
     if !is_header {
         cell = cell.border_t_1();
     }
-    cell.child(render_inline(&text, seed)).into_any()
+    cell.child(render_inline(&text, seed, selection)).into_any()
 }
 
 fn cell_text(cells: &[String], index: usize) -> String {
@@ -404,7 +482,7 @@ mod tests {
         ) -> impl IntoElement {
             div()
                 .w(px(600.0))
-                .child(render_blocks(&van_goal_core::markdown::parse(self.0)))
+                .child(render_blocks(&van_goal_core::markdown::parse(self.0), None))
         }
     }
 

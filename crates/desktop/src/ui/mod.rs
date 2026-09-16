@@ -2,6 +2,7 @@ pub mod chat;
 pub mod editor;
 pub mod markdown_view;
 pub mod root;
+pub mod selectable_text;
 pub mod settings_window;
 pub mod sidebar;
 pub mod theme;
