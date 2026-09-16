@@ -1,9 +1,9 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, CursorStyle, Element, ElementId, GlobalElementId,
+    fill, point, px, size, App, Bounds, CursorStyle, Element, ElementId, GlobalElementId,
     HighlightStyle, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, SharedString, TextAlign, TextRun, TextStyle, Window,
     WrappedLine,
@@ -27,10 +27,11 @@ pub trait SelectionHost {
     fn focus_transcript(&self, window: &mut Window, cx: &mut App);
 }
 
-/// The painted row height: a constant grid, like the editor's own text, so the
-/// selection quads and the shaped lines agree without measuring each other.
+/// A point inside the first text row, for tests that probe positions.
+#[cfg(test)]
 const ROW_HEIGHT: f32 = 20.0;
 
+#[cfg(test)]
 fn row_height() -> Pixels {
     px(ROW_HEIGHT)
 }
@@ -58,6 +59,18 @@ pub struct SelectableText {
     /// instead, which is what not wrapping means here.
     wrap: bool,
     host: Option<Rc<dyn SelectionHost>>,
+    /// Shaped once per frame at layout time, when the width is known; prepaint
+    /// and the paint pass reuse it instead of shaping a second time.
+    shaped: Rc<RefCell<Option<ShapedText>>>,
+}
+
+/// The shaped lines and the size they were measured at, shared between the
+/// layout measurement and the paint pass of one frame.
+struct ShapedText {
+    lines: Vec<WrappedLine>,
+    size: gpui::Size<Pixels>,
+    wrap_width: Pixels,
+    line_height: Pixels,
 }
 
 /// One drag, held across frames under the element's id.
@@ -88,6 +101,7 @@ impl SelectableText {
             links,
             wrap: true,
             host,
+            shaped: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -126,13 +140,56 @@ impl Element for SelectableText {
         window: &mut Window,
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // The transcript's variable-height list re-measures the real height at
-        // paint; this estimate only has to be in the right neighbourhood.
-        let rows = self.text.split('\n').count().max(1);
-        let mut style = gpui::Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = (row_height() * rows as f32).into();
-        (window.request_layout(style, [], _cx), ())
+        // Shape at layout time, when the width is known, and report the real
+        // wrapped height — a height guessed from line counts is how wrapped
+        // paragraphs ended up painted over the block below them.
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = text_style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let runs = compute_runs(&self.text, &text_style, &self.highlights);
+        let text = self.text.clone();
+        let wrap = self.wrap;
+        let shaped = self.shaped.clone();
+
+        let layout_id = window.request_measured_layout(Default::default(), {
+            move |known, available, window, _cx| {
+                let wrap_width = if wrap {
+                    known.width.or(match available.width {
+                        gpui::AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                if let Some(shaped) = shaped.borrow().as_ref() {
+                    if shaped.line_height == line_height
+                        && shaped.wrap_width == wrap_width.unwrap_or(px(0.0))
+                    {
+                        return shaped.size;
+                    }
+                }
+                let lines = window
+                    .text_system()
+                    .shape_text(text.clone(), font_size, &runs, wrap_width, None)
+                    .unwrap_or_default();
+                let mut size: gpui::Size<Pixels> = gpui::Size::default();
+                for line in &lines {
+                    let line_size = line.size(line_height);
+                    size.height += line_size.height;
+                    size.width = size.width.max(line_size.width).ceil();
+                }
+                *shaped.borrow_mut() = Some(ShapedText {
+                    lines: lines.to_vec(),
+                    size,
+                    wrap_width: wrap_width.unwrap_or(px(0.0)),
+                    line_height,
+                });
+                size
+            }
+        });
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -144,29 +201,10 @@ impl Element for SelectableText {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = text_style
-            .line_height
-            .to_pixels(font_size.into(), window.rem_size());
-        // Fold the delayed highlights into runs the way `StyledText` does for
-        // its own default style, so the surrounding text style applies.
-        let runs = compute_runs(&self.text, &text_style, &self.highlights);
-        let lines = window
-            .text_system()
-            .shape_text(
-                self.text.clone(),
-                font_size,
-                &runs,
-                self.wrap.then_some(bounds.size.width),
-                None,
-            )
-            .unwrap_or_default();
         let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
         PrepaintState {
-            lines: lines.to_vec(),
+            shaped: self.shaped.clone(),
             hitbox,
-            line_height,
         }
     }
 
@@ -180,10 +218,15 @@ impl Element for SelectableText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_height = prepaint.line_height;
+        let shaped = prepaint.shaped.borrow();
+        let shaped = shaped
+            .as_ref()
+            .expect("paint ran before the layout measurement");
+        let lines = shaped.lines.clone();
+        let line_height = shaped.line_height;
 
         let Some(host) = self.host.clone() else {
-            paint_lines(&prepaint.lines, bounds, line_height, window, cx);
+            paint_lines(&lines, bounds, line_height, window, cx);
             return;
         };
 
@@ -192,17 +235,11 @@ impl Element for SelectableText {
         // quads therefore go down before the lines.
         let selection = host.selection(cx).filter(|(key, _)| *key == self.key);
         if let Some((_, range)) = &selection {
-            for quad in selection_quads(
-                &self.text,
-                &prepaint.lines,
-                range.clone(),
-                bounds,
-                line_height,
-            ) {
+            for quad in selection_quads(&self.text, &lines, range.clone(), bounds, line_height) {
                 window.paint_quad(quad);
             }
         }
-        paint_lines(&prepaint.lines, bounds, prepaint.line_height, window, cx);
+        paint_lines(&lines, bounds, line_height, window, cx);
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.hitbox);
 
         window.with_element_state::<Drag, _>(global_id.unwrap(), |state, window| {
@@ -211,7 +248,7 @@ impl Element for SelectableText {
             // The three listeners share one shaping pass; Rc keeps the captured
             // line layouts cheap to clone into each closure.
             let text = self.text.clone();
-            let lines = Rc::new(prepaint.lines.to_vec());
+            let lines = Rc::new(lines);
             let key = self.key;
             let links = Rc::new(self.links.clone());
             let drag_move = drag.clone();
@@ -298,9 +335,8 @@ impl Element for SelectableText {
 }
 
 pub struct PrepaintState {
-    lines: Vec<WrappedLine>,
+    shaped: Rc<RefCell<Option<ShapedText>>>,
     hitbox: gpui::Hitbox,
-    line_height: Pixels,
 }
 
 fn paint_lines(
@@ -519,21 +555,26 @@ mod tests {
     struct Fixture {
         sink: Rc<FakeSink>,
         text: SharedString,
+        width: f32,
     }
 
     impl Render for Fixture {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(320.0)).h(px(60.0)).child(
-                SelectableText::new(
-                    "probe",
-                    42,
-                    self.text.clone(),
-                    Vec::new(),
-                    Vec::new(),
-                    Some(self.sink.clone()),
+            div()
+                .id("selectable-probe")
+                .debug_selector(|| "selectable-probe".into())
+                .w(px(self.width))
+                .child(
+                    SelectableText::new(
+                        "probe",
+                        42,
+                        self.text.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(self.sink.clone()),
+                    )
+                    .into_any(),
                 )
-                .into_any(),
-            )
         }
     }
 
@@ -546,6 +587,7 @@ mod tests {
         let (root, cx) = cx.add_window_view(|_window, _cx| Fixture {
             sink: sink.clone(),
             text: text.clone(),
+            width: 320.0,
         });
         for _ in 0..3 {
             cx.update(|window, _cx| window.refresh());
@@ -594,6 +636,35 @@ mod tests {
         assert!(
             sink.stored.borrow().is_none(),
             "selection survived a click outside the block"
+        );
+    }
+
+    /// A block that wraps must report the height of every wrapped row. The
+    /// height used to be guessed from the *logical* line count, so a paragraph
+    /// that wrapped onto six rows claimed one and painted over the block below
+    /// it — the transcript read as overlapping garbage.
+    #[gpui::test]
+    fn wrapped_blocks_measure_the_rows_they_need(cx: &mut TestAppContext) {
+        let sink = Rc::new(FakeSink::default());
+        let text = SharedString::from("一".repeat(240));
+        let (_root, cx) = cx.add_window_view(|_window, _cx| Fixture {
+            sink: sink.clone(),
+            text,
+            width: 220.0,
+        });
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+        let bounds = cx
+            .debug_bounds("selectable-probe")
+            .unwrap_or_else(|| panic!("probe was not laid out"));
+
+        // 240 CJK characters in a 220px column need far more than two rows.
+        assert!(
+            f32::from(bounds.size.height) > 8.0 * 20.0,
+            "wrapped block claimed only {}px of height",
+            bounds.size.height
         );
     }
 }
