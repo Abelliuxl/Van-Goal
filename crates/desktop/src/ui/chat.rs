@@ -18,7 +18,7 @@ use van_goal_core::models::{
     compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
 };
 
-actions!(chat, [CopySelection]);
+actions!(chat, [CopySelection, QuoteSelection]);
 
 /// Smallest overlay-scrollbar thumb, as a fraction of the track.
 const MIN_THUMB_FRACTION: f32 = 0.06;
@@ -150,9 +150,23 @@ pub struct ChatView {
     transcript_focus_handle: FocusHandle,
     /// The one active text selection across every block the transcript draws.
     text_selection: Option<TextSelection>,
+    /// The right-click menu for the current selection, positioned relative to
+    /// the view.
+    context_menu: Option<ContextMenu>,
+    /// Origin of this view in window coordinates, recorded at paint so a
+    /// window-coordinate event can be turned into a view-relative one.
+    view_origin: Option<gpui::Point<Pixels>>,
+}
+
+/// The small popup a right-click on a selection opens.
+#[derive(Clone)]
+struct ContextMenu {
+    position: gpui::Point<Pixels>,
+    text: String,
 }
 
 /// What a selected range in one markdown block holds while it is live.
+#[derive(Clone)]
 struct TextSelection {
     /// Which block the selection belongs to: a SelectableText only paints a
     /// range whose key matches its own.
@@ -251,6 +265,8 @@ impl ChatView {
             list_synced: false,
             transcript_focus_handle: cx.focus_handle(),
             text_selection: None,
+            context_menu: None,
+            view_origin: None,
         }
     }
 
@@ -594,28 +610,61 @@ impl ChatView {
         }
         cx.notify();
     }
+
+    /// Quote the selected text into the composer: `----` above it, so the next
+    /// prompt opens with what the agent is being asked to look at.
+    fn quote_text_selection(
+        &mut self,
+        _: &QuoteSelection,
+        _: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.text_selection.take() else {
+            return;
+        };
+        if selection.text.is_empty() {
+            return;
+        }
+        self.context_menu = None;
+        let quoted = format!("----\n{}\n", selection.text);
+        self.editor.update(cx, |editor, cx| {
+            let draft = editor.text().to_string();
+            let combined = if draft.trim().is_empty() {
+                quoted
+            } else {
+                format!("{quoted}{draft}")
+            };
+            editor.set_text(combined, cx);
+        });
+        cx.notify();
+    }
 }
 
 /// The transcript is the selection's home: every selectable markdown block
 /// stores and reads its range through here.
 impl SelectionHost for Entity<ChatView> {
-    fn selection(&self, cx: &gpui::App) -> Option<(u64, std::ops::Range<usize>)> {
-        self.read(cx)
-            .text_selection
-            .as_ref()
-            .map(|selection| (selection.key, selection.range.clone()))
+    fn selection(&self, cx: &gpui::App) -> Option<(u64, std::ops::Range<usize>, String)> {
+        self.read(cx).text_selection.as_ref().map(|selection| {
+            (
+                selection.key,
+                selection.range.clone(),
+                selection.text.clone(),
+            )
+        })
     }
 
     fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut gpui::App) {
         self.update(cx, |chat, cx| {
             chat.text_selection = Some(TextSelection { key, range, text });
+            chat.context_menu = None;
             cx.notify();
         });
     }
 
     fn clear_selection(&self, cx: &mut gpui::App) {
         self.update(cx, |chat, cx| {
-            if chat.text_selection.take().is_some() {
+            chat.text_selection.take();
+            if chat.context_menu.take().is_some() {
                 cx.notify();
             }
         });
@@ -626,6 +675,88 @@ impl SelectionHost for Entity<ChatView> {
             let handle = chat.transcript_focus_handle.clone();
             window.focus(&handle);
         });
+    }
+
+    fn open_context_menu(&self, position: gpui::Point<Pixels>, text: String, cx: &mut gpui::App) {
+        self.update(cx, |chat, cx| {
+            if text.is_empty() {
+                return;
+            }
+            // The event reports window coordinates; the menu is drawn inside
+            // the transcript, so it is stored relative to the view's origin.
+            let view_origin = chat.view_origin.unwrap_or_default();
+            chat.context_menu = Some(ContextMenu {
+                position: gpui::point(position.x - view_origin.x, position.y - view_origin.y),
+                text,
+            });
+            cx.notify();
+        });
+    }
+}
+
+impl ChatView {
+    /// The copy / quote popup for the active selection, drawn inside the
+    /// transcript at the right-click position.
+    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.context_menu.clone()?;
+        let chat = cx.entity();
+        let menu_for_close = chat.clone();
+        Some(
+            div()
+                .id("selection-context-menu")
+                .debug_selector(|| "selection-context-menu".into())
+                .absolute()
+                .left(menu.position.x)
+                .top((menu.position.y + px(8.0)).min(px(600.0)))
+                .w(px(120.0))
+                .rounded_md()
+                .border_1()
+                .border_color(Theme::border_strong())
+                .bg(Theme::surface())
+                .shadow_sm()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("menu-copy-selection")
+                        .px_2()
+                        .py_1()
+                        .text_size(Theme::text_px(12.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(Theme::surface_hover()))
+                        .on_click(move |_event, _window, cx| {
+                            // The menu carries the text it opened for: the
+                            // selection under the pointer may have moved on.
+                            menu_for_close.update(cx, |chat, cx| {
+                                if !menu.text.is_empty() {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        menu.text.clone(),
+                                    ));
+                                }
+                                chat.context_menu = None;
+                                cx.notify();
+                            });
+                        })
+                        .child("Copy"),
+                )
+                .child(
+                    div()
+                        .id("menu-quote-selection")
+                        .px_2()
+                        .py_1()
+                        .text_size(Theme::text_px(12.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(Theme::surface_hover()))
+                        .on_click(move |_event, window, cx| {
+                            chat.update(cx, |chat, cx| {
+                                chat.quote_text_selection(&QuoteSelection, window, cx);
+                            });
+                        })
+                        .child("Quote"),
+                )
+                .into_any(),
+        )
     }
 }
 
@@ -653,9 +784,80 @@ impl Render for ChatView {
             .flex_col()
             .bg(Theme::window_bg())
             .text_color(Theme::text())
+            // The origin probe sits at the top of the view so a mouse event
+            // reported in window coordinates can be drawn in view coordinates.
+            .child(OriginProbe { chat: cx.entity() })
             .child(self.render_message_list(cx))
             .children(self.render_clarify_card(cx))
             .child(self.render_composer(cx))
+            .children(self.render_context_menu(cx))
+    }
+}
+
+/// A zero-height marker at the top of the view that records the view's origin
+/// in window coordinates at paint, for turning window-coordinate events into
+/// view-relative positions.
+struct OriginProbe {
+    chat: Entity<ChatView>,
+}
+
+impl IntoElement for OriginProbe {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for OriginProbe {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.).into();
+        style.size.height = px(0.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) {
+        self.chat.update(cx, |chat, _cx| {
+            chat.view_origin = Some(bounds.origin);
+        });
     }
 }
 

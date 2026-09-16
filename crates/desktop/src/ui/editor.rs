@@ -526,20 +526,6 @@ impl Editor {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
     }
-
-    fn estimated_rows(&self) -> usize {
-        if self.single_line && !self.wrap_long_lines {
-            return 1;
-        }
-        let logical_lines = self.content.split('\n').count().max(1);
-        // Rough wrap estimate: ~90 columns per row.
-        let wraps: usize = self
-            .content
-            .split('\n')
-            .map(|line| line.len().saturating_sub(1) / 90)
-            .sum();
-        (logical_lines + wraps).max(1)
-    }
 }
 
 fn normalize_single_line(text: &str) -> String {
@@ -827,6 +813,97 @@ mod tests {
 
         let _ = root;
     }
+
+    /// A drag that starts on one wrapped row and ends on the next must select
+    /// only the span between the two points. Reported broken: crossing rows
+    /// selected all the way to the end of the content.
+    #[gpui::test]
+    fn mouse_drag_across_wrapped_rows_selects_only_the_span(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(cx);
+            // Long enough to wrap at 320px: "brave" is on the first wrapped
+            // row, and a later byte lands on the second.
+            editor.set_text("hello brave world and hello brave world again", cx);
+            editor
+        });
+        struct EditorRoot(Entity<Editor>);
+        impl Render for EditorRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().w(px(320.0)).h(px(80.0)).child(self.0.clone())
+            }
+        }
+        let (root, cx) = cx.add_window_view(|_window, _cx| EditorRoot(editor.clone()));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let hitbox: &'static str = Box::leak(
+            editor
+                .read_with(cx, |editor, _cx| editor.hitbox_id.clone())
+                .to_string()
+                .into_boxed_str(),
+        );
+        let bounds = cx
+            .debug_bounds(&hitbox)
+            .unwrap_or_else(|| panic!("{hitbox} was not laid out"));
+        let modifiers = gpui::Modifiers::default();
+
+        // One probe point on the first wrapped row, and the first byte of the
+        // row after it, taken from the shaped layout.
+        let (start, end) = editor.read_with(cx, |editor, _cx| {
+            let line_height = px(row_height());
+            let entry = &editor.lines[0];
+            let mut first = None;
+            let mut second = None;
+            for byte in 0..entry.line.len() {
+                if let Some(point) = entry.line.position_for_index(byte, line_height) {
+                    if point.y < line_height {
+                        if first.is_none() {
+                            first = Some((byte, point));
+                        }
+                    } else if second.is_none() {
+                        second = Some((byte, point));
+                        break;
+                    }
+                }
+            }
+            (
+                first.expect("first row had no probe point"),
+                second.expect("the content did not wrap onto a second row"),
+            )
+        });
+        let at = |local: gpui::Point<Pixels>| {
+            gpui::point(
+                bounds.origin.x + local.x,
+                bounds.origin.y + local.y + px(row_height() / 2.0),
+            )
+        };
+        println!("bounds={bounds:?} start={start:?} end={end:?}");
+        println!(
+            "wrap_boundaries={:?}",
+            editor.read_with(cx, |e, _cx| { e.lines[0].line.wrap_boundaries().len() })
+        );
+
+        cx.simulate_mouse_down(at(start.1), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(at(end.1), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(at(end.1), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+
+        let (content, selected, _) = editor_state(&editor, cx);
+        assert_eq!(selected.start, start.0, "anchor moved");
+        assert_eq!(selected.end, end.0, "the drag ran past the second row");
+        assert!(
+            selected.end < content.len(),
+            "crossing rows selected to the end of the content"
+        );
+
+        let _ = root;
+    }
 }
 
 impl Focusable for Editor {
@@ -1021,12 +1098,54 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let editor = self.entity.read(cx);
-        let rows = editor.estimated_rows().clamp(1, 8);
+        // The height comes from shaping at the real width: a rough guess from
+        // character counts is how a wrapped second row ended up painted below
+        // a one-row-tall box, outside its own hitbox — clicks and drags on
+        // that row then went nowhere, and a drag that crossed a row seemed to
+        // select the wrong span.
+        let content = self.entity.read(cx).content.clone();
+        let single_line = self.entity.read(cx).single_line;
+        let wrap_long_lines = self.entity.read(cx).wrap_long_lines;
+        let text_style = window.text_style();
+        let font = text_style.font();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = px(row_height());
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = px(row_height() * rows as f32).into();
-        (window.request_layout(style, [], cx), ())
+
+        let layout_id = window.request_measured_layout(style, {
+            move |known, available, window, _cx| {
+                let rows = if content.is_empty() || (single_line && !wrap_long_lines) {
+                    1
+                } else {
+                    let width = known.width.or(match available.width {
+                        gpui::AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    });
+                    let run = TextRun {
+                        len: content.len(),
+                        font: font.clone(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let wrapped = window
+                        .text_system()
+                        .shape_text(content.clone().into(), font_size, &[run], width, None)
+                        .unwrap_or_default();
+                    wrapped
+                        .iter()
+                        .map(|line| line.wrap_boundaries().len() + 1)
+                        .sum::<usize>()
+                };
+                gpui::Size::new(
+                    known.width.unwrap_or(px(0.0)),
+                    line_height * rows.max(1).min(8) as f32,
+                )
+            }
+        });
+        (layout_id, ())
     }
 
     fn prepaint(

@@ -16,8 +16,8 @@ use crate::ui::theme::Theme;
 /// Implemented on the transcript view: one selection is active at a time, and
 /// clicking another block replaces it instead of leaving two highlights.
 pub trait SelectionHost {
-    /// The active selection's key and byte range, if any.
-    fn selection(&self, cx: &App) -> Option<(u64, Range<usize>)>;
+    /// The active selection's key, byte range and rendered text, if any.
+    fn selection(&self, cx: &App) -> Option<(u64, Range<usize>, String)>;
     /// Replace the active selection with this one and request a redraw.
     fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut App);
     /// Drop the active selection and request a redraw.
@@ -25,6 +25,9 @@ pub trait SelectionHost {
     /// Take focus, so a following ⌘C reaches the transcript's copy action
     /// instead of the composer's.
     fn focus_transcript(&self, window: &mut Window, cx: &mut App);
+    /// Right-click on a selection: open the transcript's context menu for it.
+    /// `position` is in window coordinates.
+    fn open_context_menu(&self, position: gpui::Point<Pixels>, text: String, cx: &mut App);
 }
 
 /// A point inside the first text row, for tests that probe positions.
@@ -233,8 +236,8 @@ impl Element for SelectableText {
         // The highlight underneath the text has to be painted first, and this
         // element's text is painted in this same paint pass: the selection
         // quads therefore go down before the lines.
-        let selection = host.selection(cx).filter(|(key, _)| *key == self.key);
-        if let Some((_, range)) = &selection {
+        let selection = host.selection(cx).filter(|(key, _, _)| *key == self.key);
+        if let Some((_, range, _)) = &selection {
             for quad in selection_quads(&self.text, &lines, range.clone(), bounds, line_height) {
                 window.paint_quad(quad);
             }
@@ -260,6 +263,20 @@ impl Element for SelectableText {
                 let lines = lines.clone();
                 let host = host.clone();
                 move |event: &MouseDownEvent, phase, window, cx| {
+                    if event.button == MouseButton::Right {
+                        // The menu is for the selection: a right-click over a
+                        // block with an active selection of its own opens the
+                        // copy / quote menu at the pointer.
+                        if phase.bubble() && hitbox.is_hovered(window) {
+                            if let Some((selection_key, _, text)) = host.selection(cx) {
+                                if selection_key == key {
+                                    host.open_context_menu(event.position, text, cx);
+                                    window.prevent_default();
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if event.button != MouseButton::Left {
                         return;
                     }
@@ -534,11 +551,11 @@ mod tests {
     }
 
     impl SelectionHost for FakeSink {
-        fn selection(&self, _cx: &App) -> Option<(u64, Range<usize>)> {
+        fn selection(&self, _cx: &App) -> Option<(u64, Range<usize>, String)> {
             self.stored
                 .borrow()
                 .as_ref()
-                .map(|(key, range, _)| (*key, range.clone()))
+                .map(|(key, range, text)| (*key, range.clone(), text.clone()))
         }
 
         fn set_selection(&self, key: u64, range: Range<usize>, text: String, _cx: &mut App) {
@@ -550,6 +567,8 @@ mod tests {
         }
 
         fn focus_transcript(&self, _window: &mut Window, _cx: &mut App) {}
+
+        fn open_context_menu(&self, _position: gpui::Point<Pixels>, _text: String, _cx: &mut App) {}
     }
 
     struct Fixture {
