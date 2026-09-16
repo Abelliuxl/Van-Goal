@@ -2617,6 +2617,23 @@ mod message_width_tests {
         cx: &'a mut TestAppContext,
         messages: Vec<(MessageRole, &str)>,
     ) -> &'a mut VisualTestContext {
+        render_sized(cx, messages, 900.0)
+    }
+
+    /// A transcript at the real window's width, where the bubble cap is wider
+    /// than the pane and the bubble has to follow the pane.
+    fn render_narrow<'a>(
+        cx: &'a mut TestAppContext,
+        messages: Vec<(MessageRole, &str)>,
+    ) -> &'a mut VisualTestContext {
+        render_sized(cx, messages, 627.0)
+    }
+
+    fn render_sized<'a>(
+        cx: &'a mut TestAppContext,
+        messages: Vec<(MessageRole, &str)>,
+        width: f32,
+    ) -> &'a mut VisualTestContext {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
@@ -2627,8 +2644,23 @@ mod message_width_tests {
                     .collect(),
             );
         });
+        struct Sized(Entity<ChatView>, f32);
+        impl Render for Sized {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .w(px(self.1))
+                    .h(px(600.0))
+                    .flex()
+                    .flex_col()
+                    .child(self.0.clone())
+            }
+        }
         let (_host, cx) =
-            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+            cx.add_window_view(|_window, cx| Sized(cx.new(|cx| ChatView::new(state, cx)), width));
         cx.run_until_parked();
         cx
     }
@@ -2696,6 +2728,29 @@ mod message_width_tests {
             f32::from(bubble.size.width) < USER_BUBBLE_MAX_WIDTH,
             "capping the text must not stretch a short bubble to the full width: {}",
             f32::from(bubble.size.width)
+        );
+    }
+
+    /// A long prompt in a window narrower than the bubble's own cap: the
+    /// bubble used to lay out at the cap (640) regardless of the transcript's
+    /// width and stick out past both window edges.
+    #[gpui::test]
+    fn a_long_prompt_bubble_stays_within_a_narrow_transcript(cx: &mut TestAppContext) {
+        let prompt = "已".repeat(300);
+        let cx = render_narrow(
+            cx,
+            vec![(MessageRole::User, &prompt), (MessageRole::Assistant, "ok")],
+        );
+
+        let bubble = cx.debug_bounds("user-bubble-0").expect("bubble");
+        let area = cx
+            .debug_bounds("chat-message-scroll-area")
+            .expect("scroll area was not laid out");
+        assert!(
+            f32::from(bubble.size.width) <= f32::from(area.size.width) + 0.5,
+            "user bubble is {}px wide but the transcript is {}px",
+            f32::from(bubble.size.width),
+            f32::from(area.size.width)
         );
     }
 

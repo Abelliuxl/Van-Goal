@@ -178,7 +178,6 @@ fn render_block(
                             Vec::new(),
                             Some(selection.host.clone()),
                         )
-                        .without_wrap()
                         .into_any()
                     } else {
                         div().child(text.clone()).into_any()

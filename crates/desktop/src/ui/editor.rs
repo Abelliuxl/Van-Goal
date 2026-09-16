@@ -1141,7 +1141,7 @@ impl Element for EditorElement {
                 };
                 gpui::Size::new(
                     known.width.unwrap_or(px(0.0)),
-                    line_height * rows.max(1).min(8) as f32,
+                    line_height * rows.clamp(1, 8) as f32,
                 )
             }
         });
