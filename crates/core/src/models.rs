@@ -96,6 +96,15 @@ pub struct AgentSession {
     pub profile: Option<String>,
     #[serde(default)]
     pub backend_id: Option<String>,
+    /// Tokens this session's context is currently holding, as the backend
+    /// reports it. `None` when the backend says nothing, which is not the same
+    /// as zero: the frontends fall back to an estimate and mark it as one,
+    /// rather than presenting a guess as a measurement.
+    #[serde(default)]
+    pub used_tokens: Option<i64>,
+    /// The context window this session's model has, as the backend reports it.
+    #[serde(default)]
+    pub context_tokens: Option<i64>,
 }
 
 impl AgentSession {
@@ -159,9 +168,33 @@ impl ComposerAttachment {
 pub struct ContextUsage {
     pub used_tokens: i64,
     pub max_tokens: i64,
+    /// Whether the backend reported these numbers, or the client estimated them
+    /// from the text it holds. A guess is worth showing — it is the only thing
+    /// available on a backend that reports nothing — but it must not be drawn
+    /// as if it were measured, so the frontends mark it.
+    pub measured: bool,
 }
 
 impl ContextUsage {
+    /// The numbers a backend reported for this session.
+    pub fn measured(used_tokens: i64, max_tokens: i64) -> Self {
+        Self {
+            used_tokens,
+            max_tokens,
+            measured: true,
+        }
+    }
+
+    /// The numbers a frontend worked out for itself, which the backend has not
+    /// confirmed.
+    pub fn estimated(used_tokens: i64, max_tokens: i64) -> Self {
+        Self {
+            used_tokens,
+            max_tokens,
+            measured: false,
+        }
+    }
+
     pub fn ratio(&self) -> f32 {
         if self.max_tokens <= 0 {
             return 0.0;

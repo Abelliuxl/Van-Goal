@@ -142,6 +142,9 @@ impl HermesBackend {
                 archived: session.archived,
                 profile: session.profile,
                 backend_id: None,
+                // Neither backend reports a session's token accounting yet.
+                used_tokens: None,
+                context_tokens: None,
             })
             .collect())
     }

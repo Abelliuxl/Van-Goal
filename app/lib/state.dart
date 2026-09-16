@@ -125,6 +125,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   LinkState link = LinkState.offline;
   String? linkDetail;
 
+  /// The connection was up and is being brought back: a retry loop is running,
+  /// not a first connect. The header says "reconnecting" while it runs, and the
+  /// errors of individual attempts do not flip the state to failed — the app
+  /// has not failed to connect, it is in the middle of doing it again.
+  bool reconnecting = false;
+
+  /// A refresh of the session list and the open conversation is in flight, so
+  /// the refresh button can show that it did something.
+  bool refreshing = false;
+  Completer<void>? _pendingRefresh;
+
   Backend backend = Backend.openclaw;
   String host = '';
   int port = Backend.openclaw.defaultPort;
@@ -285,7 +296,18 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  void refreshSessions() => _core.send({'cmd': 'list_sessions'});
+  /// Refresh everything the screen is drawn from: the session list and the
+  /// open conversation as the backend has them now.
+  ///
+  /// Returns a future that completes when the backend has answered, so a pull
+  /// to refresh keeps its spinner up until the data is actually here.
+  Future<void> refreshAll() {
+    _pendingRefresh ??= Completer<void>();
+    refreshing = true;
+    notifyListeners();
+    _core.send({'cmd': 'refresh'});
+    return _pendingRefresh!.future;
+  }
 
   void openSession(String id) {
     messages = const [];
@@ -356,8 +378,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _applySettings(event);
       case 'sessions':
         sessions = _readSessions(event['items']);
+        _finishRefresh();
       case 'sessions_changed':
-        refreshSessions();
+        refreshAll();
       case 'transcript':
         messages = _readTranscript(event['items']);
         sending = event['sending'] == true;
@@ -374,11 +397,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       case 'error':
         error = (event['message'] as String?) ?? 'unknown error';
         sending = false;
+        _finishRefresh();
         // A connection that never came up must not sit on "connecting" forever.
-        if (link == LinkState.connecting) {
+        // A retry loop that is on its way back is different: it has not failed,
+        // it is trying again, and its per-attempt errors stay in the banner
+        // that a successful reconnect clears.
+        if (link == LinkState.connecting && !reconnecting) {
           link = LinkState.failed;
           linkDetail = error;
         }
+    }
+  }
+
+  void _finishRefresh() {
+    refreshing = false;
+    final pending = _pendingRefresh;
+    _pendingRefresh = null;
+    if (pending != null && !pending.isCompleted) {
+      pending.complete();
     }
   }
 
@@ -389,9 +425,18 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       case 'connected':
         link = LinkState.online;
         linkDetail = null;
-        // A fresh connection has no idea what exists on the other end.
-        refreshSessions();
+        // A fresh connection has no idea what exists on the other end, and the
+        // errors that got the app here describe a problem that is gone. The
+        // notice the user watched during the outage has no reason to outlive
+        // the connection it was complaining about.
+        reconnecting = false;
+        error = null;
+        refreshAll();
       case 'disconnected':
+        // Only a loss the user did not ask for starts the reconnecting state;
+        // the header keeps saying so while the retry loop brings the
+        // connection back.
+        reconnecting = link == LinkState.online;
         link = LinkState.offline;
     }
   }

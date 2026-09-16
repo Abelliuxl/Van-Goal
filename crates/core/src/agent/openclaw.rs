@@ -69,26 +69,7 @@ impl OpenClawBackend {
             .or_else(|| result.get("items").and_then(|i| i.as_array()))
             .cloned()
             .unwrap_or_default();
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let key = json_str(row, "key").or_else(|| json_str(row, "sessionKey"))?;
-                Some(AgentSession {
-                    id: key,
-                    title: json_str(row, "title").or_else(|| json_str(row, "displayName")),
-                    cwd: None,
-                    model: json_str(row, "model"),
-                    provider: Some("OpenClaw".into()),
-                    started_at: None,
-                    last_active: None,
-                    message_count: super::json_i64(row, "messageCount"),
-                    is_active: None,
-                    archived: Some(false),
-                    profile: None,
-                    backend_id: None,
-                })
-            })
-            .collect())
+        Ok(rows.iter().filter_map(session_from_row).collect())
     }
 
     pub async fn messages(
@@ -321,6 +302,34 @@ pub fn forget_device_token(base_url: &str) -> bool {
         return false;
     };
     OpenClawDeviceIdentity::forget_device_token(&url.to_string()).unwrap_or(false)
+}
+
+/// One row of `sessions.list` as a session, or nothing when it names no session.
+///
+/// A row carries the session's context accounting, so the client does not have
+/// to guess at it: `totalTokens` is what the context is holding and
+/// `contextTokens` is the width of the window its model has. Both are optional
+/// because a Gateway is free to leave them out, and "not reported" has to stay
+/// distinguishable from zero — a frontend shows an estimate for the first and
+/// must not present it as the second.
+fn session_from_row(row: &serde_json::Value) -> Option<AgentSession> {
+    let key = json_str(row, "key").or_else(|| json_str(row, "sessionKey"))?;
+    Some(AgentSession {
+        id: key,
+        title: json_str(row, "title").or_else(|| json_str(row, "displayName")),
+        cwd: None,
+        model: json_str(row, "model"),
+        provider: Some("OpenClaw".into()),
+        started_at: None,
+        last_active: None,
+        message_count: super::json_i64(row, "messageCount"),
+        is_active: None,
+        archived: Some(false),
+        profile: None,
+        backend_id: None,
+        used_tokens: super::json_i64(row, "totalTokens"),
+        context_tokens: super::json_i64(row, "contextTokens"),
+    })
 }
 
 fn sessions_create_params(key: &str) -> serde_json::Value {
@@ -992,7 +1001,8 @@ mod tests {
     use super::{
         chat_send_params, is_for_active_session, is_unexpected_property_error,
         legacy_chat_send_params, legacy_session_messages_subscribe_params, payload_session_key,
-        proposed_session_key, session_messages_subscribe_params, sessions_create_params,
+        proposed_session_key, session_from_row, session_messages_subscribe_params,
+        sessions_create_params,
     };
     use crate::agent::device_identity::{OPENCLAW_DISPLAY_NAME, OPENCLAW_SESSION_NAMESPACE};
     use std::sync::{Arc, Mutex};
@@ -1156,5 +1166,49 @@ mod tests {
             assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Desktop");
             assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-desktop");
         }
+    }
+
+    /// A `sessions.list` row as captured off a live Gateway, trimmed to the
+    /// fields the client reads. The context accounting is the part that matters
+    /// here: it is what the status bar shows instead of a guess, and the two
+    /// numbers are the row's, not the client's.
+    #[test]
+    fn a_session_row_carries_its_own_context_accounting() {
+        let row = serde_json::json!({
+            "key": "agent:main:van-goal-desktop:0ec3c05b",
+            "displayName": "Van-Goal Desktop",
+            "model": "deepseek/deepseek-v4.1-flash",
+            "messageCount": 12,
+            "totalTokens": 36393,
+            "contextTokens": 1048576,
+            "status": "done"
+        });
+        let session = session_from_row(&row).expect("the row names a session");
+        assert_eq!(session.id, "agent:main:van-goal-desktop:0ec3c05b");
+        assert_eq!(
+            session.model.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+        assert_eq!(session.used_tokens, Some(36_393));
+        assert_eq!(session.context_tokens, Some(1_048_576));
+    }
+
+    /// A Gateway that reports nothing must leave both unset rather than zero:
+    /// the frontends show an estimate for an unset value and must never draw it
+    /// as a measured zero.
+    #[test]
+    fn a_row_that_reports_no_accounting_leaves_it_unset() {
+        let row = serde_json::json!({ "key": "agent:main:van-goal-desktop:1", "model": "m" });
+        let session = session_from_row(&row).expect("the row names a session");
+        assert_eq!(session.used_tokens, None);
+        assert_eq!(session.context_tokens, None);
+    }
+
+    /// A row with no key names no session and is skipped, so a Gateway that
+    /// changes shape cannot produce a session with an empty id that every other
+    /// session would then be compared against.
+    #[test]
+    fn a_row_without_a_key_is_not_a_session() {
+        assert!(session_from_row(&serde_json::json!({ "model": "m" })).is_none());
     }
 }

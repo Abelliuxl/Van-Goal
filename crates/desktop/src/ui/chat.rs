@@ -7,8 +7,11 @@ use gpui::{
     InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
 };
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 use van_goal_core::markdown;
+use van_goal_core::markdown::MarkdownBlock;
 use van_goal_core::models::{
     compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
 };
@@ -129,6 +132,15 @@ pub struct ChatView {
     copied_message: Option<String>,
     /// Pending reset of `copied_message`.
     copied_reset_task: Option<gpui::Task<()>>,
+    /// Parsed markdown per message id. Parsing is instant but rebuilding the
+    /// div tree is not, and render reads every visible message every frame;
+    /// a reply that has not changed since the last frame reuses its blocks.
+    /// Cleared when another session is opened.
+    markdown_memo: HashMap<String, (String, Rc<Vec<MarkdownBlock>>)>,
+    /// Whether the list bookkeeping has run for the state ChatView was created
+    /// with: the observer only fires on later changes, so the first render
+    /// calls the sync once itself.
+    list_synced: bool,
 }
 
 impl ChatView {
@@ -145,6 +157,10 @@ impl ChatView {
                     editor.set_text(composer_text, cx);
                 });
             }
+            // The list bookkeeping lives here rather than in render: keeping
+            // `ListState` in step with the message vec is a reaction to the
+            // state having changed, not something a frame should decide.
+            this.sync_list_state(cx);
             cx.notify();
         })
         .detach();
@@ -169,7 +185,7 @@ impl ChatView {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let _ = this.update(cx, |this, cx| {
-                let busy = this.state.read(cx).is_sending;
+                let busy = this.state.read(cx).is_sending();
                 if busy {
                     cx.notify();
                 }
@@ -203,6 +219,8 @@ impl ChatView {
             copy_hide_task: None,
             copied_message: None,
             copied_reset_task: None,
+            markdown_memo: HashMap::new(),
+            list_synced: false,
         }
     }
 
@@ -211,6 +229,94 @@ impl ChatView {
     const COPY_HIDE_DELAY: Duration = Duration::from_millis(700);
     /// How long the checkmark stays before the button returns to the copy icon.
     const COPY_CONFIRMATION: Duration = Duration::from_millis(1400);
+
+    /// The markdown of one message, parsed at most once per change.
+    ///
+    /// Parsing is instant but rebuilding the div tree is not, and render reads
+    /// every visible message every frame; a reply that has not changed since
+    /// the last frame reuses its blocks.
+    fn markdown_blocks(
+        &mut self,
+        message: &van_goal_core::models::ChatMessage,
+    ) -> Rc<Vec<MarkdownBlock>> {
+        if let Some((cached_content, blocks)) = self.markdown_memo.get(&message.id) {
+            if *cached_content == message.content {
+                return blocks.clone();
+            }
+        }
+        let blocks = Rc::new(markdown::parse(&message.content));
+        if self.markdown_memo.len() >= 512 {
+            self.markdown_memo.clear();
+        }
+        self.markdown_memo.insert(
+            message.id.clone(),
+            (message.content.clone(), blocks.clone()),
+        );
+        blocks
+    }
+
+    /// Keep the variable-height list measurements in sync with the message
+    /// vec. Runs when the app state changes, not inside render: render reads
+    /// and the observer reacts.
+    ///
+    /// Following the streaming bubble is not done here: a bottom-aligned list
+    /// keeps the newest message in view by itself, and only stops doing so once
+    /// the user scrolls away.
+    fn sync_list_state(&mut self, cx: &mut Context<Self>) {
+        let signature = self.scroll_signature(cx);
+        let identity = self.list_identity(cx);
+        let (message_count, is_streaming) = {
+            let state = self.state.read(cx);
+            (
+                state.messages().len(),
+                state
+                    .messages()
+                    .last()
+                    .map(|m| m.is_streaming)
+                    .unwrap_or(false),
+            )
+        };
+
+        let mut scroll_to_latest = false;
+        if identity != self.last_list_identity {
+            // Different session: rebuild the list. Bottom alignment already
+            // opens on its newest message, so this needs no follow-up scroll.
+            self.last_list_identity = identity;
+            self.last_list_count = message_count;
+            self.list_state.reset(message_count);
+            self.last_scroll_signature = signature;
+            // Every bubble in the old session is out of scope.
+            self.markdown_memo.clear();
+        } else if message_count != self.last_list_count {
+            let old_count = self.last_list_count;
+            self.last_list_count = message_count;
+            if message_count > old_count {
+                // Append the new messages instead of re-splicing the whole
+                // range: re-splicing threw every measured height away, which is
+                // why a send while scrolled up left the view where it was.
+                self.list_state
+                    .splice(old_count..old_count, message_count - old_count);
+                // Sending a prompt always snaps the view to the new message.
+                scroll_to_latest = self
+                    .state
+                    .read(cx)
+                    .messages()
+                    .get(old_count..)
+                    .is_some_and(|added| added.iter().any(|m| m.role == MessageRole::User));
+            } else {
+                self.list_state.splice(0..old_count, message_count);
+            }
+        } else if signature != self.last_scroll_signature && is_streaming && message_count > 0 {
+            // The bubble is still growing, so the height the list recorded for
+            // it is stale. Re-splicing the last item is what re-measures it.
+            self.list_state.splice(message_count - 1..message_count, 1);
+        }
+        self.last_scroll_signature = signature;
+        if scroll_to_latest {
+            self.scroll_to_latest();
+        }
+        self.list_synced = true;
+    }
 
     /// Reveal or hide the copy button for a message. Leaving starts a timer
     /// rather than hiding at once: the button sits away from the text, so an
@@ -270,8 +376,8 @@ impl ChatView {
 
     fn scroll_signature(&self, cx: &Context<Self>) -> u64 {
         let state = self.state.read(cx);
-        let mut signature: u64 = state.messages.len() as u64;
-        if let Some(last) = state.messages.last() {
+        let mut signature: u64 = state.messages().len() as u64;
+        if let Some(last) = state.messages().last() {
             signature = signature
                 .wrapping_mul(31)
                 .wrapping_add(last.content.len() as u64)
@@ -452,61 +558,12 @@ impl Render for ChatView {
             window.on_next_frame(move |window, _cx| window.focus(&handle));
         }
 
-        let signature = self.scroll_signature(cx);
-        let identity = self.list_identity(cx);
-        let (message_count, is_streaming) = {
-            let state = self.state.read(cx);
-            (
-                state.messages.len(),
-                state
-                    .messages
-                    .last()
-                    .map(|m| m.is_streaming)
-                    .unwrap_or(false),
-            )
-        };
-
-        // Keep the variable-height list measurements in sync with the message
-        // vec. Following the streaming bubble is not done here: a bottom-aligned
-        // list keeps the newest message in view by itself, and only stops doing
-        // so once the user scrolls away.
-        let mut scroll_to_latest = false;
-        if identity != self.last_list_identity {
-            // Different session: rebuild the list. Bottom alignment already
-            // opens on its newest message, so this needs no follow-up scroll.
-            self.last_list_identity = identity;
-            self.last_list_count = message_count;
-            self.list_state.reset(message_count);
-            self.last_scroll_signature = signature;
-        } else if message_count != self.last_list_count {
-            let old_count = self.last_list_count;
-            self.last_list_count = message_count;
-            if message_count > old_count {
-                // Append the new messages instead of re-splicing the whole
-                // range: re-splicing threw every measured height away, which is
-                // why a send while scrolled up left the view where it was.
-                self.list_state
-                    .splice(old_count..old_count, message_count - old_count);
-                // Sending a prompt always snaps the view to the new message.
-                scroll_to_latest = self
-                    .state
-                    .read(cx)
-                    .messages
-                    .get(old_count..)
-                    .is_some_and(|added| added.iter().any(|m| m.role == MessageRole::User));
-            } else {
-                self.list_state.splice(0..old_count, message_count);
-            }
-        } else if signature != self.last_scroll_signature && is_streaming && message_count > 0 {
-            // The bubble is still growing, so the height the list recorded for
-            // it is stale. Re-splicing the last item is what re-measures it;
-            // doing it on every delta is why the view has to be re-pinned too,
-            // and with bottom alignment there is nothing to re-pin.
-            self.list_state.splice(message_count - 1..message_count, 1);
-        }
-        self.last_scroll_signature = signature;
-        if scroll_to_latest {
-            self.scroll_to_latest();
+        // The observer keeps `list_state` in step with the message vec; the
+        // only time render has to do it itself is before that observer has
+        // ever fired (ChatView created against a state that already holds a
+        // restored session).
+        if !self.list_synced {
+            self.sync_list_state(cx);
         }
 
         div()
@@ -525,7 +582,7 @@ impl Render for ChatView {
 impl ChatView {
     fn render_message_list(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let state = self.state.read(cx);
-        let is_empty = state.messages.is_empty();
+        let is_empty = state.messages().is_empty();
         let backend_name = state.backend_display_name().to_string();
 
         if is_empty {
@@ -564,14 +621,19 @@ impl ChatView {
         let list_state = self.list_state.clone();
         let chat = cx.entity();
         let state_entity = self.state.clone();
-        let messages = state_entity.read(cx).messages.clone();
         // The transcript belongs to the active backend, so that is what labels
         // each reply. It used to be the literal "HERMES" whatever was running.
         let author = state_entity.read(cx).backend_display_name().to_uppercase();
 
         let chat_for_list = chat.clone();
+        // The list reads the state per item instead of holding a copy of the
+        // whole transcript: a copy would be a full clone of every message —
+        // every content string and every tool-call detail — on every frame,
+        // including one frame per streaming delta. One visible message is
+        // cloned per rendered item; the markdown blocks it needs are reused
+        // from the memo.
         let list = list(list_state, move |index, _window, cx| {
-            let Some(message) = messages.get(index) else {
+            let Some(message) = state_entity.read(cx).messages().get(index).cloned() else {
                 return div().into_any();
             };
             let (expanded, revealed, copied) = {
@@ -582,14 +644,15 @@ impl ChatView {
                     chat.copied_message.as_deref() == Some(message.id.as_str()),
                 )
             };
+            let blocks = chat_for_list.update(cx, |chat, _cx| chat.markdown_blocks(&message));
             render_message_bubble(
-                message,
+                &message,
+                blocks,
                 expanded,
                 CopyButton { revealed, copied },
                 &author,
                 index,
                 chat_for_list.clone(),
-                state_entity.clone(),
             )
         })
         .flex_1()
@@ -820,7 +883,7 @@ impl ChatView {
             let state = self.state.read(cx);
             (
                 state.can_send(),
-                state.is_sending,
+                state.is_sending(),
                 state.pending_clarify.is_some(),
             )
         };
@@ -1096,7 +1159,7 @@ impl ChatView {
                         .when(
                             caps.contains(van_goal_core::models::BackendCaps::MODEL_SELECTION),
                             |this| {
-                                this.child(render_context_ring(usage))
+                                this.child(context_meter(usage, 36.0))
                                     .child(render_menu_button(
                                         "model-menu-button",
                                         if is_switching_model {
@@ -1432,12 +1495,12 @@ where
 
 fn render_message_bubble(
     message: &van_goal_core::models::ChatMessage,
+    blocks: Rc<Vec<MarkdownBlock>>,
     expanded: bool,
     copy: CopyButton,
     author: &str,
     index: usize,
     chat: Entity<ChatView>,
-    state: Entity<AppState>,
 ) -> AnyElement {
     let id_hash = crate::ui::hash_id(&message.id);
     let bubble = match message.role {
@@ -1482,7 +1545,7 @@ fn render_message_bubble(
                             .max_w(px(USER_BUBBLE_TEXT_MAX_WIDTH))
                             .text_size(Theme::text_px(13.0))
                             .text_color(Theme::text())
-                            .child(render_blocks(&markdown::parse(&message.content))),
+                            .child(render_blocks(&blocks)),
                     ),
             )
             .into_any(),
@@ -1544,7 +1607,7 @@ fn render_message_bubble(
             }
 
             if !message.content.trim().is_empty() {
-                bubble = bubble.child(render_blocks(&markdown::parse(&message.content)));
+                bubble = bubble.child(render_blocks(&blocks));
             }
 
             // Under the reply and against its left edge, so it sits next to the
@@ -1568,7 +1631,6 @@ fn render_message_bubble(
                 )));
             }
 
-            let _ = state;
             bubble.into_any()
         }
         _ => div()
@@ -1719,8 +1781,17 @@ fn render_activity(
     container.into_any()
 }
 
-fn render_context_ring(usage: ContextUsage) -> AnyElement {
-    let percent = usage.percent();
+/// How full the context is: a bar, and the numbers behind it.
+///
+/// One element for both places it is drawn — beside the model picker, and in the
+/// status bar — so the two cannot disagree about it. The bar is sized by the
+/// caller because the status bar has room the composer row does not.
+///
+/// [`ContextUsage::measured`] decides how the numbers are written. A backend
+/// that reported them gets them plainly; one that reported nothing gets this
+/// client's own estimate behind an "≈", because a reading and a guess are not
+/// the same claim and should not look alike.
+pub(crate) fn context_meter(usage: ContextUsage, bar_width: f32) -> AnyElement {
     let color = if usage.ratio() >= 0.9 {
         Theme::danger()
     } else if usage.ratio() >= 0.72 {
@@ -1735,7 +1806,7 @@ fn render_context_ring(usage: ContextUsage) -> AnyElement {
         .gap_1()
         .child(
             div()
-                .w(px(36.0))
+                .w(px(bar_width))
                 .h(px(4.0))
                 .rounded_full()
                 .bg(Theme::border())
@@ -1752,8 +1823,8 @@ fn render_context_ring(usage: ContextUsage) -> AnyElement {
                 .text_size(Theme::text_px(10.0))
                 .text_color(Theme::text_tertiary())
                 .child(format!(
-                    "{}% · {}/{}",
-                    percent,
+                    "{}{} / {}",
+                    if usage.measured { "" } else { "≈" },
                     compact_token_count(usage.used_tokens),
                     compact_token_count(usage.max_tokens)
                 )),
@@ -1844,7 +1915,7 @@ mod chat_view_render_tests {
         let state = cx.new(|cx| AppState::new(cx));
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = transcript_of(40);
+            state.conversation.set_transcript(transcript_of(40));
         });
         let (host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
@@ -1923,7 +1994,7 @@ mod chat_view_render_tests {
         let state = cx.new(|cx| AppState::new(cx));
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = transcript_of(40);
+            state.conversation.set_transcript(transcript_of(40));
         });
         let (host, cx) = cx.add_window_view(|_window, cx| {
             SizedChat(cx.new(|cx| ChatView::new(state.clone(), cx)))
@@ -1949,13 +2020,7 @@ mod chat_view_render_tests {
 
         // A send appends the prompt and the streaming placeholder.
         state.update(cx, |state, cx| {
-            state.messages.push(ChatMessage::new(
-                MessageRole::User,
-                "new prompt".to_string(),
-            ));
-            state
-                .messages
-                .push(ChatMessage::streaming(MessageRole::Assistant));
+            state.conversation.begin_turn_with_placeholder("new prompt");
             cx.notify();
         });
 
@@ -1991,7 +2056,7 @@ mod chat_view_render_tests {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = transcript_of(40);
+            state.conversation.set_transcript(transcript_of(40));
         });
         let (host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
@@ -2027,7 +2092,7 @@ mod chat_view_render_tests {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = transcript_of(40);
+            state.conversation.set_transcript(transcript_of(40));
         });
         let (host, cx) = cx.add_window_view(|_window, cx| {
             SizedChat(cx.new(|cx| ChatView::new(state.clone(), cx)))
@@ -2053,14 +2118,16 @@ mod chat_view_render_tests {
 
         // A reply arrives and streams in over several frames.
         state.update(cx, |state, cx| {
+            state.conversation.begin_turn();
             state
-                .messages
+                .conversation
+                .messages_mut()
                 .push(ChatMessage::streaming(MessageRole::Assistant));
             cx.notify();
         });
         for chunk in 0..5 {
             state.update(cx, |state, cx| {
-                if let Some(last) = state.messages.last_mut() {
+                if let Some(last) = state.conversation.messages_mut().last_mut() {
                     last.content.push_str(&format!("streamed line {chunk}\n\n"));
                 }
                 cx.notify();
@@ -2211,7 +2278,7 @@ mod message_width_tests {
         let state = cx.new(|cx| AppState::new(cx));
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = transcript(messages);
+            state.conversation.set_transcript(transcript(messages));
         });
         let (host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
@@ -2262,10 +2329,12 @@ mod message_width_tests {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = messages
-                .into_iter()
-                .map(|(role, content)| ChatMessage::new(role, content.to_string()))
-                .collect();
+            state.conversation.set_transcript(
+                messages
+                    .into_iter()
+                    .map(|(role, content)| ChatMessage::new(role, content.to_string()))
+                    .collect(),
+            );
         });
         let (_host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
@@ -2388,7 +2457,7 @@ mod copy_button_tests {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = vec![message];
+            state.conversation.set_transcript(vec![message]);
         });
         let (host, cx) =
             cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));

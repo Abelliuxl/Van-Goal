@@ -525,7 +525,7 @@ mod tests {
         let state = cx.new(AppState::new);
         state.update(cx, |state, _cx| {
             state.selected_session = None;
-            state.messages = Vec::new();
+            state.conversation = van_goal_core::chat::Conversation::new();
             state.sessions = sessions;
         });
         let (_host, cx) = cx

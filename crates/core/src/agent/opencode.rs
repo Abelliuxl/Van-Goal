@@ -132,6 +132,9 @@ impl OpenCodeBackend {
                     archived: Some(false),
                     profile: None,
                     backend_id: None,
+                    // Neither backend reports a session's token accounting yet.
+                    used_tokens: None,
+                    context_tokens: None,
                 })
             })
             .collect())

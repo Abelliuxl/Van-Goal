@@ -198,12 +198,20 @@ class _ChatPageState extends State<ChatPage> {
             onPressed: _app.newChat,
             icon: const Icon(Icons.add_comment_outlined),
           ),
-          Builder(
-            builder: (context) => IconButton(
-              tooltip: 'Sessions',
-              onPressed: () => Scaffold.of(context).openDrawer(),
-              icon: const Icon(Icons.forum_outlined),
-            ),
+          // Refreshes the session list and the open conversation from the
+          // backend. Opening the session list is the drawer's job — the system
+          // menu button on the left already does that, and a second button for
+          // it on this side was one more icon doing nothing.
+          IconButton(
+            tooltip: 'Refresh',
+            onPressed: _app.refreshAll,
+            icon: _app.refreshing
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh),
           ),
           IconButton(
             tooltip: 'Settings',
@@ -230,7 +238,10 @@ class _ChatPageState extends State<ChatPage> {
       case LinkState.online:
         return 'connected';
       case LinkState.connecting:
-        return 'connecting…';
+        // A retry loop after a lost connection is a different thing from a
+        // first connect, and the wording is the only place the user can see
+        // that the app is recovering rather than starting up.
+        return app.reconnecting ? 'reconnecting…' : 'connecting…';
       case LinkState.failed:
         return app.linkDetail ?? 'failed';
       case LinkState.offline:
@@ -697,63 +708,72 @@ class _SessionDrawer extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
-              child: Row(
-                children: [
-                  const Text(
-                    'Sessions',
-                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
-                  ),
-                  const Spacer(),
-                  IconButton(
-                    tooltip: 'Refresh',
-                    onPressed: app.refreshSessions,
-                    icon: const Icon(Icons.refresh, size: 20),
-                  ),
-                ],
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'Sessions',
+                style: TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                  color: _ink,
+                ),
               ),
             ),
             const Divider(height: 1, color: _line),
             Expanded(
-              child: app.sessions.isEmpty
-                  ? const Padding(
-                      padding: EdgeInsets.all(16),
-                      child: Text(
-                        'No sessions yet.',
-                        style: TextStyle(color: _inkFaint),
-                      ),
-                    )
-                  : ListView.builder(
-                      itemCount: app.sessions.length,
-                      itemBuilder: (context, index) {
-                        final session = app.sessions[index];
-                        return ListTile(
-                          selected: session.id == app.sessionId,
-                          selectedTileColor: _accent.withValues(alpha: 0.12),
-                          title: Text(
-                            session.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 14),
+              // Pulling the list down refreshes it, the way every list on a
+              // phone behaves; the refresh button in the appbar does the same
+              // for when the drawer is closed.
+              child: RefreshIndicator(
+                onRefresh: app.refreshAll,
+                backgroundColor: _panel,
+                color: _accent,
+                child: app.sessions.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          Padding(
+                            padding: EdgeInsets.all(16),
+                            child: Text(
+                              'No sessions yet.',
+                              style: TextStyle(color: _inkFaint),
+                            ),
                           ),
-                          subtitle: session.model == null
-                              ? null
-                              : Text(
-                                  session.model!,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 11,
-                                    color: _inkFaint,
+                        ],
+                      )
+                    : ListView.builder(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        itemCount: app.sessions.length,
+                        itemBuilder: (context, index) {
+                          final session = app.sessions[index];
+                          return ListTile(
+                            selected: session.id == app.sessionId,
+                            selectedTileColor:
+                                _accent.withValues(alpha: 0.12),
+                            title: Text(
+                              session.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                            subtitle: session.model == null
+                                ? null
+                                : Text(
+                                    session.model!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: _inkFaint,
+                                    ),
                                   ),
-                                ),
-                          onTap: () {
-                            Navigator.of(context).pop();
-                            app.openSession(session.id);
-                          },
-                        );
-                      },
-                    ),
+                            onTap: () {
+                              Navigator.of(context).pop();
+                              app.openSession(session.id);
+                            },
+                          );
+                        },
+                      ),
+              ),
             ),
           ],
         ),

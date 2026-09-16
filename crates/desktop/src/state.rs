@@ -1,16 +1,14 @@
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use gpui::Task;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use van_goal_core::agent::Backend;
 use van_goal_core::cache::SessionCacheStore;
-use van_goal_core::chat::{
-    best_stream_text, merge_fetched_sessions, merge_stream_chunk, needs_session_title,
-};
+use van_goal_core::chat::{merge_fetched_sessions, Conversation, ConversationChange};
 use van_goal_core::local_server::LocalHermesServer;
 use van_goal_core::models::*;
 use van_goal_core::settings::{BackendKind, Settings};
@@ -73,18 +71,20 @@ impl HeldPrompt {
     }
 }
 
-/// Single source of truth for sessions, messages, streaming and sending —
-/// the GPUI port of the SwiftUI AppState.
+/// Single source of truth for sessions, messages, streaming and sending.
 pub struct AppState {
     pub settings: Settings,
     pub local_server: Arc<LocalHermesServer>,
     pub connection_state: ConnectionState,
     pub sessions: Vec<AgentSession>,
     pub selected_session: Option<AgentSession>,
-    pub messages: Vec<ChatMessage>,
+    /// The conversation on screen. The fold rules live in `chat::Conversation`
+    /// (placeholder per turn, tool calls folded into one bubble, duplicates
+    /// dropped, every streaming message stopped when the turn ends) so this
+    /// frontend and the mobile bridge cannot disagree about them.
+    pub conversation: Conversation,
     pub composer_text: String,
     pub composer_attachments: Vec<ComposerAttachment>,
-    pub is_sending: bool,
     pub is_refreshing_sessions: bool,
     pub transport_ready: bool,
     gateway_connecting: bool,
@@ -103,15 +103,14 @@ pub struct AppState {
     /// A prompt typed before there was a live session to send it to, and the
     /// session it belongs to — see [`HeldPrompt`].
     pub pending_after_start: Option<HeldPrompt>,
-    /// Text received per event stream for the turn in flight. One reply can
-    /// arrive on several streams at once (OpenClaw sends both a `session.message`
-    /// transcript and an `agent`/assistant stream); appending every stream into
-    /// one buffer interleaves two copies of the message, so each is buffered
-    /// separately and the most complete one is displayed.
-    streaming_text: BTreeMap<DeltaSource, String>,
     /// A silent session-list refresh is in flight (debounces the gateway's
     /// "sessions changed" hints).
     sessions_refresh_inflight: bool,
+    /// A streaming-delta repaint is scheduled: text moved inside a bubble that
+    /// is already on screen needs no repaint of its own, and one scheduled
+    /// repaint carries every delta that arrived meanwhile — see
+    /// [`Self::notify_streaming`].
+    stream_notify_task: Option<Task<()>>,
 
     backend: Arc<AsyncMutex<Backend>>,
     backend_id: &'static str,
@@ -167,10 +166,9 @@ impl AppState {
             connection_state: ConnectionState::Disconnected,
             sessions,
             selected_session: selected,
-            messages: Self::visible_messages(&messages),
+            conversation: Conversation::new(),
             composer_text: String::new(),
             composer_attachments: Vec::new(),
-            is_sending: false,
             is_refreshing_sessions: false,
             transport_ready: false,
             gateway_connecting: false,
@@ -187,7 +185,7 @@ impl AppState {
             permission_mode: PermissionMode::FullAccess,
             is_changing_permission_mode: false,
             pending_after_start: None,
-            streaming_text: BTreeMap::new(),
+            stream_notify_task: None,
             sessions_refresh_inflight: false,
             backend: Arc::new(AsyncMutex::new(Backend::make(kind))),
             backend_id: backend_static_id(kind),
@@ -201,6 +199,9 @@ impl AppState {
             cache_save_task: None,
         };
         state.update_cache_summary();
+        state
+            .conversation
+            .set_transcript(Self::visible_messages(&messages));
         state.refresh_hermes_model_config();
         state.refresh_permission_mode();
 
@@ -223,6 +224,16 @@ impl AppState {
     pub fn can_send(&self) -> bool {
         self.connection_state == ConnectionState::Connected
             && (!self.composer_text.trim().is_empty() || !self.composer_attachments.is_empty())
+    }
+
+    /// The messages on screen, folded by [`Conversation`].
+    pub fn messages(&self) -> &[ChatMessage] {
+        self.conversation.messages()
+    }
+
+    /// Whether a prompt has been submitted and its turn has not ended.
+    pub fn is_sending(&self) -> bool {
+        self.conversation.is_sending()
     }
 
     /// Forget the credential backing the active backend. OpenClaw keeps its
@@ -278,17 +289,24 @@ impl AppState {
         self.backend_id
     }
 
+    /// How full the context of the session on screen is.
+    ///
+    /// The backend's own accounting is preferred: a Gateway lists what each
+    /// session's context is holding and how wide that session's window is, and
+    /// a number it reported is worth more than one this client works out from
+    /// the text it happens to hold. The estimate is for backends that report
+    /// nothing, and it is marked so the frontends can say as much — see
+    /// [`ContextUsage::measured`].
     pub fn context_usage(&self) -> ContextUsage {
-        ContextUsage {
-            used_tokens: self.estimated_context_tokens(),
-            max_tokens: self.context_window_tokens,
-        }
+        reported_context_usage(self.selected_session.as_ref(), &self.sessions).unwrap_or_else(
+            || ContextUsage::estimated(self.estimated_context_tokens(), self.context_window_tokens),
+        )
     }
 
     fn estimated_context_tokens(&self) -> i64 {
         const FIXED_PROMPT_TOKENS: i64 = 17_400;
         let message_chars: usize = self
-            .messages
+            .messages()
             .iter()
             .map(|message| {
                 message.content.len()
@@ -556,9 +574,10 @@ impl AppState {
             .cloned()
             .filter(|cached| !cached.is_empty())
         {
-            self.messages = Self::visible_messages(&cached);
+            self.conversation
+                .set_transcript(Self::visible_messages(&cached));
         } else {
-            self.messages = Vec::new();
+            self.conversation = Conversation::new();
         }
         cx.notify();
 
@@ -630,7 +649,7 @@ impl AppState {
 
     pub fn start_fresh_chat(&mut self, cx: &mut gpui::Context<Self>) {
         self.selected_session = None;
-        self.messages = Vec::new();
+        self.conversation = Conversation::new();
         self.pending_clarify = None;
         self.live_gateway_session_id = None;
         self.stored_gateway_session_id = None;
@@ -669,6 +688,10 @@ impl AppState {
                             archived: Some(false),
                             profile: profile.clone(),
                             backend_id: Some(backend_id.clone()),
+                            // A chat with nothing in it has nothing to count;
+                            // the first refresh after a turn fills these in.
+                            used_tokens: None,
+                            context_tokens: None,
                         };
                         state.selected_session = Some(local_session.clone());
                         if !state.sessions.iter().any(|session| session.id == local_id) {
@@ -813,7 +836,7 @@ impl AppState {
             }
         }
 
-        if self.is_sending {
+        if self.is_sending() {
             self.pending_queue
                 .push(QueuedPrompt::new(text, attachments));
             self.composer_text = String::new();
@@ -840,13 +863,8 @@ impl AppState {
         session_id: String,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.is_sending = true;
-        self.streaming_text.clear();
         let submitted = submitted_prompt(&text, &attachments);
-        self.messages
-            .push(ChatMessage::new(MessageRole::User, text));
-        self.messages
-            .push(ChatMessage::streaming(MessageRole::Assistant));
+        self.conversation.begin_turn_with_placeholder(&text);
         self.schedule_current_messages_cache_save(cx);
         cx.notify();
 
@@ -865,7 +883,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 if let Err(error) = result {
                     state.last_error = Some(error.to_string());
-                    state.is_sending = false;
+                    state.conversation.finish_turn();
                     log_debug!("app", "prompt.submit failed: {error}");
                 }
                 cx.notify();
@@ -878,7 +896,7 @@ impl AppState {
         let Some(session_id) = self.live_gateway_session_id.clone() else {
             return;
         };
-        if !self.is_sending {
+        if !self.is_sending() {
             return;
         }
         log_debug!("queue", "interrupt session={session_id}");
@@ -910,19 +928,8 @@ impl AppState {
         }
         self.pending_clarify = None;
 
-        let now = now_unix();
-        for message in self.messages.iter_mut() {
-            if message.role == MessageRole::Assistant && message.is_streaming {
-                message.is_streaming = false;
-                message.completed_at = Some(now);
-            }
-        }
-        self.prune_empty_assistant_messages();
-        self.messages
-            .push(ChatMessage::new(MessageRole::User, trimmed.clone()));
-        self.messages
-            .push(ChatMessage::streaming(MessageRole::Assistant));
-        self.is_sending = true;
+        self.conversation.finish_turn();
+        self.conversation.begin_turn_with_placeholder(&trimmed);
         self.schedule_current_messages_cache_save(cx);
         log_debug!(
             "queue",
@@ -948,7 +955,7 @@ impl AppState {
             let _ = this.update(cx, |state, _cx| {
                 if let Err(error) = result {
                     state.last_error = Some(format!("Could not answer: {error}"));
-                    state.is_sending = false;
+                    state.conversation.finish_turn();
                     log_debug!("queue", "clarify.respond failed: {error}");
                 }
             });
@@ -1000,7 +1007,7 @@ impl AppState {
             cx.notify();
             return;
         };
-        if self.is_sending {
+        if self.is_sending() {
             let backend = self.backend.clone();
             let join = tokio_spawn(cx, async move {
                 backend.lock().await.interrupt(&session_id).await
@@ -1261,7 +1268,7 @@ impl AppState {
         self.cache_store.clear();
         self.sessions = Vec::new();
         self.selected_session = None;
-        self.messages = Vec::new();
+        self.conversation = Conversation::new();
         self.update_cache_summary();
         cx.notify();
     }
@@ -1288,7 +1295,7 @@ impl AppState {
         let cached_sessions = self.cached_state.sessions.clone();
         self.sessions =
             Self::visible_sessions_from(&cached_sessions, kind.id(), &self.cached_state);
-        self.messages = Vec::new();
+        self.conversation = Conversation::new();
         self.live_gateway_session_id = None;
         self.stored_gateway_session_id = None;
         self.pending_clarify = None;
@@ -1370,49 +1377,25 @@ impl AppState {
             log_debug!("app", "turn event dropped while a session is opening");
             return;
         }
-        match event {
+
+        // Everything that is not a turn event is session/connection state this
+        // struct owns; the turn events go to the shared fold in `Conversation`
+        // and only the change it reports is orchestrated here.
+        match &event {
             AgentEvent::Connected => {
                 self.transport_ready = true;
                 self.gateway_connecting = false;
                 self.connection_state = ConnectionState::Connected;
                 self.last_error = None;
+                cx.notify();
             }
             AgentEvent::SessionInfo(session_id) => {
                 self.live_gateway_session_id = Some(session_id.clone());
                 self.transport_ready = true;
                 log_debug!("app", "session info live={session_id}");
-            }
-            AgentEvent::MessageStart => {
-                let needs_placeholder = self.is_sending
-                    && (self
-                        .messages
-                        .last()
-                        .map(|last| last.role != MessageRole::Assistant || !last.is_streaming)
-                        .unwrap_or(true));
-                if needs_placeholder {
-                    self.messages
-                        .push(ChatMessage::streaming(MessageRole::Assistant));
-                    self.schedule_current_messages_cache_save(cx);
-                }
-            }
-            AgentEvent::MessageDelta { text, source } => {
-                self.append_assistant_delta(text, source, cx)
+                cx.notify();
             }
             AgentEvent::SessionsChanged => self.refresh_sessions_quietly(cx),
-            AgentEvent::MessageComplete(text) => self.complete_assistant_message(text, cx),
-            AgentEvent::TurnFailed(message) => {
-                self.last_error = Some(message.clone());
-                self.complete_assistant_message(Some(format!("Error: {message}")), cx);
-            }
-            AgentEvent::Tool(record) => {
-                log_debug!(
-                    "gateway",
-                    "tool event name={} status={}",
-                    record.name,
-                    record.status
-                );
-                self.append_tool_call(record, cx);
-            }
             AgentEvent::Clarify {
                 question,
                 choices,
@@ -1425,11 +1408,12 @@ impl AppState {
                     choices.len()
                 );
                 self.pending_clarify = Some(PendingClarify {
-                    session_id,
-                    question,
-                    choices,
-                    request_id,
+                    session_id: session_id.clone(),
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    request_id: request_id.clone(),
                 });
+                cx.notify();
             }
             AgentEvent::Disconnected => {
                 self.transport_ready = false;
@@ -1438,139 +1422,51 @@ impl AppState {
                 if self.connection_state == ConnectionState::Connected {
                     self.connection_state = ConnectionState::Disconnected;
                 }
+                cx.notify();
             }
             AgentEvent::Failed(message) => {
                 self.transport_ready = false;
                 self.gateway_connecting = false;
                 self.pending_clarify = None;
                 self.connection_state = ConnectionState::Failed(message.clone());
-                self.last_error = Some(message);
+                self.last_error = Some(message.clone());
+                cx.notify();
             }
-        }
-        cx.notify();
-    }
-
-    fn append_assistant_delta(
-        &mut self,
-        text: String,
-        source: DeltaSource,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        merge_stream_chunk(self.streaming_text.entry(source).or_default(), &text);
-        let streamed = best_stream_text(&self.streaming_text);
-        if streamed.is_empty() {
-            return;
-        }
-        if self.streaming_text.len() > 1 {
-            log_debug!(
-                "gateway",
-                "reply arriving on {} streams; showing the most complete one",
-                self.streaming_text.len()
-            );
-        }
-        if let Some(index) = self.messages.iter().rposition(|message| {
-            message.role == MessageRole::Assistant
-                && message.is_streaming
-                && message.tool_calls.is_empty()
-        }) {
-            self.messages[index].content = streamed;
-        } else {
-            let mut message = ChatMessage::streaming(MessageRole::Assistant);
-            message.content = streamed;
-            self.messages.push(message);
-        }
-        self.schedule_current_messages_cache_save(cx);
-    }
-
-    fn append_tool_call(&mut self, record: ToolCallRecord, cx: &mut gpui::Context<Self>) {
-        // Deduplicate within the current turn only (after the last user message).
-        let turn_start = self
-            .messages
-            .iter()
-            .rposition(|message| message.role == MessageRole::User)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let is_duplicate = self.messages[turn_start..].iter().any(|message| {
-            message.tool_calls.iter().any(|call| {
-                call.name == record.name
-                    && call.status == record.status
-                    && call.detail == record.detail
-            })
-        });
-        if is_duplicate {
-            return;
-        }
-
-        if let Some(index) = self.messages.iter().rposition(|message| {
-            message.role == MessageRole::Assistant
-                && message.is_streaming
-                && message.content.trim().is_empty()
-        }) {
-            self.messages[index].tool_calls.push(record);
-        } else {
-            let mut message = ChatMessage::streaming(MessageRole::Assistant);
-            message.tool_calls.push(record);
-            self.messages.push(message);
-        }
-        self.schedule_current_messages_cache_save(cx);
-    }
-
-    fn complete_assistant_message(
-        &mut self,
-        final_text: Option<String>,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        // Any pending clarify is stale once the turn ends.
-        self.pending_clarify = None;
-        let completed_at = now_unix();
-        let active_index = self
-            .messages
-            .iter()
-            .rposition(|message| message.role == MessageRole::Assistant && message.is_streaming);
-
-        for message in self.messages.iter_mut() {
-            if message.role == MessageRole::Assistant && message.is_streaming {
-                message.is_streaming = false;
-                message.completed_at = Some(completed_at);
+            AgentEvent::TurnFailed(message) => {
+                self.last_error = Some(message.clone());
+                // The fold would end the turn silently; the desktop reports the
+                // failure in the transcript, so route it through the completion
+                // path with the error as the final text.
+                self.conversation
+                    .complete_message(Some(&format!("Error: {message}")));
+                self.after_turn_finished(cx);
             }
-        }
-
-        if let Some(index) = active_index {
-            let trimmed_final = final_text
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            if !trimmed_final.is_empty() {
-                if self.messages[index].tool_calls.is_empty() {
-                    if self.messages[index].content != trimmed_final {
-                        self.messages[index].content = trimmed_final;
+            turn_event => {
+                let change = self.conversation.apply(turn_event);
+                match change {
+                    ConversationChange::None => {}
+                    ConversationChange::Streaming { .. } => {
+                        self.schedule_current_messages_cache_save(cx);
+                        self.notify_streaming(cx);
                     }
-                } else {
-                    self.messages
-                        .push(ChatMessage::new(MessageRole::Assistant, trimmed_final));
+                    ConversationChange::Structure => {
+                        self.schedule_current_messages_cache_save(cx);
+                        cx.notify();
+                    }
                 }
             }
-        } else if let Some(final_text) = final_text.filter(|text| !text.is_empty()) {
-            self.messages
-                .push(ChatMessage::new(MessageRole::Assistant, final_text));
         }
-        self.prune_empty_assistant_messages();
-        self.streaming_text.clear();
-        self.is_sending = false;
+    }
+
+    /// The turn has ended: everything the end of a turn means beyond the
+    /// messages themselves. The pending clarify is stale, the transcript is
+    /// worth persisting, and two things only the backend knows have changed:
+    /// the name a gateway gives a chat from its first prompt, and the session's
+    /// context accounting — which a turn has just changed.
+    fn after_turn_finished(&mut self, cx: &mut gpui::Context<Self>) {
+        self.pending_clarify = None;
         self.save_current_messages_to_cache();
-        // A chat created here is named by the gateway from its first prompt, and
-        // the name only shows up once the session list is re-read.
-        if self
-            .selected_session
-            .as_ref()
-            .is_some_and(|session| needs_session_title(session.title.as_deref()))
-        {
-            self.refresh_sessions_quietly(cx);
-        }
+        self.refresh_sessions_quietly(cx);
 
         // Auto-dequeue the next waiting prompt.
         if let Some(next) = self.pending_queue.first().cloned() {
@@ -1587,8 +1483,24 @@ impl AppState {
         cx.notify();
     }
 
-    fn prune_empty_assistant_messages(&mut self) {
-        self.messages.retain(|message| !message.is_empty_shell());
+    /// A streaming delta only moved text inside a bubble that is already on
+    /// screen. Redrawing on every delta repaints the whole window for a change
+    /// that is itself produced many times a second, so these are coalesced:
+    /// one scheduled repaint carries the text to wherever it has got to, the
+    /// way the queue that feeds the mobile client folds its deltas.
+    fn notify_streaming(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.stream_notify_task.is_some() {
+            return;
+        }
+        self.stream_notify_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(60))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.stream_notify_task = None;
+                cx.notify();
+            });
+        }));
     }
 
     // ------------------------------------------------------------------
@@ -1618,7 +1530,7 @@ impl AppState {
         };
         self.cached_state
             .messages_by_session_id
-            .insert(key.clone(), self.messages.clone());
+            .insert(key.clone(), self.conversation.messages().to_vec());
         self.cached_state.selected_session_id = Some(key);
         self.cached_state.updated_at = Some(now_unix());
         self.update_cache_summary();
@@ -1734,7 +1646,7 @@ impl AppState {
             == Some(id)
         {
             self.selected_session = None;
-            self.messages = Vec::new();
+            self.conversation = Conversation::new();
             self.live_gateway_session_id = None;
             self.stored_gateway_session_id = None;
             self.transport_ready = false;
@@ -1770,7 +1682,7 @@ impl AppState {
         {
             if ids.contains(&selected) {
                 self.selected_session = None;
-                self.messages = Vec::new();
+                self.conversation = Conversation::new();
                 self.live_gateway_session_id = None;
                 self.stored_gateway_session_id = None;
                 self.transport_ready = false;
@@ -1799,12 +1711,13 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(fetched) => {
-                        let fetched = AppState::visible_messages(&fetched);
+                        let visible = AppState::visible_messages(&fetched);
                         let key = format!("{backend_id}::{session_key}");
                         // Do not clobber messages mid-stream; WS deltas own the
                         // current bubble until completion.
                         if state
-                            .messages
+                            .conversation
+                            .messages()
                             .last()
                             .map(|last| last.is_streaming)
                             .unwrap_or(false)
@@ -1812,21 +1725,27 @@ impl AppState {
                             state
                                 .cached_state
                                 .messages_by_session_id
-                                .insert(key, fetched);
+                                .insert(key, visible);
                             state.update_cache_summary();
                             let cache = state.cache_store.clone();
                             let snapshot = state.cached_state.clone();
                             cache.save(snapshot);
                             return;
                         }
-                        if !state.messages.is_empty() && fetched.len() <= state.messages.len() {
+                        if !state.conversation.messages().is_empty()
+                            && fetched.len() <= state.conversation.messages().len()
+                        {
                             return;
                         }
-                        state.messages = fetched.clone();
+                        // The backend reports a turn as text alone, so the two
+                        // lists are merged rather than substituted: what this
+                        // client watched happen — the tool calls — survives the
+                        // reload (see `Conversation::merge_transcript`).
+                        state.conversation.merge_transcript(visible.clone());
                         state
                             .cached_state
                             .messages_by_session_id
-                            .insert(key.clone(), fetched);
+                            .insert(key.clone(), visible);
                         state.cached_state.selected_session_id = Some(key);
                         state.update_cache_summary();
                         let cache = state.cache_store.clone();
@@ -1919,6 +1838,29 @@ fn model_order(lhs: &str, rhs: &str, current: &str) -> std::cmp::Ordering {
     lhs.to_lowercase().cmp(&rhs.to_lowercase())
 }
 
+/// The context accounting the backend reported for the session on screen, if it
+/// reported both halves of it.
+///
+/// The row is looked up in `sessions` rather than read off `selected`: a refresh
+/// replaces the listed rows with the backend's, and the selected session is a
+/// clone taken when it was opened, so reading that one would report the
+/// conversation as it stood before the turn that just ran — the very thing the
+/// number is there to answer. Both halves are required together, because a
+/// measured "used" over an estimated window would mislabel one of the two.
+fn reported_context_usage(
+    selected: Option<&AgentSession>,
+    sessions: &[AgentSession],
+) -> Option<ContextUsage> {
+    let selected = selected?;
+    let row = sessions
+        .iter()
+        .find(|session| session.id == selected.id)
+        .unwrap_or(selected);
+    let used = row.used_tokens?;
+    let max = row.context_tokens.filter(|max| *max > 0)?;
+    Some(ContextUsage::measured(used, max))
+}
+
 /// Whether an event that belongs to a turn may be folded into the messages on
 /// screen.
 ///
@@ -1966,5 +1908,77 @@ mod tests {
     #[test]
     fn a_live_session_without_a_stored_key_still_takes_its_traffic() {
         assert!(accepts_turn_events(Some("live-1"), None));
+    }
+
+    fn session_row(id: &str, used: Option<i64>, window: Option<i64>) -> AgentSession {
+        AgentSession {
+            id: id.to_string(),
+            used_tokens: used,
+            context_tokens: window,
+            ..AgentSession::default()
+        }
+    }
+
+    /// What the backend reported is what the status bar shows: a Gateway says
+    /// what the context is holding and how wide the window is, and neither the
+    /// count nor the width should be this client's guess when it can be a
+    /// reading.
+    #[test]
+    fn a_reported_reading_is_used_as_it_stands() {
+        let selected = session_row("a", None, None);
+        let rows = vec![session_row("a", Some(36_393), Some(1_048_576))];
+        let usage = reported_context_usage(Some(&selected), &rows).expect("reported");
+        assert!(usage.measured);
+        assert_eq!(usage.used_tokens, 36_393);
+        assert_eq!(usage.max_tokens, 1_048_576);
+    }
+
+    /// The listed row is the fresh one. A turn just ran, the list was re-read,
+    /// and the copy the session was opened with is older than the reading.
+    #[test]
+    fn the_listed_row_wins_over_the_copy_the_session_was_opened_with() {
+        let selected = session_row("a", Some(1), Some(100));
+        let rows = vec![session_row("a", Some(9_000), Some(1_048_576))];
+        let usage = reported_context_usage(Some(&selected), &rows).expect("reported");
+        assert_eq!(usage.used_tokens, 9_000);
+        assert_eq!(usage.max_tokens, 1_048_576);
+    }
+
+    /// A backend that reports nothing leaves the frontends to estimate, and the
+    /// estimate has to be marked as one — the difference between a reading and
+    /// a guess is the whole reason the flag exists.
+    #[test]
+    fn a_backend_that_reports_nothing_leaves_the_estimate_to_say_so() {
+        let selected = session_row("a", None, None);
+        assert!(reported_context_usage(Some(&selected), &[]).is_none());
+
+        // Half a reading is not a reading: a measured "used" over a guessed
+        // window would put two different claims in one line.
+        let half = vec![session_row("a", Some(500), None)];
+        assert!(reported_context_usage(Some(&selected), &half).is_none());
+
+        let zero_window = vec![session_row("a", Some(500), Some(0))];
+        assert!(
+            reported_context_usage(Some(&selected), &zero_window).is_none(),
+            "a window of zero is not a window"
+        );
+    }
+
+    /// With no session on screen there is nothing to report a reading of.
+    #[test]
+    fn nothing_on_screen_has_no_reading() {
+        assert!(reported_context_usage(None, &[session_row("a", Some(1), Some(2))]).is_none());
+    }
+
+    #[test]
+    fn an_estimate_is_never_drawn_as_a_reading() {
+        let estimated = ContextUsage::estimated(17_400, 258_000);
+        assert!(!estimated.measured);
+        let measured = ContextUsage::measured(36_393, 1_048_576);
+        assert!(measured.measured);
+        // Same bar either way: how full it looks is the numbers' business, and
+        // whether they were measured is the label's.
+        assert!((measured.ratio() - 36_393.0 / 1_048_576.0).abs() < 0.0001);
+        assert_eq!(measured.percent(), 3);
     }
 }

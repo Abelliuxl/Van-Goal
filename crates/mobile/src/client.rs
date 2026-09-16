@@ -221,6 +221,66 @@ fn forget_session(settings: &Mutex<Settings>) {
     }
 }
 
+/// Ask the backend for the session list and hand it to the frontend.
+async fn fetch_sessions(
+    backend: Arc<AsyncMutex<Backend>>,
+    config: BackendConfig,
+    events: Arc<Mutex<Vec<Value>>>,
+) {
+    match backend.lock().await.list_sessions(&config).await {
+        Ok(sessions) => {
+            let items: Vec<Value> = sessions
+                .into_iter()
+                .map(|session| {
+                    json!({
+                        "id": session.id,
+                        "title": session.display_title(),
+                        "model": session.model,
+                        "cwd": session.cwd,
+                        "last_active": session.last_active,
+                        "messages": session.message_count,
+                    })
+                })
+                .collect();
+            push(&events, json!({ "event": "sessions", "items": items }));
+        }
+        Err(error) => push_error(&events, format!("could not list sessions: {error}")),
+    }
+}
+
+/// Bring the transcript on screen up to date with the backend's history.
+///
+/// The fetch is merged rather than substituted, because `chat.history` reports
+/// a turn as text alone: a merge keeps the tool calls this client watched
+/// happen (see [`Conversation::merge_transcript`]). A turn in flight is left
+/// alone — the reply the user is waiting for is not in the history yet, and
+/// folding a fetch over the conversation would drop the prompt that started it.
+async fn catch_up_history(
+    backend: Arc<AsyncMutex<Backend>>,
+    config: BackendConfig,
+    events: Arc<Mutex<Vec<Value>>>,
+    open: Arc<Mutex<OpenSession>>,
+    id: String,
+) {
+    if open.lock().unwrap().conversation.is_sending() {
+        return;
+    }
+    if let Ok(messages) = backend.lock().await.messages(&config, &id).await {
+        {
+            let mut open = open.lock().unwrap();
+            // The history belongs to this session only while it is still the
+            // one on screen: the user may have switched away during the fetch,
+            // and folding it into the conversation now on screen would write
+            // one chat's messages into another.
+            if open.key().as_deref() != Some(id.as_str()) {
+                return;
+            }
+            open.conversation.merge_transcript(messages);
+        }
+        push_transcript(&events, &open);
+    }
+}
+
 /// Show a session's transcript and attach this connection to it.
 ///
 /// Both halves matter and the order is the point: the messages are shown *before*
@@ -312,6 +372,10 @@ impl Client {
             }
             Some("disconnect") => self.disconnect().map(|()| None),
             Some("list_sessions") => self.list_sessions().map(|()| None),
+            Some("refresh") => {
+                self.refresh();
+                Ok(None)
+            }
             Some("open_session") => {
                 let id = required(&value, "id")?;
                 self.open_session(id);
@@ -535,11 +599,11 @@ impl Client {
                     live.store(true, Ordering::SeqCst);
                     attempt = 0;
                     let reopened = { open.lock().unwrap().stored_id.clone() };
-                    match reopened {
+                    match &reopened {
                         // A session is already on screen: put the subscription
                         // back. A gateway only delivers a session's frames to a
                         // connection that subscribed to it.
-                        Some(id) => match backend.lock().await.resume_session(&config, &id).await {
+                        Some(id) => match backend.lock().await.resume_session(&config, id).await {
                             Ok(ids) => {
                                 open.lock().unwrap().live_id = Some(ids.live_id.clone());
                                 push(&events, json!({ "event": "session", "id": ids.live_id }));
@@ -559,6 +623,19 @@ impl Client {
                                 open_on(&backend, &config, &events, &open, &id).await;
                             }
                         }
+                    }
+                    // The session on screen may have moved on while the socket
+                    // was down — a turn that finished while the phone was
+                    // locked is in the history and nowhere else.
+                    if let Some(id) = reopened.clone() {
+                        catch_up_history(
+                            backend.clone(),
+                            config.clone(),
+                            events.clone(),
+                            open.clone(),
+                            id,
+                        )
+                        .await;
                     }
                     // Drain the backend's events for as long as the stream lives.
                     while let Some(event) = receiver.next().await {
@@ -635,28 +712,29 @@ impl Client {
         let config = self.config();
         let backend = self.backend();
         let events = self.events.clone();
-        self.runtime.spawn(async move {
-            match backend.lock().await.list_sessions(&config).await {
-                Ok(sessions) => {
-                    let items: Vec<Value> = sessions
-                        .into_iter()
-                        .map(|session| {
-                            json!({
-                                "id": session.id,
-                                "title": session.display_title(),
-                                "model": session.model,
-                                "cwd": session.cwd,
-                                "last_active": session.last_active,
-                                "messages": session.message_count,
-                            })
-                        })
-                        .collect();
-                    push(&events, json!({ "event": "sessions", "items": items }));
-                }
-                Err(error) => push_error(&events, format!("could not list sessions: {error}")),
-            }
-        });
+        self.runtime.spawn(fetch_sessions(backend, config, events));
         Ok(())
+    }
+
+    /// Refresh everything the screen is drawn from: the session list and, when
+    /// a session is open, its transcript as the backend has it now.
+    ///
+    /// The appbar's refresh button asks for this, and so does a reconnect. A
+    /// connection that comes back knows nothing about what happened while it
+    /// was gone: the turns that ran in the open session while the phone was
+    /// locked exist only in the backend's history, so a reconnect that merely
+    /// re-subscribes leaves the chat older than the conversation it shows.
+    fn refresh(&self) {
+        let _ = self.list_sessions();
+        let config = self.config();
+        let backend = self.backend();
+        let events = self.events.clone();
+        let open = self.open.clone();
+        let Some(stored) = open.lock().unwrap().stored_id.clone() else {
+            return;
+        };
+        self.runtime
+            .spawn(catch_up_history(backend, config, events, open, stored));
     }
 
     fn open_session(&self, id: String) {

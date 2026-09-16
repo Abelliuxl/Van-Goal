@@ -49,6 +49,7 @@ struct Args {
     history: Vec<String>,
     poke: bool,
     list: bool,
+    raw: bool,
 }
 
 fn parse_args() -> Args {
@@ -60,6 +61,7 @@ fn parse_args() -> Args {
         history: Vec::new(),
         poke: false,
         list: false,
+        raw: false,
     };
     let mut positional = true;
     let mut rest = std::env::args().skip(1).peekable();
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
                 }
             }
             "--poke" => args.poke = true,
+            "--raw" => args.raw = true,
             "--list" => args.list = true,
             other if positional && !other.starts_with("--") => {
                 args.url = other.to_string();
@@ -197,6 +200,11 @@ async fn main() {
                     if ok {
                         let payload = object.get("payload").cloned().unwrap_or(Value::Null);
                         println!("[{elapsed:>6.1}s] res  {label} ok {}", summarize(&payload));
+                        if label == "sessions.list" {
+                            for row in accounting_rows(&payload) {
+                                println!("[{elapsed:>6.1}s]   {row}");
+                            }
+                        }
                         if label == "chat.history" {
                             for row in history_rows(&payload) {
                                 println!("[{elapsed:>6.1}s]   {row}");
@@ -371,6 +379,11 @@ async fn main() {
                     "[{elapsed:>6.1}s] EVENT {event:<24} label={label:<40} {verdict}{}",
                     if is_turn { format!(" deep={deep:?}") } else { String::new() }
                 );
+                if args.raw && is_turn {
+                    let text = payload.to_string();
+                    let cut = text.char_indices().take(600).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                    println!("[{elapsed:>6.1}s]   raw {event}: {}", &text[..cut]);
+                }
             }
         }
     }
@@ -502,6 +515,31 @@ fn history_rows(payload: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every session's context accounting, most-used first.
+///
+/// This is the backend's own answer to "how full is this conversation", which
+/// is what a frontend shows instead of estimating it — so it is also what to
+/// check a frontend's reading against.
+fn accounting_rows(payload: &Value) -> Vec<String> {
+    let Some(rows) = payload.get("sessions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|row| {
+            let key = row.get("key").and_then(Value::as_str)?;
+            let used = row.get("totalTokens").and_then(Value::as_i64)?;
+            let window = row.get("contextTokens").and_then(Value::as_i64);
+            let shown = window
+                .map(|window| format!("{:>8} / {:<9}", used, window))
+                .unwrap_or_else(|| format!("{used:>8} / {}", "-"));
+            Some((used, format!("    {shown}  {key}")))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, line)| line).collect()
 }
 
 /// One line describing an RPC result, without dumping a whole session list.

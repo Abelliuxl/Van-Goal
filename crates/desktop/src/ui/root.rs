@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::ui::chat::ChatView;
+use crate::ui::chat::{context_meter, ChatView};
 use crate::ui::sidebar::SidebarView;
 use crate::ui::theme::Theme;
 use gpui::{
@@ -118,6 +118,20 @@ impl Render for RootView {
                 state.last_error.clone(),
             )
         };
+        // The two things about the session on screen that a reader wants without
+        // asking: how full its context is, and which model is filling it. Both
+        // are read here rather than inside the element tree so the state borrow
+        // ends before the closures below.
+        let (context_usage, model_name) = {
+            let state = state.read(cx);
+            let model = state
+                .selected_session
+                .as_ref()
+                .and_then(|session| session.model.clone())
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| state.current_model_name.trim().to_string());
+            (state.context_usage(), model)
+        };
 
         div()
             .size_full()
@@ -218,7 +232,18 @@ impl Render for RootView {
                             .max_w(px(720.0))
                             .text_ellipsis()
                             .child(error)
-                    })),
+                    }))
+                    .child(context_meter(context_usage, 72.0))
+                    .when(!model_name.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_size(Theme::text_px(11.0))
+                                .text_color(Theme::text_tertiary())
+                                .max_w(px(260.0))
+                                .text_ellipsis()
+                                .child(model_name),
+                        )
+                    }),
             )
     }
 }

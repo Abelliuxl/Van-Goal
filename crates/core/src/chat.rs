@@ -143,6 +143,13 @@ impl Conversation {
         &self.messages
     }
 
+    /// The messages on screen, mutable. Rarely wanted: the fold owns the list
+    /// during a turn. A test or a repair that must reach into an existing
+    /// message uses this instead of the frontend keeping its own copy.
+    pub fn messages_mut(&mut self) -> &mut Vec<ChatMessage> {
+        &mut self.messages
+    }
+
     pub fn is_sending(&self) -> bool {
         self.sending
     }
@@ -158,6 +165,19 @@ impl Conversation {
             .push(ChatMessage::new(MessageRole::User, prompt));
         self.sending = true;
         self.streams.clear();
+    }
+
+    /// Like [`begin_turn_with`], plus the assistant placeholder right away.
+    ///
+    /// The desktop sends this way: on a slow handshake the placeholder arriving
+    /// with `MessageStart` would leave the prompt sitting alone in the chat for
+    /// the whole round trip, and the composer would look like it did nothing.
+    /// The backend's own `MessageStart` finds the placeholder already there and
+    /// adds nothing (see `start_message`).
+    pub fn begin_turn_with_placeholder(&mut self, prompt: &str) {
+        self.begin_turn_with(prompt);
+        self.messages
+            .push(ChatMessage::streaming(MessageRole::Assistant));
     }
 
     pub fn begin_turn(&mut self) {
@@ -291,7 +311,10 @@ impl Conversation {
         }
     }
 
-    fn complete_message(&mut self, text: Option<&str>) -> ConversationChange {
+    /// The turn's reply is complete. The mobile bridge reaches this through
+    /// [`Self::apply`]; the desktop calls it directly for a turn the backend
+    /// reported as failed, with the error as the final text.
+    pub fn complete_message(&mut self, text: Option<&str>) -> ConversationChange {
         let final_text = text
             .map(str::to_string)
             .unwrap_or_else(|| best_stream_text(&self.streams));
@@ -389,6 +412,25 @@ mod tests {
         assert!(needs_session_title(Some("  ")));
         assert!(needs_session_title(Some("New Chat")));
         assert!(!needs_session_title(Some("Van-Goal")));
+    }
+
+    /// The desktop sends with the placeholder already in place, so a slow
+    /// handshake leaves something moving on screen. The backend's own
+    /// `MessageStart` must not add a second placeholder on top of it.
+    #[test]
+    fn sending_with_a_placeholder_shows_one_bubble_per_turn() {
+        let mut conversation = Conversation::new();
+        conversation.begin_turn_with_placeholder("第一句");
+        assert_eq!(conversation.messages().len(), 2);
+        assert_eq!(conversation.messages()[0].role, MessageRole::User);
+        assert!(conversation.messages()[1].is_streaming);
+
+        assert_eq!(
+            conversation.apply(&AgentEvent::MessageStart),
+            ConversationChange::None,
+            "the placeholder is already on screen"
+        );
+        assert_eq!(conversation.messages().len(), 2);
     }
 
     #[test]
