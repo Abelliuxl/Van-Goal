@@ -333,6 +333,8 @@ impl ChatView {
             self.last_scroll_signature = signature;
             // Every bubble in the old session is out of scope.
             self.markdown_memo.clear();
+            self.text_selection = None;
+            self.context_menu = None;
         } else if message_count != self.last_list_count {
             let old_count = self.last_list_count;
             self.last_list_count = message_count;
@@ -1379,12 +1381,28 @@ impl ChatView {
 
         composer = composer.child(
             div()
+                .id("composer-box")
                 .rounded_xl()
                 .bg(Theme::input_bg())
                 .border_1()
                 .border_color(Theme::border())
                 .flex()
                 .flex_col()
+                // A click here leaves the transcript: an active selection in
+                // the transcript is not what the user is looking at any more,
+                // so it goes with the menu.
+                .on_mouse_down(MouseButton::Left, {
+                    let chat = chat.clone();
+                    move |_event, _window, cx| {
+                        chat.update(cx, |chat, cx| {
+                            if chat.text_selection.take().is_some()
+                                || chat.context_menu.take().is_some()
+                            {
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
                 .child(div().px_4().pt_2().pb_1().child(editor.clone()))
                 .child(
                     div()

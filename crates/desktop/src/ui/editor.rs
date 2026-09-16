@@ -71,6 +71,7 @@ pub enum EditorEvent {
     Change,
 }
 
+#[derive(Clone)]
 struct LineEntry {
     /// Byte offset of this logical line inside the content.
     byte_start: usize,
@@ -94,6 +95,10 @@ pub struct Editor {
     /// Long single values such as credentials may wrap visually while still
     /// rejecting embedded line breaks and submitting on Enter.
     wrap_long_lines: bool,
+    /// First visible wrapped row: content taller than the editor's box is
+    /// clipped, and this window follows the caret so what is being typed or
+    /// selected stays on screen.
+    scroll_row: usize,
 }
 
 impl Editor {
@@ -123,6 +128,7 @@ impl Editor {
             lines: Vec::new(),
             last_bounds: None,
             is_selecting: false,
+            scroll_row: 0,
             single_line,
             wrap_long_lines,
         }
@@ -151,6 +157,10 @@ impl Editor {
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
+        // The text changed wholesale: rows are reshaped at the next paint, so
+        // the scroll window restarts at the top and follows the caret again.
+        self.lines.clear();
+        self.scroll_row = 0;
         cx.notify();
     }
 
@@ -164,6 +174,7 @@ impl Editor {
         let offset = self.clamp(offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.ensure_cursor_visible(cx);
         cx.notify();
     }
 
@@ -188,6 +199,7 @@ impl Editor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.selected_range = self.clamp_range(self.selected_range.clone());
+        self.ensure_cursor_visible(cx);
         cx.notify();
     }
 
@@ -277,7 +289,16 @@ impl Editor {
         let line_height = px(row_height());
         for (row_index, entry) in self.lines.iter().enumerate() {
             let rows = entry.line.wrap_boundaries().len() + 1;
-            let top = bounds.top() + px(self.rows_above(row_index) as f32 * row_height());
+            // Rows scrolled off the top sit above the box; a click can only
+            // land on what is visible.
+            let top = bounds.top()
+                + px(
+                    (self.rows_above(row_index).saturating_sub(self.scroll_row)) as f32
+                        * row_height(),
+                );
+            if top < bounds.top() {
+                continue;
+            }
             let span = px(row_height() * rows as f32);
             if position.y >= top && position.y <= top + span {
                 let local = point(position.x - bounds.left(), position.y - top);
@@ -302,6 +323,64 @@ impl Editor {
             .iter()
             .map(|entry| entry.line.wrap_boundaries().len() + 1)
             .sum()
+    }
+
+    /// Rows the content would paint in total.
+    fn total_rows(&self) -> usize {
+        self.rows_above(self.lines.len())
+    }
+
+    /// The wrapped row the caret sits on.
+    fn caret_row(&self) -> usize {
+        let cursor = self.cursor_offset();
+        for (index, entry) in self.lines.iter().enumerate() {
+            let line_end = entry.byte_start + entry.line.len();
+            if cursor <= line_end {
+                let within = entry
+                    .line
+                    .position_for_index(
+                        (cursor - entry.byte_start).min(entry.line.len()),
+                        px(row_height()),
+                    )
+                    .map(|point| (point.y / px(row_height())) as usize)
+                    .unwrap_or(0);
+                return self.rows_above(index) + within;
+            }
+        }
+        self.total_rows()
+    }
+
+    /// Keep the caret row on screen once the content outgrows the box.
+    fn ensure_cursor_visible(&mut self, cx: &mut Context<Self>) {
+        if self.single_line && !self.wrap_long_lines {
+            return;
+        }
+        let max = self.max_visible_rows();
+        let total = self.total_rows();
+        if total <= max {
+            if self.scroll_row != 0 {
+                self.scroll_row = 0;
+                cx.notify();
+            }
+            return;
+        }
+        let caret = self.caret_row();
+        let mut next = self.scroll_row;
+        if caret < next {
+            next = caret;
+        }
+        if caret >= next + max {
+            next = caret + 1 - max;
+        }
+        if next != self.scroll_row {
+            self.scroll_row = next;
+            cx.notify();
+        }
+    }
+
+    /// How many rows fit the editor's box.
+    fn max_visible_rows(&self) -> usize {
+        8
     }
 
     // -- editing -----------------------------------------------------------
@@ -337,6 +416,9 @@ impl Editor {
         );
         self.selected_range = cursor..cursor;
         self.marked_range = None;
+        // Content just moved under the caret: reshaped rows land later.
+        self.lines.clear();
+        self.ensure_cursor_visible(cx);
         cx.emit(EditorEvent::Change);
         cx.notify();
     }
@@ -904,6 +986,42 @@ mod tests {
 
         let _ = root;
     }
+
+    /// Pasting more rows than the box holds used to paint them straight past
+    /// the editor, over whatever sat below. Now the visible window follows the
+    /// caret: with the caret at the end of a twelve-row paste, the first rows
+    /// are scrolled off and the caret's row is on screen.
+    #[gpui::test]
+    fn content_taller_than_the_box_follows_the_caret(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(cx);
+            let content: String = (0..12).map(|row| format!("line {row}\n")).collect();
+            editor.set_text(content, cx);
+            editor
+        });
+        struct EditorRoot(Entity<Editor>);
+        impl Render for EditorRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().w(px(320.0)).h(px(180.0)).child(self.0.clone())
+            }
+        }
+        let (_root, cx) = cx.add_window_view(|_window, _cx| EditorRoot(editor.clone()));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let scroll = editor.read_with(cx, |editor, _cx| editor.scroll_row);
+        assert!(
+            scroll > 0,
+            "the caret at the end of the paste was not scrolled into view"
+        );
+        assert!(scroll < 12, "the scroll window ran past the content");
+    }
 }
 
 impl Focusable for Editor {
@@ -1069,6 +1187,9 @@ struct PrepaintState {
     content_size: Size<Pixels>,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    /// First visible wrapped row: rows before it paint above the box, where
+    /// the content mask clips them.
+    scroll_row: usize,
 }
 
 impl IntoElement for EditorElement {
@@ -1161,6 +1282,7 @@ impl Element for EditorElement {
         let content = editor.content.clone();
         let selected_range = editor.selected_range.clone();
         let cursor = editor.cursor_offset();
+        let scroll_row = editor.scroll_row;
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
 
@@ -1240,7 +1362,9 @@ impl Element for EditorElement {
                         .line
                         .position_for_index(cursor - entry.byte_start, px(row_height()))
                     {
-                        let y = bounds.top() + px(rows_above as f32 * row_height()) + local.y;
+                        let y = bounds.top()
+                            + px((rows_above as f32 - scroll_row as f32) * row_height())
+                            + local.y;
                         cursor_quad = Some(fill(
                             Bounds::new(
                                 point(bounds.left() + local.x, y),
@@ -1273,10 +1397,12 @@ impl Element for EditorElement {
                     if let (Some(start_local), Some(end_local)) = (start_local, end_local) {
                         // One quad per wrapped row is overkill for v1: draw the
                         // whole span on one row when it fits, else a full-row
-                        // highlight.
+                        // highlight. Rows scrolled off the top paint above the
+                        // box and the mask clips them.
                         if (start_local.y - end_local.y).abs() < px(0.5) {
-                            let y =
-                                bounds.top() + px(rows_above as f32 * row_height()) + start_local.y;
+                            let y = bounds.top()
+                                + px((rows_above as f32 - scroll_row as f32) * row_height())
+                                + start_local.y;
                             selection_quads.push(fill(
                                 Bounds::new(
                                     point(bounds.left() + start_local.x, y),
@@ -1289,7 +1415,8 @@ impl Element for EditorElement {
                             ));
                         } else {
                             let rows = entry.line.wrap_boundaries().len() + 1;
-                            let y = bounds.top() + px(rows_above as f32 * row_height());
+                            let y = bounds.top()
+                                + px((rows_above as f32 - scroll_row as f32) * row_height());
                             selection_quads.push(fill(
                                 Bounds::new(
                                     point(bounds.left(), y),
@@ -1312,11 +1439,20 @@ impl Element for EditorElement {
             px(row_height() * content_rows.max(1) as f32),
         );
 
+        // Store the freshly shaped rows now (paint used to do it later), so
+        // the scroll window is computed against rows that exist, and the
+        // caret stays in view after every reshape.
+        self.entity.update(cx, |editor, cx| {
+            editor.lines = lines.clone();
+            editor.ensure_cursor_visible(cx);
+        });
+
         PrepaintState {
             lines,
             content_size,
             cursor: cursor_quad,
             selection: selection_quads,
+            scroll_row,
         }
     }
 
@@ -1337,33 +1473,40 @@ impl Element for EditorElement {
             cx,
         );
 
-        for quad in prepaint.selection.drain(..) {
-            window.paint_quad(quad);
-        }
-
-        let line_height = px(row_height());
-        let mut rows_above = 0usize;
-        for entry in &prepaint.lines {
-            let origin = point(
-                bounds.left(),
-                bounds.top() + px(rows_above as f32 * row_height()),
-            );
-            let _ = entry
-                .line
-                .paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
-            rows_above += entry.line.wrap_boundaries().len() + 1;
-        }
-
-        if focus_handle.is_focused(window) {
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
+        // Everything is painted at its content position minus the scrolled
+        // rows, then clipped to the box: content taller than the editor no
+        // longer paints past the box and over whatever sits below it.
+        let content_mask = gpui::ContentMask { bounds };
+        window.with_content_mask(Some(content_mask), |window| {
+            for quad in prepaint.selection.drain(..) {
+                window.paint_quad(quad);
             }
-        }
 
-        let lines = std::mem::take(&mut prepaint.lines);
+            let line_height = px(row_height());
+            let mut rows_above = 0usize;
+            for entry in &prepaint.lines {
+                let origin = point(
+                    bounds.left(),
+                    bounds.top()
+                        + px((rows_above as f32 - prepaint.scroll_row as f32) * row_height()),
+                );
+                let _ =
+                    entry
+                        .line
+                        .paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+                rows_above += entry.line.wrap_boundaries().len() + 1;
+            }
+
+            if focus_handle.is_focused(window) {
+                if let Some(cursor) = prepaint.cursor.take() {
+                    window.paint_quad(cursor);
+                }
+            }
+        });
+
+        let _ = std::mem::take(&mut prepaint.lines);
         let content_size = prepaint.content_size;
         self.entity.update(cx, |editor, _cx| {
-            editor.lines = lines;
             editor.last_bounds = Some(bounds);
         });
         let _ = content_size;
