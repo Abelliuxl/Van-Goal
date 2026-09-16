@@ -5,8 +5,8 @@ use gpui::{
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement, Style, Styled, TextRun,
-    UTF16Selection, Window, WrappedLine,
+    Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Style,
+    Styled, TextRun, UTF16Selection, Window, WrappedLine,
 };
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -381,6 +381,32 @@ impl Editor {
     /// How many rows fit the editor's box.
     fn max_visible_rows(&self) -> usize {
         8
+    }
+
+    /// Scroll the visible window by whole rows, clamped to the content. This
+    /// is the wheel's path; typing keeps following the caret.
+    fn scroll_by(&mut self, rows: i64, cx: &mut Context<Self>) {
+        let max_scroll = self.total_rows().saturating_sub(self.max_visible_rows());
+        let next = (self.scroll_row as i64 + rows).clamp(0, max_scroll as i64) as usize;
+        if next != self.scroll_row {
+            self.scroll_row = next;
+            cx.notify();
+        }
+    }
+
+    /// The scroll wheel: wheeling down scrolls the window down.
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = self.total_rows();
+        if total <= self.max_visible_rows() {
+            return;
+        }
+        let pixels = event.delta.pixel_delta(px(row_height())).y;
+        self.scroll_by((-pixels / px(row_height())).round() as i64, cx);
     }
 
     // -- editing -----------------------------------------------------------
@@ -1190,6 +1216,8 @@ struct PrepaintState {
     /// First visible wrapped row: rows before it paint above the box, where
     /// the content mask clips them.
     scroll_row: usize,
+    /// The thumb of the editor's own scrollbar, if the content scrolls.
+    thumb: Option<PaintQuad>,
 }
 
 impl IntoElement for EditorElement {
@@ -1439,6 +1467,26 @@ impl Element for EditorElement {
             px(row_height() * content_rows.max(1) as f32),
         );
 
+        // A thin thumb on the right edge whenever the content outgrows the
+        // box, positioned from the same rows the text is painted from.
+        let thumb_quad = if content_rows > 8 {
+            let track = bounds.size.height;
+            let thumb_height = (track * 8.0 / content_rows.max(1) as f32).max(px(24.0));
+            let thumb_top = bounds.top()
+                + track
+                    * (scroll_row as f32 / (content_rows - 8).max(1) as f32)
+                    * (1.0 - thumb_height / track).min(1.0);
+            Some(fill(
+                Bounds::new(
+                    point(bounds.right() - px(6.0), thumb_top),
+                    size(px(3.0), thumb_height),
+                ),
+                rgba(0xffffff2c),
+            ))
+        } else {
+            None
+        };
+
         // Store the freshly shaped rows now (paint used to do it later), so
         // the scroll window is computed against rows that exist, and the
         // caret stays in view after every reshape.
@@ -1453,6 +1501,7 @@ impl Element for EditorElement {
             cursor: cursor_quad,
             selection: selection_quads,
             scroll_row,
+            thumb: thumb_quad,
         }
     }
 
@@ -1495,6 +1544,10 @@ impl Element for EditorElement {
                         .line
                         .paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
                 rows_above += entry.line.wrap_boundaries().len() + 1;
+            }
+
+            if let Some(thumb) = prepaint.thumb.take() {
+                window.paint_quad(thumb);
             }
 
             if focus_handle.is_focused(window) {
@@ -1545,6 +1598,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

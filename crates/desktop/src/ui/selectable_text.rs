@@ -3,9 +3,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    fill, point, px, App, Bounds, CursorStyle, Element, ElementId, GlobalElementId, HighlightStyle,
-    Hitbox, HitboxBehavior, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, SharedString, StyledText, TextLayout, Window,
+    App, Bounds, CursorStyle, Element, ElementId, GlobalElementId, HighlightStyle, HitboxBehavior,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    SharedString, StyledText, TextLayout, Window,
 };
 
 use crate::ui::theme::Theme;
@@ -33,18 +33,20 @@ pub trait SelectionHost {
 /// item, a quote, a table cell or a code block.
 ///
 /// Layout and glyph painting are delegated to gpui's own [`StyledText`], so
-/// this block measures and wraps exactly like the plain text it replaced; the
-/// only additions are the selection highlight underneath and the mouse
-/// handling. Without a host it paints the text and nothing more, which is the
-/// plain renderer's behaviour.
+/// this block measures and wraps exactly like the plain text it replaced. The
+/// selection is folded into the runs as their background colour, so it is
+/// painted by the same pass as the glyphs and lines up with every wrapped row
+/// and every inline-code span by construction.
 pub struct SelectableText {
     id: ElementId,
     /// Selection identity: a block cannot hold another block's selection.
     /// Stable across frames so a repaint keeps the highlight.
     key: u64,
     text: SharedString,
-    /// The styled text this block delegates to, carrying the same highlights
-    /// a plain `StyledText` would take.
+    /// The block's own highlights; the selection is re-cut against them per
+    /// frame (see [`selection_over`]).
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    /// The styled text this block delegates to.
     styled: StyledText,
     /// `(byte range in `text`, destination)` pairs, sorted by range start.
     links: Vec<(Range<usize>, String)>,
@@ -72,11 +74,12 @@ impl SelectableText {
         host: Option<Rc<dyn SelectionHost>>,
     ) -> Self {
         let text = text.into();
-        let styled = StyledText::new(text.clone()).with_highlights(highlights);
+        let styled = StyledText::new(text.clone()).with_highlights(highlights.clone());
         Self {
             id: id.into(),
             key,
             text,
+            highlights,
             styled,
             links,
             host,
@@ -114,6 +117,24 @@ impl Element for SelectableText {
         // The inner StyledText owns measurement in every layout pass
         // (intrinsic, min-content, final) — rolling that by hand is how
         // wrapped heights and widths drifted from their boxes before.
+        //
+        // The selection ships inside the runs as their background colour, so
+        // the same pass that paints the glyphs paints the selection: it aligns
+        // with every wrapped row and every inline-code span by construction. A
+        // separately painted highlight underneath loses that fight to the code
+        // spans' own backgrounds, which is what made selected rows and spans
+        // look unselected.
+        let selection = self
+            .host
+            .as_ref()
+            .and_then(|host| host.selection(cx))
+            .filter(|(key, _, _)| *key == self.key)
+            .map(|(_, range, _)| range);
+        self.styled = StyledText::new(self.text.clone()).with_highlights(selection_over(
+            self.text.len(),
+            self.highlights.clone(),
+            selection,
+        ));
         self.styled.request_layout(None, _inspector_id, window, cx)
     }
 
@@ -146,24 +167,15 @@ impl Element for SelectableText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(host) = self.host.clone() else {
-            self.styled
-                .paint(None, None, bounds, &mut (), &mut (), window, cx);
-            return;
-        };
-
-        // The highlight underneath the text has to be painted first, and the
-        // inner element paints its glyphs in this same pass: the selection
-        // quads therefore go down first.
-        let selection = host.selection(cx).filter(|(key, _, _)| *key == self.key);
-        if let Some((_, range, _)) = &selection {
-            for quad in selection_quads(&prepaint.layout, &prepaint.text, range.clone(), bounds) {
-                window.paint_quad(quad);
-            }
-        }
+        // The selection ships inside the runs (see request_layout), so the
+        // glyphs are all this pass paints.
         self.styled
             .paint(None, None, bounds, &mut (), &mut (), window, cx);
         window.set_cursor_style(CursorStyle::IBeam, &prepaint.hitbox);
+
+        let Some(host) = self.host.clone() else {
+            return;
+        };
 
         window.with_element_state::<Drag, _>(global_id.unwrap(), |state, window| {
             let drag = state.unwrap_or_default();
@@ -275,7 +287,7 @@ impl Element for SelectableText {
 pub struct PrepaintState {
     layout: TextLayout,
     text: SharedString,
-    hitbox: Hitbox,
+    hitbox: gpui::Hitbox,
 }
 
 /// Byte index of a window position, through the shared layout.
@@ -313,68 +325,198 @@ fn word_range_around(text: &str, index: usize) -> Range<usize> {
     start..end.max(start)
 }
 
-/// One highlight quad per wrapped row the selection covers, positioned from
-/// the same layout the glyphs were painted from.
-fn selection_quads(
-    layout: &TextLayout,
-    text: &str,
-    range: Range<usize>,
-    bounds: Bounds<Pixels>,
-) -> Vec<PaintQuad> {
-    let line_height = layout.line_height();
-    let (start, end) = (range.start.min(range.end), range.start.max(range.end));
-    if start >= end {
-        return Vec::new();
+/// Tile the block's text into disjoint pieces against both the styled spans
+/// and the selection, and hand every covered piece its style — with the
+/// selection background winning over a code span's own. Deterministic, so the
+/// selection always reads as one solid range.
+fn selection_over(
+    text_len: usize,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    selection: Option<Range<usize>>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let Some(selection) = selection else {
+        return highlights;
+    };
+    let mut cuts = vec![0usize, text_len, selection.start, selection.end];
+    for (range, _) in &highlights {
+        cuts.push(range.start);
+        cuts.push(range.end);
     }
+    cuts.retain(|cut| *cut <= text_len);
+    cuts.sort_unstable();
+    cuts.dedup();
 
-    let mut quads = Vec::new();
-    let mut byte = 0usize;
-    let mut rows_above = 0usize;
-    for line in text.split('\n') {
-        let line_start = byte;
-        let relative_len = line.len();
-        if let Some(wrapped) = layout.line_layout_for_index(line_start) {
-            // Byte ranges of each wrapped row inside this logical line: the
-            // wrap boundaries carry the glyph they wrap before.
-            let mut row_ends: Vec<usize> = wrapped
-                .wrap_boundaries
-                .iter()
-                .map(|boundary| {
-                    wrapped.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
-                })
-                .collect();
-            row_ends.push(relative_len);
-
-            let mut row_start = 0usize;
-            for row_end in row_ends.iter() {
-                let intersect_start = start.max(line_start + row_start);
-                let intersect_end = end.min(line_start + row_end);
-                if intersect_start < intersect_end {
-                    let local_from = intersect_start - line_start;
-                    let local_to = intersect_end - line_start;
-                    if let (Some(from), Some(to)) = (
-                        wrapped.position_for_index(local_from, line_height),
-                        wrapped.position_for_index(local_to, line_height),
-                    ) {
-                        // `from.y` is the wrapped row's offset inside this
-                        // logical line; the rows of the logical lines before
-                        // it come from the running count.
-                        let y = bounds.top() + rows_above as f32 * line_height + from.y;
-                        quads.push(highlight_quad(Bounds::new(
-                            point(bounds.left() + from.x, y),
-                            gpui::size((to.x - from.x).max(px(2.0)), line_height),
-                        )));
-                    }
-                }
-                row_start = *row_end;
-            }
-            rows_above += row_ends.len();
+    let mut out = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        if from >= to {
+            continue;
         }
-        byte += relative_len + 1;
+        // The pieces are disjoint and sorted, so at most one spans a window.
+        let containing = highlights
+            .iter()
+            .find(|(range, _)| range.contains(&from))
+            .map(|(_, style)| *style)
+            .unwrap_or_default();
+        let mut style = containing;
+        if from >= selection.start && to <= selection.end {
+            style.background_color = Some(Theme::selection());
+        }
+        out.push((from..to, style));
     }
-    quads
+    out
 }
 
-fn highlight_quad(bounds: Bounds<Pixels>) -> PaintQuad {
-    fill(bounds, Theme::selection())
+#[cfg(test)]
+const ROW_HEIGHT: f32 = 20.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{div, point, prelude::*, px, Context, TestAppContext};
+    use std::cell::RefCell;
+
+    type StoredSelection = Option<(u64, Range<usize>, String)>;
+
+    /// A stand-in for the transcript: records whatever a block stores through
+    /// the host, so the selection layer is testable on its own.
+    #[derive(Default)]
+    struct FakeSink {
+        stored: RefCell<StoredSelection>,
+    }
+
+    impl SelectionHost for FakeSink {
+        fn selection(&self, _cx: &App) -> Option<(u64, Range<usize>, String)> {
+            self.stored
+                .borrow()
+                .as_ref()
+                .map(|(key, range, text)| (*key, range.clone(), text.clone()))
+        }
+
+        fn set_selection(&self, key: u64, range: Range<usize>, text: String, _cx: &mut App) {
+            *self.stored.borrow_mut() = Some((key, range, text));
+        }
+
+        fn clear_selection(&self, _cx: &mut App) {
+            *self.stored.borrow_mut() = None;
+        }
+
+        fn focus_transcript(&self, _window: &mut Window, _cx: &mut App) {}
+
+        fn open_context_menu(&self, _position: gpui::Point<Pixels>, _text: String, _cx: &mut App) {}
+    }
+
+    struct Fixture {
+        sink: Rc<FakeSink>,
+        text: SharedString,
+        width: f32,
+    }
+
+    impl Render for Fixture {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("selectable-probe")
+                .debug_selector(|| "selectable-probe".into())
+                .w(px(self.width))
+                .child(
+                    SelectableText::new(
+                        "probe",
+                        42,
+                        self.text.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Some(self.sink.clone()),
+                    )
+                    .into_any(),
+                )
+        }
+    }
+
+    /// Dragging across part of a block selects those bytes: the host receives
+    /// the range and the text it picks out.
+    #[gpui::test]
+    fn a_drag_within_a_block_stores_the_selection_on_the_host(cx: &mut TestAppContext) {
+        let sink = Rc::new(FakeSink::default());
+        let text = SharedString::from("hello brave world");
+        let (_root, cx) = cx.add_window_view(|_window, _cx| Fixture {
+            sink: sink.clone(),
+            text: text.clone(),
+            width: 320.0,
+        });
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        // Pixel positions of bytes 6 and 11, shaped the same way the element
+        // shapes its own text.
+        let (start, end) = _root.update_in(cx, |_, window, _cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let run = style.to_run(17);
+            let lines = window
+                .text_system()
+                .shape_text(text.clone(), font_size, &[run], Some(px(320.0)), None)
+                .unwrap();
+            (
+                lines[0].position_for_index(6, px(ROW_HEIGHT)).unwrap(),
+                lines[0].position_for_index(11, px(ROW_HEIGHT)).unwrap(),
+            )
+        });
+        let at = |local: gpui::Point<Pixels>| {
+            point(px(0.0) + local.x, px(0.0) + local.y + px(ROW_HEIGHT / 2.0))
+        };
+
+        cx.simulate_mouse_down(at(start), MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(at(end), Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(at(end), MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let stored = sink.stored.borrow().clone();
+        let (key, range, text) = stored.expect("no selection was stored");
+        assert_eq!(key, 42);
+        assert_eq!(range, 6..11, "selection picked {:?}", range);
+        assert_eq!(text, "brave");
+
+        // A click elsewhere clears it.
+        cx.simulate_mouse_down(
+            gpui::point(px(300.0), px(50.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(
+            sink.stored.borrow().is_none(),
+            "selection survived a click outside the block"
+        );
+    }
+
+    /// A block that wraps must report the height of every wrapped row. The
+    /// height used to be guessed from the *logical* line count, so a paragraph
+    /// that wrapped onto six rows claimed one and painted over the block below
+    /// it — the transcript read as overlapping garbage.
+    #[gpui::test]
+    fn wrapped_blocks_measure_the_rows_they_need(cx: &mut TestAppContext) {
+        let sink = Rc::new(FakeSink::default());
+        let text = SharedString::from("一".repeat(240));
+        let (_root, cx) = cx.add_window_view(|_window, _cx| Fixture {
+            sink: sink.clone(),
+            text,
+            width: 220.0,
+        });
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+        let bounds = cx
+            .debug_bounds("selectable-probe")
+            .unwrap_or_else(|| panic!("probe was not laid out"));
+
+        // 240 CJK characters in a 220px column need far more than two rows.
+        assert!(
+            f32::from(bounds.size.height) > 8.0 * 20.0,
+            "wrapped block claimed only {}px of height",
+            bounds.size.height
+        );
+    }
 }
