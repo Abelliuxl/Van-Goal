@@ -1403,57 +1403,54 @@ impl Element for EditorElement {
                     }
                 }
             } else {
+                // One quad per wrapped row the selection covers: a selection
+                // that crosses a row boundary used to paint the whole logical
+                // line as one block, which read as "everything got selected".
                 let start = selected_range.start.min(selected_range.end);
                 let end = selected_range.start.max(selected_range.end);
-                for (row, entry) in lines.iter().enumerate() {
-                    let line_end = entry.byte_start + entry.line.len();
-                    let intersect_start = start.max(entry.byte_start);
-                    let intersect_end = end.min(line_end);
-                    if intersect_start >= intersect_end {
-                        continue;
-                    }
-                    let rows_above: usize = lines[..row]
+                let mut rows_above = 0usize;
+                for entry in &lines {
+                    let row_ends: Vec<usize> = entry
+                        .line
+                        .wrap_boundaries()
                         .iter()
-                        .map(|entry| entry.line.wrap_boundaries().len() + 1)
-                        .sum();
-                    let start_local = entry
-                        .line
-                        .position_for_index(intersect_start - entry.byte_start, px(row_height()));
-                    let end_local = entry
-                        .line
-                        .position_for_index(intersect_end - entry.byte_start, px(row_height()));
-                    if let (Some(start_local), Some(end_local)) = (start_local, end_local) {
-                        // One quad per wrapped row is overkill for v1: draw the
-                        // whole span on one row when it fits, else a full-row
-                        // highlight. Rows scrolled off the top paint above the
-                        // box and the mask clips them.
-                        if (start_local.y - end_local.y).abs() < px(0.5) {
-                            let y = bounds.top()
-                                + px((rows_above as f32 - scroll_row as f32) * row_height())
-                                + start_local.y;
-                            selection_quads.push(fill(
-                                Bounds::new(
-                                    point(bounds.left() + start_local.x, y),
-                                    size(
-                                        (end_local.x - start_local.x).max(px(2.0)),
-                                        px(row_height()),
+                        .map(|boundary| {
+                            entry.line.unwrapped_layout.runs[boundary.run_ix].glyphs
+                                [boundary.glyph_ix]
+                                .index
+                        })
+                        .chain([entry.line.len()])
+                        .collect();
+                    let mut row_start = 0usize;
+                    for row_end in &row_ends {
+                        let intersect_start = start.max(entry.byte_start + row_start);
+                        let intersect_end = end.min(entry.byte_start + row_end);
+                        if intersect_start < intersect_end {
+                            if let (Some(from), Some(to)) = (
+                                entry.line.position_for_index(
+                                    intersect_start - entry.byte_start,
+                                    px(row_height()),
+                                ),
+                                entry.line.position_for_index(
+                                    intersect_end - entry.byte_start,
+                                    px(row_height()),
+                                ),
+                            ) {
+                                let y = bounds.top()
+                                    + px((rows_above as f32 - scroll_row as f32) * row_height())
+                                    + from.y;
+                                selection_quads.push(fill(
+                                    Bounds::new(
+                                        point(bounds.left() + from.x, y),
+                                        size((to.x - from.x).max(px(2.0)), px(row_height())),
                                     ),
-                                ),
-                                rgba(0x3311ff30),
-                            ));
-                        } else {
-                            let rows = entry.line.wrap_boundaries().len() + 1;
-                            let y = bounds.top()
-                                + px((rows_above as f32 - scroll_row as f32) * row_height());
-                            selection_quads.push(fill(
-                                Bounds::new(
-                                    point(bounds.left(), y),
-                                    size(bounds.size.width, px(row_height() * rows as f32)),
-                                ),
-                                rgba(0x3311ff30),
-                            ));
+                                    rgba(0x3311ff30),
+                                ));
+                            }
                         }
+                        row_start = *row_end;
                     }
+                    rows_above += row_ends.len();
                 }
             }
         }
