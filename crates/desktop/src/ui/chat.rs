@@ -663,10 +663,30 @@ impl SelectionHost for Entity<ChatView> {
         });
     }
 
-    fn clear_selection(&self, cx: &mut gpui::App) {
+    fn press_outside(&self, position: gpui::Point<Pixels>, cx: &mut gpui::App) {
         self.update(cx, |chat, cx| {
-            chat.text_selection.take();
+            // A press on the menu itself belongs to the menu's own items;
+            // clearing here would drop the menu and the selection before the
+            // click can act on either.
+            let view_origin = chat.view_origin.unwrap_or_default();
+            let local = point(position.x - view_origin.x, position.y - view_origin.y);
+            let on_menu = chat.context_menu.as_ref().is_some_and(|menu| {
+                menu.position.x <= local.x
+                    && local.x <= menu.position.x + px(120.0)
+                    && menu.position.y <= local.y
+                    && local.y <= menu.position.y + px(64.0)
+            });
+            if on_menu {
+                return;
+            }
+            let mut changed = false;
+            if chat.text_selection.take().is_some() {
+                changed = true;
+            }
             if chat.context_menu.take().is_some() {
+                changed = true;
+            }
+            if changed {
                 cx.notify();
             }
         });
@@ -2792,6 +2812,95 @@ mod message_width_tests {
             "the reply starts at {} but the prompt bubble runs to {first_bottom}",
             f32::from(second.origin.y)
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+    use van_goal_core::models::ChatMessage;
+
+    struct SizedChat(Entity<ChatView>);
+
+    impl Render for SizedChat {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(900.0)).h(px(600.0)).child(self.0.clone())
+        }
+    }
+
+    /// A press on the context menu itself must leave the selection and the
+    /// menu untouched: the menu's items act on them after the click. A press
+    /// anywhere else drops both, as a click that leaves a selection should.
+    #[gpui::test]
+    fn a_press_on_the_context_menu_keeps_the_selection(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.conversation.set_transcript(vec![ChatMessage::new(
+                MessageRole::Assistant,
+                "hello brave world".to_string(),
+            )]);
+        });
+        let (host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let view: Entity<ChatView> = host.read_with(cx, |sized, _cx| sized.0.clone());
+        let (menu_position, view_origin) = view.read_with(cx, |chat, _cx| {
+            (
+                point(px(40.0), px(40.0)),
+                chat.view_origin.unwrap_or_default(),
+            )
+        });
+        let entity: Entity<ChatView> = view.clone();
+
+        entity.update(cx, |chat, _cx| {
+            chat.text_selection = Some(TextSelection {
+                key: 7,
+                range: 0..5,
+                text: "hello".to_string(),
+            });
+            chat.context_menu = Some(ContextMenu {
+                position: menu_position,
+                text: "hello".to_string(),
+            });
+        });
+
+        // A press inside the menu's rect: the window-coordinate event points
+        // at the menu only after the view origin is subtracted.
+        let on_menu = point(
+            view_origin.x + menu_position.x + px(30.0),
+            view_origin.y + px(55.0),
+        );
+        cx.update(|_window, cx| entity.press_outside(on_menu, cx));
+        view.read_with(cx, |chat, _cx| {
+            assert!(
+                chat.text_selection.is_some(),
+                "the press dropped the selection while on the menu"
+            );
+            assert!(
+                chat.context_menu.is_some(),
+                "the press closed the menu it landed on"
+            );
+        });
+
+        // A press far away clears both.
+        let far_away = point(view_origin.x + px(20.0), view_origin.y + px(400.0));
+        cx.update(|_window, cx| entity.press_outside(far_away, cx));
+        view.read_with(cx, |chat, _cx| {
+            assert!(
+                chat.text_selection.is_none(),
+                "selection survived an outside press"
+            );
+            assert!(
+                chat.context_menu.is_none(),
+                "the menu survived an outside press"
+            );
+        });
     }
 }
 

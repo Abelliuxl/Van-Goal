@@ -19,8 +19,10 @@ pub trait SelectionHost {
     fn selection(&self, cx: &App) -> Option<(u64, Range<usize>, String)>;
     /// Replace the active selection with this one and request a redraw.
     fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut App);
-    /// Drop the active selection and request a redraw.
-    fn clear_selection(&self, cx: &mut App);
+    /// A left press landed outside this block. Clears an active selection,
+    /// except when the press is on the open context menu — the menu's own
+    /// items have yet to act on the selection.
+    fn press_outside(&self, position: gpui::Point<Pixels>, cx: &mut App);
     /// Take focus, so a following ⌘C reaches the transcript's copy action
     /// instead of the composer's.
     fn focus_transcript(&self, window: &mut Window, cx: &mut App);
@@ -228,7 +230,7 @@ impl Element for SelectableText {
                         window.prevent_default();
                     } else if phase.capture() {
                         drag_down.anchor.set(None);
-                        host.clear_selection(cx);
+                        host.press_outside(event.position, cx);
                     }
                 }
             });
@@ -397,7 +399,7 @@ mod tests {
             *self.stored.borrow_mut() = Some((key, range, text));
         }
 
-        fn clear_selection(&self, _cx: &mut App) {
+        fn press_outside(&self, _position: gpui::Point<Pixels>, _cx: &mut App) {
             *self.stored.borrow_mut() = None;
         }
 
