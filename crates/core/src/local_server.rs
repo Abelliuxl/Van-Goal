@@ -1,21 +1,182 @@
-use crate::hermes_config::hermes_executable_path;
+use crate::agent::opencode;
+use crate::hermes_config::{hermes_executable_path, is_executable};
 use crate::log_debug;
 use crate::logger::global_logger;
+use crate::settings::BackendKind;
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Manages the local `hermes serve` subprocess: probe, start, wait for ready.
+/// A local agent server Van-Goal knows how to launch and keep an eye on.
+///
+/// Each variant is one recipe: where its CLI usually lives, the arguments that
+/// put it on a loopback port, and the path that answers once it is listening.
+/// A backend with no recipe here is never started by the app — it keeps
+/// connecting to a server the user is already running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedServer {
+    Hermes,
+    MiMoCode,
+}
+
+impl ManagedServer {
+    /// The server that serves this backend, or `None` when the app does not
+    /// start one for it. A backend missing from here keeps its existing
+    /// behaviour: Van-Goal connects to an already-running server.
+    pub fn for_kind(kind: BackendKind) -> Option<Self> {
+        match kind {
+            BackendKind::Hermes => Some(ManagedServer::Hermes),
+            BackendKind::MiMoCode => Some(ManagedServer::MiMoCode),
+            _ => None,
+        }
+    }
+
+    /// How the settings window names the server it manages.
+    pub fn label(self) -> &'static str {
+        match self {
+            ManagedServer::Hermes => "hermes serve",
+            ManagedServer::MiMoCode => "mimo serve",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ManagedServer::Hermes => "Hermes",
+            ManagedServer::MiMoCode => "MiMoCode",
+        }
+    }
+
+    /// The username its HTTP server pairs with the configured password. `None`
+    /// for a server whose health endpoint takes no credentials, which is the
+    /// case for a local Hermes.
+    pub fn auth_username(self) -> Option<&'static str> {
+        match self {
+            ManagedServer::Hermes => None,
+            ManagedServer::MiMoCode => Some(opencode::MIMOCODE_AUTH_USER),
+        }
+    }
+
+    /// The CLI, preferring a well-known install location over `PATH`.
+    fn executable(self) -> PathBuf {
+        match self {
+            ManagedServer::Hermes => {
+                hermes_executable_path().unwrap_or_else(|| PathBuf::from("hermes"))
+            }
+            ManagedServer::MiMoCode => self
+                .binary_search_directories()
+                .iter()
+                .map(|dir| dir.join("mimo"))
+                .find(|path| is_executable(path))
+                .unwrap_or_else(|| PathBuf::from("mimo")),
+        }
+    }
+
+    /// Directories a CLI of this kind is normally installed in, searched first
+    /// as a list of candidate paths and then prepended to the child's `PATH`.
+    ///
+    /// The second half matters: `mimo` is a `#!/usr/bin/env node` script, so the
+    /// process it is started as needs to find `node` on its own `PATH`. An app
+    /// launched from Finder inherits only the system default
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`), where neither a user's own bin
+    /// directory nor Homebrew appears — the CLI would be found and then fail to
+    /// run at all.
+    fn binary_search_directories(self) -> Vec<PathBuf> {
+        let home = crate::logger::dirs::home();
+        match self {
+            ManagedServer::Hermes => vec![
+                home.join(".local/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ],
+            ManagedServer::MiMoCode => vec![
+                home.join(".npm-global/bin"),
+                home.join(".local/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ],
+        }
+    }
+
+    /// The `PATH` its process is started with: the directories above, then
+    /// whatever the app itself was launched with.
+    fn child_path(self) -> std::ffi::OsString {
+        let mut parts: Vec<std::ffi::OsString> = Vec::new();
+        let mut push = |value: std::ffi::OsString| {
+            if !value.is_empty() && !parts.contains(&value) {
+                parts.push(value);
+            }
+        };
+        for dir in self.binary_search_directories() {
+            push(dir.into_os_string());
+        }
+        if let Some(existing) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&existing) {
+                push(dir.into_os_string());
+            }
+        }
+        std::env::join_paths(parts).unwrap_or_default()
+    }
+
+    /// Arguments that put the server on `port`. The two CLIs spell the bind
+    /// address differently, and a flag one of them does not know is ignored
+    /// rather than refused: the server would quietly keep its own port.
+    fn arguments(self, port: u16) -> Vec<String> {
+        let port = port.to_string();
+        match self {
+            ManagedServer::Hermes => vec![
+                "serve".into(),
+                "--port".into(),
+                port,
+                "--host".into(),
+                "127.0.0.1".into(),
+            ],
+            ManagedServer::MiMoCode => vec![
+                "serve".into(),
+                "--port".into(),
+                port,
+                "--hostname".into(),
+                "127.0.0.1".into(),
+            ],
+        }
+    }
+
+    /// The path that answers once the server is ready to take requests.
+    fn health_path(self) -> &'static str {
+        match self {
+            ManagedServer::Hermes => "/api/status",
+            ManagedServer::MiMoCode => "/global/health",
+        }
+    }
+
+    /// Whether the process is started in the configured workspace.
+    ///
+    /// `mimo serve` scopes every session to the project it was started in — the
+    /// session list and the agent's own working directory both come from there —
+    /// so a server started anywhere else answers with a different conversation
+    /// list and edits a different tree. Hermes keeps its workspace in its own
+    /// config file, so passing one would be a second, contradictory place to
+    /// set it.
+    fn uses_workspace(self) -> bool {
+        matches!(self, ManagedServer::MiMoCode)
+    }
+}
+
+/// Manages one local agent server subprocess: probe, start, wait for ready.
+///
+/// One process at a time, whichever backend asked for it: a second `start`
+/// while a child is alive is refused rather than obeyed, so switching backends
+/// cannot leave two servers fighting over the same port.
 #[derive(Default)]
-pub struct LocalHermesServer {
+pub struct LocalServerManager {
     child: Arc<Mutex<Option<tokio::process::Child>>>,
+    server: Mutex<Option<ManagedServer>>,
     last_message: Mutex<String>,
     is_launching: Mutex<bool>,
 }
 
-impl LocalHermesServer {
+impl LocalServerManager {
     fn set_message(&self, message: impl Into<String>) {
         let message = message.into();
         global_logger().log("server", message.clone());
@@ -29,77 +190,284 @@ impl LocalHermesServer {
             .clone()
     }
 
-    pub async fn start(&self, port: u16) {
+    pub async fn start(&self, server: ManagedServer, port: u16, workspace: Option<&str>) {
         if self
             .child
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
         {
-            self.set_message("Hermes server process is already managed by Van-Goal.");
+            self.set_message(format!(
+                "{} process is already managed by Van-Goal.",
+                server.display_name()
+            ));
             return;
         }
-        let executable = hermes_executable_path().unwrap_or_else(|| PathBuf::from("hermes"));
-        let mut command = Command::new(&executable);
+        let mut command = Command::new(server.executable());
         command
-            .args(["serve", "--port", &port.to_string(), "--host", "127.0.0.1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .args(server.arguments(port))
+            .env("PATH", server.child_path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if server.uses_workspace() {
+            match workspace.map(str::trim).filter(|path| !path.is_empty()) {
+                Some(path) if std::path::Path::new(path).is_dir() => {
+                    command.current_dir(path);
+                }
+                Some(path) => self.set_message(format!(
+                    "Workspace {path} does not exist; {} is started in the app's own directory.",
+                    server.label()
+                )),
+                None => {}
+            }
+        }
         match command.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
+                forward_output(child.stdout.take(), server);
+                forward_output(child.stderr.take(), server);
                 *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 *self.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-                self.set_message(format!("Started local Hermes server on 127.0.0.1:{port}."));
+                *self.server.lock().unwrap_or_else(|e| e.into_inner()) = Some(server);
+                self.set_message(format!(
+                    "Started local {} on 127.0.0.1:{port}.",
+                    server.display_name()
+                ));
             }
             Err(error) => {
-                self.set_message(format!("Failed to start Hermes: {error}"));
+                self.set_message(format!("Failed to start {}: {error}", server.display_name()));
             }
         }
     }
 
-    pub async fn ensure_running(&self, port: u16) -> Result<String> {
+    /// Use the server already listening on `port`, or start one and wait for it
+    /// to answer. Returns the base URL the backend should talk to.
+    pub async fn ensure_running(
+        &self,
+        server: ManagedServer,
+        port: u16,
+        workspace: Option<&str>,
+        credential: &str,
+    ) -> Result<String> {
         let url = format!("http://127.0.0.1:{port}");
-        if is_reachable(&url).await {
-            self.set_message(format!("Using local Hermes on 127.0.0.1:{port}."));
+        if is_reachable(&url, server, credential).await {
+            self.set_message(format!(
+                "Using local {} on 127.0.0.1:{port}.",
+                server.display_name()
+            ));
             return Ok(url);
         }
-        self.start(port).await;
+        self.start(server, port, workspace).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
         while std::time::Instant::now() < deadline {
-            if is_reachable(&url).await {
+            if is_reachable(&url, server, credential).await {
                 *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                self.set_message("Local Hermes is ready.");
+                self.set_message(format!("Local {} is ready.", server.display_name()));
                 return Ok(url);
+            }
+            // A server that is gone cannot become ready, however the port looks.
+            // Its own output is in the app log; report the exit instead of
+            // waiting out the whole deadline for a timeout nobody can act on.
+            if let Some(status) = self.take_exited_child() {
+                log_debug!(
+                    "server",
+                    "local {} exited before it was ready: {status}",
+                    server.label()
+                );
+                return Err(anyhow!(
+                    "Local {} exited before it was ready ({status}). Its output is in the app log.",
+                    server.display_name()
+                ));
             }
             tokio::time::sleep(Duration::from_millis(350)).await;
         }
         *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        log_debug!("server", "local hermes did not become ready before timeout");
+        log_debug!("server", "local server did not become ready before timeout");
         Err(anyhow!(
-            "Local Hermes started but did not become ready in time."
+            "Local {} started but did not become ready in time.",
+            server.display_name()
         ))
     }
 
+    /// The child's exit status, if it is gone. Reaping it here also lets the
+    /// next `start` try again.
+    fn take_exited_child(&self) -> Option<String> {
+        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let status = match guard.as_mut() {
+            Some(child) => child.try_wait().ok().flatten(),
+            None => None,
+        };
+        if status.is_some() {
+            *guard = None;
+            self.server
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        }
+        status.map(|status| status.to_string())
+    }
+
     pub async fn stop(&self) {
+        let managed = self.server.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = child.start_kill();
         }
         *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        self.set_message("Stopped local Hermes server.");
+        match managed {
+            Some(server) => {
+                self.set_message(format!("Stopped local {} server.", server.display_name()))
+            }
+            // The server in use was already running when the app arrived, so
+            // there is nothing of the app's to stop — and killing a process the
+            // user started is not the app's business.
+            None => self.set_message("No server started by Van-Goal is running."),
+        }
     }
 }
 
-async fn is_reachable(url: &str) -> bool {
+/// Keep a server's own output in the app log. A server that refuses to start —
+/// a port already taken, a missing login — says so on its stderr, and that
+/// sentence is the only actionable part of the failure.
+fn forward_output(
+    stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    server: ManagedServer,
+) {
+    let Some(stream) = stream else {
+        return;
+    };
+    let label = server.label();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            global_logger().log(label, line);
+        }
+    });
+}
+
+async fn is_reachable(url: &str, server: ManagedServer, credential: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap_or_default();
+    let mut request = client
+        .get(format!("{url}{}", server.health_path()))
+        .header("Accept", "application/json");
+    // A server started with a password answers 401 to everything else, so the
+    // readiness check presents the same credentials the backend will.
+    if let Some(username) = server.auth_username() {
+        if !credential.is_empty() {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("{username}:{credential}"));
+            request = request.header("Authorization", format!("Basic {encoded}"));
+        }
+    }
     matches!(
-        client
-            .get(format!("{url}/api/status"))
-            .header("Accept", "application/json")
-            .send()
-            .await,
+        request.send().await,
         Ok(response) if response.status().is_success()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManagedServer;
+    use crate::agent::opencode;
+    use crate::settings::BackendKind;
+
+    /// Only a backend whose server this app can actually launch reports one. A
+    /// backend missing here keeps connecting to an already-running server.
+    #[test]
+    fn only_the_backends_with_a_launchable_server_are_managed() {
+        assert_eq!(
+            ManagedServer::for_kind(BackendKind::Hermes),
+            Some(ManagedServer::Hermes)
+        );
+        assert_eq!(
+            ManagedServer::for_kind(BackendKind::MiMoCode),
+            Some(ManagedServer::MiMoCode)
+        );
+        for kind in [
+            BackendKind::OpenCode,
+            BackendKind::Codex,
+            BackendKind::ClaudeCode,
+            BackendKind::Pi,
+            BackendKind::OpenClaw,
+        ] {
+            assert_eq!(
+                ManagedServer::for_kind(kind),
+                None,
+                "{} must keep connecting to an already-running server",
+                kind.id()
+            );
+        }
+    }
+
+    /// The two CLIs disagree on the bind-address flag, and a flag one of them
+    /// does not know is ignored rather than refused: the server would quietly
+    /// keep its own port while the app waited for an address nothing listens on.
+    #[test]
+    fn each_server_is_told_where_to_listen_in_its_own_words() {
+        assert_eq!(
+            ManagedServer::Hermes.arguments(9119),
+            ["serve", "--port", "9119", "--host", "127.0.0.1"]
+        );
+        assert_eq!(
+            ManagedServer::MiMoCode.arguments(4096),
+            ["serve", "--port", "4096", "--hostname", "127.0.0.1"]
+        );
+        assert_eq!(ManagedServer::Hermes.health_path(), "/api/status");
+        assert_eq!(ManagedServer::MiMoCode.health_path(), "/global/health");
+    }
+
+    /// The readiness check authenticates as the same user the adapter does. A
+    /// server started with a password answers 401 to everything else, so a
+    /// mismatch would make a healthy server look dead — measured against
+    /// `mimo serve`: `mimocode:<password>` is 200, `opencode:<password>` is 401.
+    #[test]
+    fn the_readiness_check_authenticates_as_the_adapter_does() {
+        let backend = opencode::OpenCodeBackend::new("MiMoCode", opencode::MIMOCODE_AUTH_USER);
+        assert_eq!(
+            ManagedServer::MiMoCode.auth_username(),
+            Some(backend.auth_username())
+        );
+        assert_eq!(ManagedServer::MiMoCode.auth_username(), Some("mimocode"));
+        assert_eq!(
+            ManagedServer::Hermes.auth_username(),
+            None,
+            "a local hermes takes no credentials on its health path"
+        );
+    }
+
+    /// The spawned CLI has to be able to find its own runtime. `mimo` is a
+    /// `#!/usr/bin/env node` script and `node` is not on the `PATH` an app
+    /// launched from Finder inherits, so the directories a user installs into
+    /// are prepended to the child's environment.
+    #[test]
+    fn the_child_can_find_a_user_installed_runtime() {
+        let path = ManagedServer::MiMoCode.child_path();
+        let entries: Vec<String> = std::env::split_paths(&path)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .collect();
+        let home = crate::logger::dirs::home().to_string_lossy().into_owned();
+        for directory in [".local/bin", ".npm-global/bin"] {
+            let expected = format!("{home}/{directory}");
+            assert!(
+                entries.contains(&expected),
+                "{expected} must be on the child's PATH, so its own runtime is found: {entries:?}"
+            );
+        }
+    }
+
+    /// Only `mimo serve` is scoped by its working directory; passing one to
+    /// hermes would set a workspace the app cannot keep in step with its own
+    /// config file.
+    #[test]
+    fn only_mimo_is_scoped_by_the_workspace() {
+        assert!(ManagedServer::MiMoCode.uses_workspace());
+        assert!(!ManagedServer::Hermes.uses_workspace());
+    }
 }

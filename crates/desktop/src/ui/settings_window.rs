@@ -277,6 +277,15 @@ impl Render for SettingsView {
         );
 
         // Connection section
+        let address_hint = match settings.managed_server_label() {
+            Some(label) => {
+                format!("Local address: Van-Goal starts and manages {label} automatically.")
+            }
+            None if settings.backend_kind == van_goal_core::settings::BackendKind::OpenClaw => {
+                "For a reverse-proxy path, paste the complete ws:// or wss:// URL; it overrides Port and TLS.".to_string()
+            }
+            None => "Van-Goal connects to an already-running server at this address.".to_string(),
+        };
         let mut connection = section("Connection");
         if uses_network {
             connection = connection
@@ -291,13 +300,7 @@ impl Render for SettingsView {
                         state.settings.save();
                     },
                 ))
-                .child(hint(if settings.is_managed_local_backend() {
-                    "Local address: Van-Goal starts and manages hermes serve automatically."
-                } else if settings.backend_kind == van_goal_core::settings::BackendKind::OpenClaw {
-                    "For a reverse-proxy path, paste the complete ws:// or wss:// URL; it overrides Port and TLS."
-                } else {
-                    "Van-Goal connects to an already-running server at this address."
-                }));
+                .child(hint(&address_hint));
         } else {
             connection = connection
                 .child(field_row("Workspace", self.workspace_editor.clone()))
@@ -309,6 +312,17 @@ impl Render for SettingsView {
             connection = connection
                 .child(field_row("Default profile", self.profile_editor.clone()))
                 .child(hint("Leave empty to use the Hermes default profile."));
+        }
+        // A managed MiMoCode server is scoped by the directory it is started
+        // in: it answers with that project's sessions and runs the agent there.
+        // The field is the one the CLI backends already use, shown here because
+        // it decides what this backend can see.
+        if settings.backend_kind == van_goal_core::settings::BackendKind::MiMoCode {
+            connection = connection
+                .child(field_row("Workspace", self.workspace_editor.clone()))
+                .child(hint(
+                    "The project mimo serve is started in: its sessions and its working directory.",
+                ));
         }
         let active_backend = settings.backend_kind;
         let active_enabled = settings.is_backend_enabled(active_backend);
@@ -353,7 +367,7 @@ impl Render for SettingsView {
                     )
                 })
                 .when(
-                    active_backend == van_goal_core::settings::BackendKind::Hermes,
+                    settings.is_managed_local_backend(),
                     |this| {
                         this.child(small_button(
                             "stop-managed",

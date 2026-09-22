@@ -27,7 +27,7 @@ app/               the Flutter client                 ─┘
 | `core::chat` | `Conversation`, the folding of events into a message list, and the stream merging that keeps a two-stream reply from interleaving |
 | `core::markdown` | The block and inline parser both renderers use |
 | `core::settings` / `cache` / `secret_store` | Everything that survives a restart, in one app-data directory |
-| `core::jsonl_process` / `local_server` | Subprocess backends, and the managed local `hermes serve` |
+| `core::jsonl_process` / `local_server` | Subprocess backends, and the managed local servers (`hermes serve`, `mimo serve`) |
 | `crates/desktop` | Windows, menus, GPUI views, the desktop window's own state |
 | `crates/mobile` | The C ABI, and the connection/reconnect/parking logic a phone needs |
 | `app` | Widgets. Dart folds no events and owns no message list |
@@ -134,10 +134,10 @@ queue on a timer and redraws; it never blocks on the network, and it never folds
 an event into a message.
 
 The phone build offers the network backends only (Hermes, OpenCode, MiMoCode,
-OpenClaw). Codex CLI, Claude Code and Pi are local subprocesses and a managed
-`hermes serve` is launched as one; none of those binaries exist on a phone, so
-`crates/mobile` refuses them by name rather than offering a connection that fails
-for a reason the user cannot act on.
+OpenClaw). Codex CLI, Claude Code and Pi are local subprocesses, and the managed
+servers (`hermes serve`, `mimo serve`) are launched as ones; none of those
+binaries exist on a phone, so `crates/mobile` refuses them by name rather than
+offering a connection that fails for a reason the user cannot act on.
 
 A phone takes the app away whenever the screen locks, so the connection is owned
 by a retry loop rather than by a single attempt, the backend is reconnected when

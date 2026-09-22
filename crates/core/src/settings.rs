@@ -180,6 +180,19 @@ impl BackendKind {
             _ => "Server password (optional)",
         }
     }
+
+    /// Whether this backend's server wants its stored password on every
+    /// request, the first one included.
+    ///
+    /// A password-protected `mimo serve` (and `opencode serve`) answers 401 to
+    /// anything else, so a probe that does not present it reports a healthy
+    /// server as unreachable. A server with no password ignores the header
+    /// entirely — measured — so sending a stale one costs nothing. A local
+    /// Hermes hands out its own token instead and the OpenClaw gateway pairs
+    /// separately, so neither takes a password here.
+    pub fn server_takes_password(&self) -> bool {
+        matches!(self, BackendKind::OpenCode | BackendKind::MiMoCode)
+    }
 }
 
 /// Persistent app settings. Stored as JSON in
@@ -579,9 +592,12 @@ impl Settings {
         format!("{}://{}:{}", scheme, host, self.resolved_port())
     }
 
-    /// Only loopback Hermes addresses are managed (auto-started) by Van-Goal.
+    /// Only a loopback address of a backend whose server this app can launch is
+    /// managed (auto-started) by Van-Goal. Every other backend connects to a
+    /// server the user runs, so a host that already names a scheme or a path is
+    /// never touched.
     pub fn is_managed_local_backend(&self) -> bool {
-        if self.backend_kind != BackendKind::Hermes
+        if crate::local_server::ManagedServer::for_kind(self.backend_kind).is_none()
             || self.backend_use_tls
             || url::Url::parse(&self.resolved_host()).is_ok()
         {
@@ -591,6 +607,17 @@ impl Settings {
             self.resolved_host().to_lowercase().as_str(),
             "127.0.0.1" | "localhost" | "::1"
         )
+    }
+
+    /// What the settings window calls the server it starts for the active
+    /// backend, or `None` when the app starts none — either because this
+    /// backend has no server of its own to launch, or because the address names
+    /// a machine the app cannot manage.
+    pub fn managed_server_label(&self) -> Option<&'static str> {
+        if !self.is_managed_local_backend() {
+            return None;
+        }
+        crate::local_server::ManagedServer::for_kind(self.backend_kind).map(|server| server.label())
     }
 
     pub fn normalized_profile(&self) -> Option<String> {
@@ -646,6 +673,84 @@ mod tests {
             settings.active_backend_url(),
             "https://claw.example.com:8443"
         );
+    }
+
+    /// MiMoCode is started and kept as closely as Hermes is: its CLI is a
+    /// server of its own, and without one none of it works. A backend the app
+    /// cannot launch a server for must keep connecting to a server the user
+    /// runs, which is what its description already promises.
+    #[test]
+    fn a_loopback_mimocode_is_managed_and_a_remote_one_is_not() {
+        let local = Settings {
+            backend_kind: BackendKind::MiMoCode,
+            backend_host: "127.0.0.1".into(),
+            backend_port: 4096,
+            ..Settings::default()
+        };
+        assert!(local.is_managed_local_backend());
+        assert_eq!(local.managed_server_label(), Some("mimo serve"));
+
+        let remote = Settings {
+            backend_host: "mimo.example.com".into(),
+            ..local.clone()
+        };
+        assert!(
+            !remote.is_managed_local_backend(),
+            "a server on another machine is the user's to run"
+        );
+        assert_eq!(remote.managed_server_label(), None);
+
+        let tls = Settings {
+            backend_use_tls: true,
+            ..local.clone()
+        };
+        assert!(!tls.is_managed_local_backend());
+
+        // Backends whose server this app does not launch are untouched by the
+        // change: OpenCode and OpenClaw keep their existing addresses.
+        for kind in [BackendKind::OpenCode, BackendKind::OpenClaw] {
+            let settings = Settings {
+                backend_kind: kind,
+                ..local.clone()
+            };
+            assert!(
+                !settings.is_managed_local_backend(),
+                "{} must keep using the server the user runs",
+                kind.id()
+            );
+            assert_eq!(settings.managed_server_label(), None);
+        }
+
+        // Hermes is unchanged, and still names its own server.
+        let hermes = Settings {
+            backend_kind: BackendKind::Hermes,
+            backend_port: 9119,
+            ..local.clone()
+        };
+        assert!(hermes.is_managed_local_backend());
+        assert_eq!(hermes.managed_server_label(), Some("hermes serve"));
+    }
+
+    /// A password-protected server authenticates the first request too, so the
+    /// probe has to carry the stored password. The backends whose servers do
+    /// not are left exactly as they were.
+    #[test]
+    fn only_the_password_servers_send_a_password_on_the_first_request() {
+        assert!(BackendKind::MiMoCode.server_takes_password());
+        assert!(BackendKind::OpenCode.server_takes_password());
+        for kind in [
+            BackendKind::Hermes,
+            BackendKind::OpenClaw,
+            BackendKind::Codex,
+            BackendKind::ClaudeCode,
+            BackendKind::Pi,
+        ] {
+            assert!(
+                !kind.server_takes_password(),
+                "{} must keep probing without a password",
+                kind.id()
+            );
+        }
     }
 
     /// A settings file in a private directory. Every test here goes through an

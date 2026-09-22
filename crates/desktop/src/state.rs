@@ -9,7 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use van_goal_core::agent::Backend;
 use van_goal_core::cache::SessionCacheStore;
 use van_goal_core::chat::{merge_fetched_sessions, Conversation, ConversationChange};
-use van_goal_core::local_server::LocalHermesServer;
+use van_goal_core::local_server::{LocalServerManager, ManagedServer};
 use van_goal_core::models::*;
 use van_goal_core::settings::{BackendKind, Settings};
 use van_goal_core::{hermes_config, log_debug};
@@ -74,7 +74,7 @@ impl HeldPrompt {
 /// Single source of truth for sessions, messages, streaming and sending.
 pub struct AppState {
     pub settings: Settings,
-    pub local_server: Arc<LocalHermesServer>,
+    pub local_server: Arc<LocalServerManager>,
     pub connection_state: ConnectionState,
     pub sessions: Vec<AgentSession>,
     pub selected_session: Option<AgentSession>,
@@ -166,7 +166,7 @@ impl AppState {
         let kind = settings.backend_kind;
         let mut state = Self {
             settings: settings.clone(),
-            local_server: Arc::new(LocalHermesServer::default()),
+            local_server: Arc::new(LocalServerManager::default()),
             connection_state: ConnectionState::Disconnected,
             sessions,
             selected_session: selected,
@@ -381,29 +381,43 @@ impl AppState {
         let settings = self.settings.clone();
         let local_server = self.local_server.clone();
         let backend = self.backend.clone();
-        let managed = settings.is_managed_local_backend();
+        let managed_server = ManagedServer::for_kind(settings.backend_kind);
         let port = settings.resolved_port();
         let fallback_url = settings.active_backend_url();
+        // The password is needed before the first request, not after it: a
+        // protected server answers 401 to a password-less probe, which would
+        // read as a connection failure. A server that takes no password ignores
+        // the header, so passing a stale one is harmless.
+        let credential = if settings.backend_kind.server_takes_password() {
+            settings.session_token.trim().to_string()
+        } else {
+            String::new()
+        };
+        let workspace = settings.workspace_trimmed();
 
         let join = tokio_spawn(cx, async move {
-            let base_url = if managed {
-                match local_server.ensure_running(port).await {
-                    Ok(url) => url,
-                    Err(error) => {
-                        return ConnectOutcome {
-                            discovered_token: None,
-                            error: Some(error.to_string()),
-                        };
+            let base_url = match managed_server {
+                Some(server) => {
+                    match local_server
+                        .ensure_running(server, port, workspace.as_deref(), &credential)
+                        .await
+                    {
+                        Ok(url) => url,
+                        Err(error) => {
+                            return ConnectOutcome {
+                                discovered_token: None,
+                                error: Some(error.to_string()),
+                            };
+                        }
                     }
                 }
-            } else {
-                fallback_url.clone()
+                None => fallback_url.clone(),
             };
             let config = BackendConfig {
                 base_url: base_url.clone(),
-                credential: String::new(),
+                credential: credential.clone(),
                 profile: settings.normalized_profile(),
-                workspace: settings.workspace_trimmed(),
+                workspace: workspace.clone(),
             };
             if let Err(error) = backend.lock().await.probe(&config).await {
                 return ConnectOutcome {

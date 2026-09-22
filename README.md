@@ -64,13 +64,13 @@ Backends are selectable in Settings; each adapter translates its native protocol
 | --- | --- | --- |
 | Hermes | REST + WebSocket JSON-RPC | List, create, resume, stream, clarify |
 | OpenCode | `opencode serve` HTTP + SSE | List, create, resume, stream, permissions |
-| MiMoCode | `mimo serve` OpenCode-compatible HTTP + SSE | List, create, resume, stream |
+| MiMoCode | `mimo serve` OpenCode-compatible HTTP + SSE, managed locally | List, create, resume, stream |
 | Codex CLI | Local `codex app-server` JSON-RPC | List, create, resume, stream, approvals |
 | Claude Code | Local bidirectional `stream-json` process | Create, resume, stream, tools |
 | Pi | Local `pi --mode rpc` JSONL process | Create, resume, stream, extension UI |
 | OpenClaw | Gateway protocol v4 over WebSocket | List, create, resume, stream, approvals |
 
-Local CLI backends use the workspace directory configured in Settings and reuse the CLI's existing login. Hermes defaults to port `9119`, OpenCode/MiMoCode to `4096`, OpenClaw to `18789`.
+Local CLI backends use the workspace directory configured in Settings and reuse the CLI's existing login. Hermes defaults to port `9119`, OpenCode/MiMoCode to `4096`, OpenClaw to `18789`. At a loopback address Van-Goal starts and manages `hermes serve` and `mimo serve` itself, so a switch to either needs nothing running first; a server already listening on the port is used as it is. `mimo serve` scopes every session to the directory it was started in, so the Workspace field decides which project its sessions and its agent work in.
 
 OpenClaw connections create a stable Ed25519 device identity in Van-Goal's local app-data directory and sign the Gateway challenge nonce. A new remote device may appear as pending in OpenClaw and must be approved once.
 

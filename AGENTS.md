@@ -40,6 +40,20 @@ it, which is how a leak is reproduced on purpose. Removing it needs the
 `operator.admin` scope, which this client is not granted, so a poked session has
 to be deleted from the Gateway's own side.
 
+`crates/core/examples/mimocode_probe.rs` is the same kind of instrument for the
+OpenCode family. Its two servers look alike and are not: `mimo serve` picks a
+random port unless it is told which one, scopes every session to the directory it
+was started in, pairs its password with the `mimocode` user rather than
+`opencode`, and reports a text part as the whole text so far with no `delta`
+field. This runs the app's own managed-server path — start, wait for health,
+list, create, prompt, stream — in one command:
+
+```bash
+cargo run -p van-goal-core --example mimocode_probe
+cargo run -p van-goal-core --example mimocode_probe -- --prompt "reply with exactly: PROBE-OK"
+cargo run -p van-goal-core --example mimocode_probe -- --keep-running
+```
+
 ## Rules that are not negotiable
 
 **`crates/core` must not import a UI toolkit.** That is the whole reason the

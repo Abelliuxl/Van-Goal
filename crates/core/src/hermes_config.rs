@@ -191,7 +191,7 @@ fn hermes_command() -> (PathBuf, Vec<String>) {
     }
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

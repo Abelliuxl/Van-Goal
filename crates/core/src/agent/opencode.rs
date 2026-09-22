@@ -11,6 +11,14 @@ use std::time::Duration;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The username each server pairs with the configured password in its
+/// `Authorization: Basic` header. They are not interchangeable: a
+/// password-protected `mimo serve` answers `200` to `mimocode:<password>` and
+/// `401` to `opencode:<password>`, so a shared name authenticates against
+/// neither server's other credentials.
+pub const OPENCODE_AUTH_USER: &str = "opencode";
+pub const MIMOCODE_AUTH_USER: &str = "mimocode";
+
 #[derive(Default)]
 struct SharedState {
     active_session_id: Option<String>,
@@ -23,6 +31,8 @@ struct SharedState {
 /// (and the OpenCode-compatible `mimo serve`).
 pub struct OpenCodeBackend {
     display_name: &'static str,
+    /// The username this server expects beside the configured password.
+    auth_username: &'static str,
     http: reqwest::Client,
     shared: Arc<Mutex<SharedState>>,
     event_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -31,9 +41,10 @@ pub struct OpenCodeBackend {
 }
 
 impl OpenCodeBackend {
-    pub fn new(display_name: &'static str) -> Self {
+    pub fn new(display_name: &'static str, auth_username: &'static str) -> Self {
         Self {
             display_name,
+            auth_username,
             http: reqwest::Client::builder()
                 .timeout(HTTP_TIMEOUT)
                 .build()
@@ -45,13 +56,19 @@ impl OpenCodeBackend {
         }
     }
 
+    /// The username the readiness check and this adapter have to agree on.
+    pub fn auth_username(&self) -> &'static str {
+        self.auth_username
+    }
+
     fn auth_header(&self, credential: &str) -> Option<String> {
         if credential.is_empty() {
             None
         } else {
             Some(format!(
                 "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("opencode:{credential}"))
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{credential}", self.auth_username))
             ))
         }
     }
@@ -153,27 +170,7 @@ impl OpenCodeBackend {
                 None,
             )
             .await?;
-        let rows = value
-            .as_array()
-            .ok_or_else(|| anyhow!("{} returned an invalid message list.", self.display_name))?;
-        Ok(rows
-            .iter()
-            .filter_map(|row| {
-                let info = row.get("info")?;
-                let role = MessageRole::parse(json_str(info, "role").as_deref()?)?;
-                let parts = row.get("parts")?.as_array()?;
-                let text = parts
-                    .iter()
-                    .filter(|part| json_str(part, "type").as_deref() == Some("text"))
-                    .filter_map(|part| json_str(part, "text"))
-                    .collect::<String>();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(ChatMessage::new(role, text))
-                }
-            })
-            .collect())
+        messages_from_value(&value, self.display_name)
     }
 
     pub async fn connect(
@@ -191,6 +188,7 @@ impl OpenCodeBackend {
             events,
             self.shared.clone(),
             self.abort_flag.clone(),
+            self.auth_username,
         ));
         *self.event_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         Ok(())
@@ -343,11 +341,60 @@ fn urlencode(value: &str) -> String {
         .to_string()
 }
 
+/// Read a session's transcript out of the message list both servers return:
+/// `info.role` plus the message's parts, of which only the text parts are the
+/// conversation.
+fn messages_from_value(
+    value: &serde_json::Value,
+    display_name: &str,
+) -> Result<Vec<ChatMessage>> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{display_name} returned an invalid message list."))?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let info = row.get("info")?;
+            let role = MessageRole::parse(json_str(info, "role").as_deref()?)?;
+            let parts = row.get("parts")?.as_array()?;
+            let text = parts
+                .iter()
+                .filter(|part| json_str(part, "type").as_deref() == Some("text"))
+                .filter(|part| !is_injected_reminder(part, role))
+                .filter_map(|part| json_str(part, "text"))
+                .collect::<String>();
+            if text.is_empty() {
+                None
+            } else {
+                Some(ChatMessage::new(role, text))
+            }
+        })
+        .collect())
+}
+
+/// Whether a part is the server talking to the model rather than the user
+/// talking to it.
+///
+/// `mimo serve` appends its own instructions to the user's own message and
+/// marks them `"synthetic": true` — a turn was measured carrying a
+/// `<system-reminder>` that told the model to search its skills first. Reopening
+/// that session would otherwise show those instructions in the user's bubble, as
+/// though they had been typed. Parts of the model's own reply are left alone:
+/// nothing measured marks those synthetic, and dropping one would lose an answer.
+fn is_injected_reminder(part: &serde_json::Value, role: MessageRole) -> bool {
+    role == MessageRole::User
+        && part
+            .get("synthetic")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false)
+}
+
 async fn run_event_stream(
     config: BackendConfig,
     events: UnboundedSender<AgentEvent>,
     shared: Arc<Mutex<SharedState>>,
     abort_flag: Arc<std::sync::atomic::AtomicBool>,
+    auth_username: &'static str,
 ) {
     let client = reqwest::Client::builder().build().unwrap_or_default();
     let mut request = client
@@ -355,7 +402,7 @@ async fn run_event_stream(
         .header("Accept", "text/event-stream");
     if !config.credential.is_empty() {
         let encoded = base64::engine::general_purpose::STANDARD
-            .encode(format!("opencode:{}", config.credential));
+            .encode(format!("{auth_username}:{}", config.credential));
         request = request.header("Authorization", format!("Basic {encoded}"));
     }
     let response = match request.send().await {
@@ -548,5 +595,281 @@ fn handle_event_json(
             });
         }
         _ => {}
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_event_json, SharedState};
+    use crate::models::{AgentEvent, DeltaSource};
+    use futures::channel::mpsc::{unbounded, UnboundedSender};
+    use std::sync::{Arc, Mutex};
+
+    const SESSION: &str = "ses_f38608c86ffen4dUyi7sKmrq5x";
+    const OTHER_SESSION: &str = "ses_070fe86f0ffe7El4nrN45x5eYg";
+    const USER_MESSAGE: &str = "msg_0c79f7fe9001Xx39w41s5ud1r1";
+    const ASSISTANT_MESSAGE: &str = "msg_0c79f8012001t5E39aNf3cJOsF";
+    const ASSISTANT_PART: &str = "prt_0c79f8006001rD9BP85NWJPX4K";
+
+    /// A shared state scoped to the session on screen — the state a client is
+    /// in right after opening a session — plus the channel the adapter would
+    /// hand its events to.
+    struct Probe {
+        shared: Arc<Mutex<SharedState>>,
+        tx: UnboundedSender<AgentEvent>,
+        rx: futures::channel::mpsc::UnboundedReceiver<AgentEvent>,
+    }
+
+    impl Probe {
+        fn new() -> Self {
+            let (tx, rx) = unbounded();
+            Self {
+                shared: Arc::new(Mutex::new(SharedState {
+                    active_session_id: Some(SESSION.to_string()),
+                    ..SharedState::default()
+                })),
+                tx,
+                rx,
+            }
+        }
+
+        /// Feed the captured payloads through the adapter in order.
+        fn feed(&mut self, payloads: &[String]) {
+            for payload in payloads {
+                handle_event_json(payload, &self.tx, &self.shared);
+            }
+        }
+
+        fn events(&mut self) -> Vec<AgentEvent> {
+            let mut out = Vec::new();
+            while let Ok(event) = self.rx.try_recv() {
+                out.push(event);
+            }
+            out
+        }
+    }
+
+    /// The end of a turn exactly as `mimo serve` 0.1.8 streams it, copied from a
+    /// live capture. The user's own message and prompt part arrive first and
+    /// must not read as the reply; the reply's text part carries the whole text
+    /// so far with no `delta` field, which is where mimo differs from OpenCode
+    /// and where a delta-only reader would show nothing at all.
+    #[test]
+    fn a_mimo_reply_streams_as_the_whole_part_it_reports() {
+        let mut probe = Probe::new();
+        probe.feed(&[
+            // The user's message, then the prompt as its own text part.
+            format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"{SESSION}","info":{{"id":"{USER_MESSAGE}","role":"user","sessionID":"{SESSION}","time":{{"created":1790055514089}},"agent":"build","model":{{"providerID":"mimo","modelID":"mimo-auto"}}}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{SESSION}","part":{{"type":"text","text":"Reply with exactly one word: PONG. Do not use any tools.","messageID":"{USER_MESSAGE}","sessionID":"{SESSION}","id":"prt_0c79f7fea001aRRQn5TLKQeaU2"}},"time":1790055514095}}}}"#
+            ),
+            // MimoCode's own additions to the stream. None of them is a turn's
+            // traffic, and all of them are interleaved with it.
+            format!(
+                r#"{{"type":"session.status","properties":{{"sessionID":"{SESSION}","status":{{"type":"busy"}}}}}}"#
+            ),
+            r#"{"type":"server.heartbeat","properties":{}}"#.to_string(),
+            r#"{"type":"server.connected","properties":{}}"#.to_string(),
+            r#"{"type":"metrics.agent_request","properties":{"providerID":"mimo"}}"#.to_string(),
+            format!(r#"{{"type":"session.diff","properties":{{"sessionID":"{SESSION}","diff":[]}}}}"#),
+            // The assistant message, then its text part growing.
+            format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"{SESSION}","info":{{"id":"{ASSISTANT_MESSAGE}","parentID":"{USER_MESSAGE}","role":"assistant","agentID":"main","mode":"build","agent":"build","cost":0,"tokens":{{"input":0,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}},"modelID":"mimo-auto","providerID":"mimo","time":{{"created":1790055514130}},"sessionID":"{SESSION}"}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{SESSION}","part":{{"id":"{ASSISTANT_PART}","messageID":"{ASSISTANT_MESSAGE}","sessionID":"{SESSION}","type":"text","text":"PONG"}},"time":1790055514400}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{SESSION}","part":{{"id":"{ASSISTANT_PART}","messageID":"{ASSISTANT_MESSAGE}","sessionID":"{SESSION}","type":"text","text":"PONG, as asked."}},"time":1790055514500}}}}"#
+            ),
+            format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SESSION}"}}}}"#),
+        ]);
+
+        match probe.events().as_slice() {
+            [
+                AgentEvent::MessageStart,
+                AgentEvent::MessageDelta {
+                    text: first,
+                    source: DeltaSource::EventStream,
+                },
+                AgentEvent::MessageDelta {
+                    text: second,
+                    source: DeltaSource::EventStream,
+                },
+                AgentEvent::MessageComplete(None),
+            ] => {
+                assert_eq!(first, "PONG", "the reply's first report is its whole text");
+                assert_eq!(
+                    second, ", as asked.",
+                    "a later report holds the whole part, so only the new tail \
+                     belongs in the bubble"
+                );
+            }
+            other => panic!("unexpected events from a mimo turn: {other:#?}"),
+        }
+    }
+
+    /// Opening a session the server has already finished shows the same shape:
+    /// the first report of a part is the whole text it holds.
+    #[test]
+    fn a_part_first_seen_whole_is_not_a_delta_against_nothing() {
+        let mut probe = Probe::new();
+        probe.feed(&[
+            format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"{SESSION}","info":{{"id":"{ASSISTANT_MESSAGE}","role":"assistant","sessionID":"{SESSION}","time":{{"created":1790055514130}}}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{SESSION}","part":{{"type":"text","text":"already finished","messageID":"{ASSISTANT_MESSAGE}","sessionID":"{SESSION}","id":"{ASSISTANT_PART}"}},"time":1790055514400}}}}"#
+            ),
+        ]);
+
+        match probe.events().as_slice() {
+            [AgentEvent::MessageStart, AgentEvent::MessageDelta { text, .. }] => {
+                assert_eq!(text, "already finished");
+            }
+            other => panic!("unexpected events: {other:#?}"),
+        }
+    }
+
+    /// A tool part is folded into the turn's one tool bubble, with the status
+    /// the server reports for it.
+    #[test]
+    fn a_tool_part_arrives_as_a_tool_record() {
+        let mut probe = Probe::new();
+        probe.feed(&[
+            format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"{SESSION}","info":{{"id":"{ASSISTANT_MESSAGE}","role":"assistant","sessionID":"{SESSION}"}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{SESSION}","part":{{"id":"prt_tool","messageID":"{ASSISTANT_MESSAGE}","sessionID":"{SESSION}","type":"tool","callID":"call_1","tool":"Read","state":{{"status":"completed","title":"Read a file"}}}}}}}}"#
+            ),
+        ]);
+
+        let events = probe.events();
+        let [AgentEvent::MessageStart, AgentEvent::Tool(record)] = events.as_slice() else {
+            panic!("unexpected events: {events:#?}");
+        };
+        assert_eq!(record.name, "Read");
+        assert_eq!(record.status, "completed");
+    }
+
+    /// A failed turn reaches the transcript as the server's own report, not as a
+    /// summary of it.
+    #[test]
+    fn a_turn_failure_carries_the_servers_own_error() {
+        let mut probe = Probe::new();
+        probe.feed(&[format!(
+            r#"{{"type":"session.error","properties":{{"sessionID":"{SESSION}","error":{{"name":"UnknownError","data":{{"message":"unknown certificate verification error"}}}}}}}}"#
+        )]);
+
+        let events = probe.events();
+        let [AgentEvent::TurnFailed(detail)] = events.as_slice() else {
+            panic!("unexpected events: {events:#?}");
+        };
+        assert!(detail.contains("unknown certificate verification error"));
+    }
+
+    /// The stream carries every session the server has, so a second conversation
+    /// must never be able to write into the open transcript.
+    #[test]
+    fn another_sessions_traffic_never_reaches_the_transcript() {
+        let mut probe = Probe::new();
+        probe.feed(&[
+            format!(
+                r#"{{"type":"message.updated","properties":{{"sessionID":"{OTHER_SESSION}","info":{{"id":"msg_elsewhere","role":"assistant","sessionID":"{OTHER_SESSION}"}}}}}}"#
+            ),
+            format!(
+                r#"{{"type":"message.part.updated","properties":{{"sessionID":"{OTHER_SESSION}","part":{{"type":"text","text":"someone else's reply","messageID":"msg_elsewhere","sessionID":"{OTHER_SESSION}","id":"prt_elsewhere"}}}}}}"#
+            ),
+            format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{OTHER_SESSION}"}}}}"#),
+        ]);
+
+        let events = probe.events();
+        assert!(events.is_empty(), "another session leaked in: {events:#?}");
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::messages_from_value;
+    use crate::models::MessageRole;
+    use serde_json::json;
+
+    /// A `mimo serve` history, copied from a live capture: the user's message
+    /// carries their own part and, after it, one the server injected and marked
+    /// `synthetic`.
+    #[test]
+    fn an_injected_reminder_is_not_shown_as_the_users_own_words() {
+        let value = json!([
+            {
+                "info": { "id": "msg_0c79f7fe9001", "role": "user", "sessionID": "ses_1" },
+                "parts": [
+                    {
+                        "id": "prt_1",
+                        "messageID": "msg_0c79f7fe9001",
+                        "sessionID": "ses_1",
+                        "type": "text",
+                        "text": "reply with exactly: PROBE-OK"
+                    },
+                    {
+                        "id": "prt_2",
+                        "messageID": "msg_0c79f7fe9001",
+                        "sessionID": "ses_1",
+                        "type": "text",
+                        "synthetic": true,
+                        "text": "<system-reminder>\nSkill search trigger: this is the first user query in the session."
+                    }
+                ]
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(
+            messages[0].content, "reply with exactly: PROBE-OK",
+            "the server's own instructions must not be read back as the prompt"
+        );
+    }
+
+    /// A message whose parts the server replaced entirely leaves nothing to
+    /// show, and an empty bubble is worse than none.
+    #[test]
+    fn a_message_with_nothing_but_an_injected_part_is_dropped() {
+        let value = json!([
+            {
+                "info": { "id": "msg_1", "role": "user", "sessionID": "ses_1" },
+                "parts": [
+                    { "id": "prt_1", "type": "text", "synthetic": true, "text": "<system-reminder>" }
+                ]
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert!(messages.is_empty(), "an empty bubble was left behind: {messages:#?}");
+    }
+
+    /// The model's own reply is never filtered: a reasoning part and a tool part
+    /// are not text, and the text it produced is what the user came to read.
+    #[test]
+    fn the_models_own_reply_is_kept_whole() {
+        let value = json!([
+            {
+                "info": { "id": "msg_2", "role": "assistant", "sessionID": "ses_1" },
+                "parts": [
+                    { "id": "prt_1", "type": "reasoning", "text": "let me think" },
+                    { "id": "prt_2", "type": "tool", "tool": "Read", "state": { "status": "completed" } },
+                    { "id": "prt_3", "type": "text", "text": "Two files, read." },
+                    { "id": "prt_4", "type": "text", "synthetic": false, "text": " Anything else?" }
+                ]
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "Two files, read. Anything else?");
     }
 }

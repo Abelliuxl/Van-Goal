@@ -26,8 +26,14 @@ impl Backend {
     pub fn make(kind: BackendKind) -> Self {
         match kind {
             BackendKind::Hermes => Backend::Hermes(hermes::HermesBackend::new()),
-            BackendKind::OpenCode => Backend::OpenCode(opencode::OpenCodeBackend::new("OpenCode")),
-            BackendKind::MiMoCode => Backend::MiMoCode(opencode::OpenCodeBackend::new("MiMoCode")),
+            BackendKind::OpenCode => Backend::OpenCode(opencode::OpenCodeBackend::new(
+                "OpenCode",
+                opencode::OPENCODE_AUTH_USER,
+            )),
+            BackendKind::MiMoCode => Backend::MiMoCode(opencode::OpenCodeBackend::new(
+                "MiMoCode",
+                opencode::MIMOCODE_AUTH_USER,
+            )),
             BackendKind::Codex => Backend::Codex(cli::LocalCliBackend::new(BackendKind::Codex)),
             BackendKind::ClaudeCode => {
                 Backend::ClaudeCode(cli::LocalCliBackend::new(BackendKind::ClaudeCode))
