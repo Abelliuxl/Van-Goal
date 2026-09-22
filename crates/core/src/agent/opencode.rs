@@ -188,6 +188,7 @@ impl OpenCodeBackend {
             events,
             self.shared.clone(),
             self.abort_flag.clone(),
+            self.display_name,
             self.auth_username,
         ));
         *self.event_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
@@ -394,6 +395,7 @@ async fn run_event_stream(
     events: UnboundedSender<AgentEvent>,
     shared: Arc<Mutex<SharedState>>,
     abort_flag: Arc<std::sync::atomic::AtomicBool>,
+    display_name: &'static str,
     auth_username: &'static str,
 ) {
     let client = reqwest::Client::builder().build().unwrap_or_default();
@@ -414,11 +416,17 @@ async fn run_event_stream(
     };
     if !response.status().is_success() {
         let _ = events.unbounded_send(AgentEvent::Failed(format!(
-            "OpenCode returned HTTP {} for event stream",
+            "{} returned HTTP {} for event stream",
+            display_name,
             response.status().as_u16()
         )));
         return;
     }
+
+    // The stream is open, so the transport is up. Without this the frontends
+    // never leave "Connecting": this is the only point at which the adapter
+    // knows the connection it was asked for is actually there.
+    let _ = events.unbounded_send(AgentEvent::Connected);
 
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -871,5 +879,128 @@ mod history_tests {
         let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "Two files, read. Anything else?");
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::{run_event_stream, SharedState, MIMOCODE_AUTH_USER};
+    use crate::models::{AgentEvent, BackendConfig};
+    use base64::Engine;
+    use futures::channel::mpsc::unbounded;
+    use futures::StreamExt;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that answers the event stream, so the adapter's own request can
+    /// be read back off the wire.
+    async fn one_event_stream() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let address = listener.local_addr().expect("an address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("a request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .expect("headers");
+            socket
+                .write_all(b"data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")
+                .await
+                .expect("one event");
+            socket.flush().await.expect("flush");
+            String::from_utf8_lossy(&request[..read]).to_string()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// Opening the stream is what tells a frontend the transport is up. Without
+    /// it the status stays "Connecting" for the life of the connection, which is
+    /// exactly what a user reads as the backend never having connected.
+    #[tokio::test]
+    async fn an_open_stream_reports_the_transport_up() {
+        let (base_url, server) = one_event_stream().await;
+        let (tx, mut rx) = unbounded();
+        let config = BackendConfig {
+            base_url,
+            credential: "pw".into(),
+            profile: None,
+            workspace: None,
+        };
+        let task = tokio::spawn(run_event_stream(
+            config,
+            tx,
+            Arc::new(Mutex::new(SharedState::default())),
+            Arc::new(AtomicBool::new(false)),
+            "MiMoCode",
+            MIMOCODE_AUTH_USER,
+        ));
+
+        assert!(
+            matches!(rx.next().await, Some(AgentEvent::Connected)),
+            "the first thing the frontend hears must be that it is connected"
+        );
+
+        // The request itself, so the stream's own credentials are pinned to the
+        // user the password is paired with.
+        let request = server.await.expect("the server's capture");
+        assert!(request.starts_with("GET /event "), "{request}");
+        let expected = base64::engine::general_purpose::STANDARD.encode("mimocode:pw");
+        // Header names arrive lowercased, so compare the whole request that way.
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: basic {}", expected.to_lowercase())),
+            "{request}"
+        );
+
+        // The server closed the stream, which ends the task and says so.
+        assert!(matches!(rx.next().await, Some(AgentEvent::Disconnected)));
+        task.await.expect("the stream task");
+    }
+
+    /// A stream the server refuses is a failure, not a connection that is up.
+    #[tokio::test]
+    async fn a_refused_stream_is_reported_as_a_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let address = listener.local_addr().expect("an address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("a connection");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+
+        let (tx, mut rx) = unbounded();
+        let config = BackendConfig {
+            base_url: format!("http://{address}"),
+            credential: String::new(),
+            profile: None,
+            workspace: None,
+        };
+        tokio::spawn(run_event_stream(
+            config,
+            tx,
+            Arc::new(Mutex::new(SharedState::default())),
+            Arc::new(AtomicBool::new(false)),
+            "MiMoCode",
+            MIMOCODE_AUTH_USER,
+        ));
+
+        match rx.next().await {
+            Some(AgentEvent::Failed(detail)) => {
+                assert!(detail.contains("MiMoCode"), "{detail}");
+                assert!(detail.contains("401"), "{detail}");
+            }
+            other => panic!("a refused stream must be a failure, got {other:?}"),
+        }
     }
 }
