@@ -364,13 +364,37 @@ fn messages_from_value(
                 .filter(|part| !is_injected_reminder(part, role))
                 .filter_map(|part| json_str(part, "text"))
                 .collect::<String>();
-            if text.is_empty() {
-                None
-            } else {
-                Some(ChatMessage::new(role, text))
+            if !text.is_empty() {
+                return Some(ChatMessage::new(role, text));
             }
+            // A turn that failed has no text at all: the server records the
+            // failure on the message instead, and dropping the message would
+            // leave the user's prompt in the transcript with nothing after it —
+            // no reply and no reason. Measured: a `mimo serve` turn that could
+            // not reach its model is exactly this shape.
+            let failure = error_text(info)?;
+            Some(ChatMessage::new(role, format!("Error: {failure}")))
         })
         .collect())
+}
+
+/// The failure the server recorded on a message, if it recorded one.
+fn error_text(info: &serde_json::Value) -> Option<String> {
+    let error = info.get("error")?;
+    let detail = error
+        .get("data")
+        .and_then(|data| json_str(data, "message"))
+        .or_else(|| json_str(error, "message"))
+        .or_else(|| json_str(error, "name"));
+    match detail {
+        Some(detail) => Some(detail),
+        // An error of a shape this adapter does not know is still reported, as
+        // it came, rather than swallowed.
+        None => {
+            let rendered = error.to_string();
+            (rendered != "null" && rendered != "{}").then_some(rendered)
+        }
+    }
 }
 
 /// Whether a part is the server talking to the model rather than the user
@@ -1002,5 +1026,92 @@ mod stream_tests {
             }
             other => panic!("a refused stream must be a failure, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_history_tests {
+    use super::messages_from_value;
+    use crate::models::MessageRole;
+    use serde_json::json;
+
+    /// A failed turn is recorded by the server with no parts at all — measured
+    /// on a `mimo serve` turn that could not reach its model. Reopening the
+    /// session must show the reason, not just the prompt the user typed.
+    #[test]
+    fn a_turn_that_failed_is_reopened_with_its_reason() {
+        let value = json!([
+            {
+                "info": { "id": "msg_1", "role": "user", "sessionID": "ses_1" },
+                "parts": [
+                    { "id": "prt_1", "type": "text", "text": "你好" }
+                ]
+            },
+            {
+                "info": {
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "sessionID": "ses_1",
+                    "tokens": { "input": 0, "output": 0 },
+                    "error": {
+                        "name": "UnknownError",
+                        "data": { "message": "unknown certificate verification error" }
+                    }
+                },
+                "parts": []
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert_eq!(messages.len(), 2, "{messages:#?}");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[1].content,
+            "Error: unknown certificate verification error"
+        );
+    }
+
+    /// An error of a shape this adapter has never seen is still shown, as it
+    /// came.
+    #[test]
+    fn an_unknown_error_shape_is_reported_rather_than_swallowed() {
+        let value = json!([
+            {
+                "info": {
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "sessionID": "ses_1",
+                    "error": { "kind": "something-new", "detail": 42 }
+                },
+                "parts": []
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].content.contains("something-new"),
+            "{messages:#?}"
+        );
+    }
+
+    /// A message with text is never turned into an error bubble, whatever else
+    /// it carries.
+    #[test]
+    fn text_wins_over_an_error_field() {
+        let value = json!([
+            {
+                "info": {
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "sessionID": "ses_1",
+                    "error": { "name": "UnknownError" }
+                },
+                "parts": [{ "id": "prt_1", "type": "text", "text": "Two files, read." }]
+            }
+        ]);
+
+        let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
+        assert_eq!(messages[0].content, "Two files, read.");
     }
 }
