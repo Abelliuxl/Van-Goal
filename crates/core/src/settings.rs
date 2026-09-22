@@ -309,6 +309,19 @@ pub struct PerBackendConnection {
     pub enabled: Option<bool>,
 }
 
+/// The directory a fresh install starts from.
+///
+/// A bundled app is launched with `/` as its working directory, which is no
+/// project at all — a coding agent scoped to the filesystem root is worse than
+/// one scoped to nothing. The home directory is where a terminal would have put
+/// the user, and the field is theirs to change.
+fn default_workspace_path() -> String {
+    match std::env::current_dir() {
+        Ok(dir) if dir != std::path::Path::new("/") => dir.to_string_lossy().to_string(),
+        _ => std::env::var("HOME").unwrap_or_default(),
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -341,9 +354,7 @@ impl Default for Settings {
             session_token: String::new(),
             auto_connect: true,
             selected_profile: String::new(),
-            workspace_path: std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
+            workspace_path: default_workspace_path(),
             backend_host: DEFAULT_HOST.to_string(),
             backend_port: DEFAULT_PORT,
             backend_use_tls: false,

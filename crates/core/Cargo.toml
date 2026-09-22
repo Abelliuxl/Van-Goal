@@ -36,3 +36,4 @@ sha2.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 chrono.workspace = true
+libc.workspace = true

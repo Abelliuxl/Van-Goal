@@ -1420,6 +1420,69 @@ impl AppState {
         });
     }
 
+    /// Put the managed server into the directory the settings now name.
+    ///
+    /// MiMoCode is not OpenClaw: its project *is* a working directory, and the
+    /// server picks it up once, when it starts. Changing the setting therefore
+    /// means starting the server again — nothing else re-reads it — so this is
+    /// what a committed Workspace field does. Only a server this app started is
+    /// moved; one the user started keeps its directory and is left alone.
+    pub fn apply_workspace(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(server) = ManagedServer::for_kind(self.settings.backend_kind) else {
+            return;
+        };
+        if !self.settings.is_managed_local_backend() || !self.local_server.is_managing() {
+            return;
+        }
+        // A backend that is switched off gets no server from this: the setting
+        // is used the next time it is switched on.
+        if !self.settings.is_backend_enabled(self.settings.backend_kind) {
+            return;
+        }
+        let workspace = self.settings.workspace_trimmed();
+        if self.local_server.started_in() == workspace {
+            return;
+        }
+        // A turn in flight belongs to the directory being left. Say why nothing
+        // moved rather than cutting the reply off, and let the next connect do
+        // it — the field and the message below will disagree until then.
+        if self.is_sending() {
+            self.local_server.set_message(format!(
+                "{} is still running in {}; a reply is being written, so the workspace applies at the next connect.",
+                server.label(),
+                self.local_server.started_in().unwrap_or_else(|| "the app's own directory".into())
+            ));
+            cx.notify();
+            return;
+        }
+
+        log_debug!("app", "workspace changed; restarting the managed server");
+        let port = self.settings.resolved_port();
+        let credential = self.settings.session_token.trim().to_string();
+        let local_server = self.local_server.clone();
+        let join = tokio_spawn(cx, async move {
+            local_server
+                .restart_in(server, port, workspace.as_deref(), &credential)
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = join
+                .await
+                .unwrap_or(Err(anyhow::anyhow!("restart task failed")));
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.last_error = Some(error.to_string());
+                    log_debug!("app", "restarting the managed server failed");
+                }
+                // The connection was attached to the server that just stopped,
+                // so it is re-established here rather than left pointing at it.
+                state.connect(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn backend_caps_for(&self, kind: BackendKind) -> BackendCaps {
         Backend::make(kind).capabilities()
     }

@@ -13,6 +13,7 @@
 //! cargo run -p van-goal-core --example mimocode_probe -- --port 4096 --workspace ~/code/project
 //! cargo run -p van-goal-core --example mimocode_probe -- --prompt "reply with exactly: PROBE-OK"
 //! cargo run -p van-goal-core --example mimocode_probe -- --keep-running
+//! cargo run -p van-goal-core --example mimocode_probe -- --move-to ~/other-project
 //! ```
 //!
 //! Nothing here writes to an existing session: the turn it can send goes to a
@@ -34,6 +35,9 @@ struct Args {
     prompt: Option<String>,
     seconds: u64,
     keep_running: bool,
+    /// Start the server again in this directory, the way committing the
+    /// Workspace field does.
+    move_to: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +50,7 @@ fn parse_args() -> Args {
         prompt: None,
         seconds: 60,
         keep_running: false,
+        move_to: None,
     };
     let mut parts = std::env::args().skip(1);
     while let Some(flag) = parts.next() {
@@ -64,6 +69,7 @@ fn parse_args() -> Args {
                 }
             }
             "--keep-running" => args.keep_running = true,
+            "--move-to" => args.move_to = parts.next(),
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
@@ -105,6 +111,22 @@ async fn main() {
     };
     println!("manager says: {}", manager.take_message());
     println!("base url: {base_url}");
+
+    if let Some(target) = args.move_to.clone() {
+        println!("moving the server to {target}");
+        match manager
+            .restart_in(server, args.port, Some(&target), &args.credential)
+            .await
+        {
+            Ok(url) => println!("  now serving {url}"),
+            Err(error) => eprintln!("  the move failed: {error}"),
+        }
+        println!("manager says: {}", manager.take_message());
+        println!(
+            "manager records the directory as: {:?}",
+            manager.started_in()
+        );
+    }
 
     let config = BackendConfig {
         base_url: base_url.clone(),

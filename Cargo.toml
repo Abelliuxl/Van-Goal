@@ -48,6 +48,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 
+# Signalling a spawned server's whole process group, so a wrapper CLI cannot
+# leave the real server behind. Core only.
+libc = "0.2"
+
 [profile.release]
 opt-level = 2
 strip = true

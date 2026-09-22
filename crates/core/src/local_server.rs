@@ -172,12 +172,17 @@ impl ManagedServer {
 pub struct LocalServerManager {
     child: Arc<Mutex<Option<tokio::process::Child>>>,
     server: Mutex<Option<ManagedServer>>,
+    /// The directory the running child was started in. `None` means it was
+    /// started without one, in the app's own directory.
+    started_in: Mutex<Option<String>>,
     last_message: Mutex<String>,
     is_launching: Mutex<bool>,
 }
 
 impl LocalServerManager {
-    fn set_message(&self, message: impl Into<String>) {
+    /// Record a message for the settings window. It is the manager's own voice:
+    /// what it did, or why it did nothing.
+    pub fn set_message(&self, message: impl Into<String>) {
         let message = message.into();
         global_logger().log("server", message.clone());
         *self.last_message.lock().unwrap_or_else(|e| e.into_inner()) = message;
@@ -190,13 +195,26 @@ impl LocalServerManager {
             .clone()
     }
 
-    pub async fn start(&self, server: ManagedServer, port: u16, workspace: Option<&str>) {
-        if self
-            .child
+    /// Whether a server this app started is still running. A server the user
+    /// started is not this app's to stop, move or claim.
+    pub fn is_managing(&self) -> bool {
+        self.child
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
-        {
+    }
+
+    /// The directory the server this app started is running in. `None` when the
+    /// app started no server, or started one without a directory.
+    pub fn started_in(&self) -> Option<String> {
+        self.started_in
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub async fn start(&self, server: ManagedServer, port: u16, workspace: Option<&str>) {
+        if self.is_managing() {
             self.set_message(format!(
                 "{} process is already managed by Van-Goal.",
                 server.display_name()
@@ -209,10 +227,20 @@ impl LocalServerManager {
             .env("PATH", server.child_path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Its own process group, so the server can be stopped as a whole. The
+        // CLIs are wrappers that run the real server as a child — `mimo` is a
+        // node script that `spawnSync`s the bundled binary and forwards no
+        // signals — so signalling only the process this app spawned leaves the
+        // server itself running, still holding the port. Measured: the port
+        // answered after the wrapper was gone.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut started_in = None;
         if server.uses_workspace() {
             match workspace.map(str::trim).filter(|path| !path.is_empty()) {
                 Some(path) if std::path::Path::new(path).is_dir() => {
                     command.current_dir(path);
+                    started_in = Some(path.to_string());
                 }
                 Some(path) => self.set_message(format!(
                     "Workspace {path} does not exist; {} is started in the app's own directory.",
@@ -228,10 +256,17 @@ impl LocalServerManager {
                 *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 *self.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                 *self.server.lock().unwrap_or_else(|e| e.into_inner()) = Some(server);
-                self.set_message(format!(
-                    "Started local {} on 127.0.0.1:{port}.",
-                    server.display_name()
-                ));
+                *self.started_in.lock().unwrap_or_else(|e| e.into_inner()) = started_in.clone();
+                self.set_message(match &started_in {
+                    Some(directory) => format!(
+                        "Started local {} on 127.0.0.1:{port} in {directory}.",
+                        server.display_name()
+                    ),
+                    None => format!(
+                        "Started local {} on 127.0.0.1:{port}.",
+                        server.display_name()
+                    ),
+                });
             }
             Err(error) => {
                 self.set_message(format!("Failed to start {}: {error}", server.display_name()));
@@ -261,7 +296,13 @@ impl LocalServerManager {
         while std::time::Instant::now() < deadline {
             if is_reachable(&url, server, credential).await {
                 *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                self.set_message(format!("Local {} is ready.", server.display_name()));
+                self.set_message(match self.started_in() {
+                    Some(directory) => format!(
+                        "Local {} is ready in {directory}.",
+                        server.display_name()
+                    ),
+                    None => format!("Local {} is ready.", server.display_name()),
+                });
                 return Ok(url);
             }
             // A server that is gone cannot become ready, however the port looks.
@@ -288,6 +329,48 @@ impl LocalServerManager {
         ))
     }
 
+    /// Start the server again in `workspace`, because the project it serves is
+    /// fixed by the directory it was started in.
+    ///
+    /// A session is not: one resumed on a server started elsewhere runs its next
+    /// turn in *that* server's directory — measured — so moving the directory is
+    /// the whole of what "change the project" means. Only a server this app
+    /// started is moved; one the user started keeps its directory and its
+    /// process.
+    pub async fn restart_in(
+        &self,
+        server: ManagedServer,
+        port: u16,
+        workspace: Option<&str>,
+        credential: &str,
+    ) -> Result<String> {
+        let ours = self.is_managing();
+        self.stop().await;
+        if ours {
+            // Wait for the port to go quiet. `ensure_running` would otherwise
+            // find the server we just stopped still answering and keep using it,
+            // which is how a "restart" ends up changing nothing.
+            let url = format!("http://127.0.0.1:{port}");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if !is_reachable(&url, server, credential).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        let url = self
+            .ensure_running(server, port, workspace, credential)
+            .await?;
+        if !ours {
+            self.set_message(format!(
+                "Using local {} on 127.0.0.1:{port}. It was not started by Van-Goal, so its project is the directory it was started in.",
+                server.display_name()
+            ));
+        }
+        Ok(url)
+    }
+
     /// The child's exit status, if it is gone. Reaping it here also lets the
     /// next `start` try again.
     fn take_exited_child(&self) -> Option<String> {
@@ -302,6 +385,7 @@ impl LocalServerManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
+            *self.started_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
         }
         status.map(|status| status.to_string())
@@ -309,20 +393,50 @@ impl LocalServerManager {
 
     pub async fn stop(&self) {
         let managed = self.server.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = child.start_kill();
+        let was_managing = self.is_managing();
+        if let Some(child) = self
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            stop_process_group(child);
         }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        *self.started_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
         match managed {
-            Some(server) => {
+            Some(server) if was_managing => {
                 self.set_message(format!("Stopped local {} server.", server.display_name()))
             }
             // The server in use was already running when the app arrived, so
-            // there is nothing of the app's to stop — and killing a process the
-            // user started is not the app's business.
-            None => self.set_message("No server started by Van-Goal is running."),
+            // there is nothing of the app's to stop — killing a process the user
+            // started is not the app's business.
+            _ => self.set_message("No server started by Van-Goal is running."),
         }
     }
+}
+
+/// Stop a spawned server, and whatever it spawned in turn.
+///
+/// The child was started in its own process group, so the group is the unit to
+/// signal: the wrapper and the server it runs are one thing to the app even
+/// though they are two processes to the operating system.
+fn stop_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // `process_group(0)` makes the child the leader of its own group, so its
+        // pid is the group to signal.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    // The child itself, for a platform with no process groups and as a backstop
+    // when the group leader is already gone.
+    let _ = child.start_kill();
 }
 
 /// Keep a server's own output in the app log. A server that refuses to start —
@@ -374,9 +488,10 @@ async fn is_reachable(url: &str, server: ManagedServer, credential: &str) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::ManagedServer;
+    use super::{LocalServerManager, ManagedServer};
     use crate::agent::opencode;
     use crate::settings::BackendKind;
+    use std::time::Duration;
 
     /// Only a backend whose server this app can actually launch reports one. A
     /// backend missing here keeps connecting to an already-running server.
@@ -460,6 +575,71 @@ mod tests {
                 "{expected} must be on the child's PATH, so its own runtime is found: {entries:?}"
             );
         }
+    }
+
+    /// A server the user started is not the app's to stop or move: their
+    /// process keeps running, keeps its directory, and the app says so instead
+    /// of pretending the workspace changed.
+    #[tokio::test]
+    async fn a_server_started_outside_the_app_is_never_stopped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        // A stand-in for a `mimo serve` the user started: it answers the health
+        // path and stays up.
+        let foreign = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut socket,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+                    )
+                    .await;
+                    // Hold the connection open: a health check is not a shutdown.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+
+        let manager = LocalServerManager::default();
+        assert!(!manager.is_managing(), "nothing has been started yet");
+        assert_eq!(manager.started_in(), None);
+
+        let url = manager
+            .restart_in(ManagedServer::MiMoCode, port, Some("/tmp/elsewhere"), "")
+            .await
+            .expect("the running server is reused");
+
+        assert_eq!(url, format!("http://127.0.0.1:{port}"));
+        assert!(!manager.is_managing());
+        assert_eq!(manager.started_in(), None);
+        let message = manager.take_message();
+        assert!(
+            message.contains("not started by Van-Goal"),
+            "the app must say why the directory did not change: {message}"
+        );
+        assert!(
+            !message.contains("Stopped"),
+            "nothing of the app's was stopped: {message}"
+        );
+        foreign.abort();
+    }
+
+    /// `stop` says what it did, so the button that calls it is never silent.
+    #[tokio::test]
+    async fn stopping_nothing_says_so() {
+        let manager = LocalServerManager::default();
+        manager.stop().await;
+        assert_eq!(
+            manager.take_message(),
+            "No server started by Van-Goal is running."
+        );
     }
 
     /// Only `mimo serve` is scoped by its working directory; passing one to

@@ -102,12 +102,22 @@ impl SettingsView {
         cx.subscribe(
             &workspace_editor,
             move |this, _editor, event: &EditorEvent, cx| {
-                if *event == EditorEvent::Change {
-                    let text = this.workspace_editor.read(cx).text().to_string();
-                    workspace_state.update(cx, |state, _cx| {
-                        state.settings.workspace_path = text;
-                        state.settings.save();
-                    });
+                match event {
+                    EditorEvent::Change => {
+                        let text = this.workspace_editor.read(cx).text().to_string();
+                        workspace_state.update(cx, |state, _cx| {
+                            state.settings.workspace_path = text;
+                            state.settings.save();
+                        });
+                    }
+                    // Enter is the commit: the directory is where a managed
+                    // server has to be started again, so it takes effect here
+                    // rather than on every keystroke.
+                    EditorEvent::Submit => {
+                        workspace_state.update(cx, |state, cx| {
+                            state.apply_workspace(cx);
+                        });
+                    }
                 }
             },
         )
@@ -156,6 +166,15 @@ impl SettingsView {
                 });
                 this.token_editor.update(cx, |editor, cx| {
                     editor.set_text(settings.session_token.clone(), cx)
+                });
+            }
+            // The workspace can also be set from outside this field — the
+            // directory picker does — so the field follows the setting rather
+            // than only its own keystrokes. They are equal while typing, which
+            // is what keeps this from fighting the person typing.
+            if this.workspace_editor.read(cx).text() != settings.workspace_path {
+                this.workspace_editor.update(cx, |editor, cx| {
+                    editor.set_text(settings.workspace_path.clone(), cx)
                 });
             }
             cx.notify();
@@ -315,13 +334,38 @@ impl Render for SettingsView {
         }
         // A managed MiMoCode server is scoped by the directory it is started
         // in: it answers with that project's sessions and runs the agent there.
-        // The field is the one the CLI backends already use, shown here because
-        // it decides what this backend can see.
+        // Picking a directory and committing the field both move the server,
+        // because nothing else re-reads the setting.
         if settings.backend_kind == van_goal_core::settings::BackendKind::MiMoCode {
+            let pick_state = state.clone();
             connection = connection
-                .child(field_row("Workspace", self.workspace_editor.clone()))
+                .child(field_row_with(
+                    "Workspace",
+                    self.workspace_editor.clone(),
+                    Some(small_button(
+                        "choose-workspace",
+                        "Choose…",
+                        Theme::accent(),
+                        // The same native picker the attachment button uses.
+                        move |_event, _window, cx| {
+                            let Some(folder) = rfd::FileDialog::new()
+                                .set_title("Choose the project MiMoCode works in")
+                                .pick_folder()
+                            else {
+                                return;
+                            };
+                            let chosen = folder.to_string_lossy().to_string();
+                            pick_state.update(cx, |state, cx| {
+                                state.settings.workspace_path = chosen;
+                                state.settings.save();
+                                state.apply_workspace(cx);
+                                cx.notify();
+                            });
+                        },
+                    )),
+                ))
                 .child(hint(
-                    "The project mimo serve is started in: its sessions and its working directory.",
+                    "The project mimo serve is started in: its sessions and its working directory. Picking a directory starts it there; pressing Enter in the field does the same.",
                 ));
         }
         let active_backend = settings.backend_kind;
@@ -531,7 +575,17 @@ fn row_label(text: &'static str) -> AnyElement {
 }
 
 fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
-    div()
+    field_row_with(label, editor, None)
+}
+
+/// A `field_row` with one more control on its right, for a value that is easier
+/// to point at than to type.
+fn field_row_with(
+    label: &'static str,
+    editor: Entity<Editor>,
+    action: Option<AnyElement>,
+) -> AnyElement {
+    let row = div()
         .flex()
         .flex_row()
         .items_center()
@@ -554,8 +608,12 @@ fn field_row(label: &'static str, editor: Entity<Editor>) -> AnyElement {
                 .border_color(Theme::border())
                 .text_size(Theme::text_px(12.0))
                 .child(editor),
-        )
-        .into_any()
+        );
+    let row = match action {
+        Some(action) => row.child(action),
+        None => row,
+    };
+    row.into_any()
 }
 
 /// One backend and its own on/off switch. The switch is the only control:
