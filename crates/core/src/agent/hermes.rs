@@ -293,6 +293,10 @@ impl HermesBackend {
         Ok(())
     }
 
+    pub fn clear_session_scope(&mut self) {
+        self.gateway.set_subscribed(std::iter::empty());
+    }
+
     pub fn disconnect(&mut self) {
         self.gateway.close();
     }

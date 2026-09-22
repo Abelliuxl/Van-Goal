@@ -1,14 +1,16 @@
 use crate::ui::theme::Theme;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, fill, hsla, point, px, relative, rgba, size, App, Bounds, Context, CursorStyle,
+    actions, div, fill, hsla, point, px, relative, size, App, Bounds, Context, CursorStyle,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Style,
-    Styled, TextRun, UTF16Selection, Window, WrappedLine,
+    Focusable, Font, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection, Window, WrappedLine,
 };
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -78,6 +80,54 @@ struct LineEntry {
     line: WrappedLine,
 }
 
+#[derive(Clone, PartialEq)]
+struct EditorShapeKey {
+    text: SharedString,
+    wrap_width: Option<Pixels>,
+    font: Font,
+    font_size: Pixels,
+    color: Hsla,
+}
+
+#[derive(Clone)]
+struct RequestedShape {
+    key: EditorShapeKey,
+    wrapped: Vec<WrappedLine>,
+}
+
+fn shape_editor_text(window: &mut Window, key: &EditorShapeKey) -> Vec<WrappedLine> {
+    let run = TextRun {
+        len: key.text.len(),
+        font: key.font.clone(),
+        color: key.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_text(
+            key.text.clone(),
+            key.font_size,
+            &[run],
+            key.wrap_width,
+            None,
+        )
+        .unwrap_or_default()
+        .into_vec()
+}
+
+fn line_entries(content: &str, wrapped: Vec<WrappedLine>) -> Vec<LineEntry> {
+    let mut lines = Vec::with_capacity(wrapped.len());
+    let mut byte_start = 0usize;
+    for line in wrapped {
+        lines.push(LineEntry { byte_start, line });
+        let remainder = &content[byte_start.min(content.len())..];
+        byte_start += remainder.find('\n').unwrap_or(remainder.len()) + 1;
+    }
+    lines
+}
+
 pub struct Editor {
     hitbox_id: SharedString,
     element_id: SharedString,
@@ -88,6 +138,9 @@ pub struct Editor {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     lines: Vec<LineEntry>,
+    /// Shape used by `lines`. Long drafts are expensive to shape, so an
+    /// unrelated chat repaint reuses it until text, width or typography moves.
+    shape_key: Option<EditorShapeKey>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     /// Single-line fields hide newlines and use input cursor style.
@@ -99,6 +152,12 @@ pub struct Editor {
     /// clipped, and this window follows the caret so what is being typed or
     /// selected stays on screen.
     scroll_row: usize,
+    /// Set by editing/caret movement and consumed after the next reshape.
+    /// Manual wheel/thumb scrolling leaves it false so the viewport does not
+    /// immediately snap back to the caret on the following frame.
+    follow_cursor: bool,
+    /// Pointer offset inside the vertical scrollbar thumb while it is dragged.
+    scrollbar_grab: Option<f32>,
 }
 
 impl Editor {
@@ -126,9 +185,12 @@ impl Editor {
             selection_reversed: false,
             marked_range: None,
             lines: Vec::new(),
+            shape_key: None,
             last_bounds: None,
             is_selecting: false,
             scroll_row: 0,
+            follow_cursor: true,
+            scrollbar_grab: None,
             single_line,
             wrap_long_lines,
         }
@@ -140,6 +202,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.placeholder = placeholder.into();
+        self.lines.clear();
+        self.shape_key = None;
         cx.notify();
     }
 
@@ -160,7 +224,9 @@ impl Editor {
         // The text changed wholesale: rows are reshaped at the next paint, so
         // the scroll window restarts at the top and follows the caret again.
         self.lines.clear();
+        self.shape_key = None;
         self.scroll_row = 0;
+        self.follow_cursor = true;
         cx.notify();
     }
 
@@ -174,6 +240,7 @@ impl Editor {
         let offset = self.clamp(offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.follow_cursor = true;
         self.ensure_cursor_visible(cx);
         cx.notify();
     }
@@ -199,6 +266,7 @@ impl Editor {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.selected_range = self.clamp_range(self.selected_range.clone());
+        self.follow_cursor = true;
         self.ensure_cursor_visible(cx);
         cx.notify();
     }
@@ -291,11 +359,8 @@ impl Editor {
             let rows = entry.line.wrap_boundaries().len() + 1;
             // Rows scrolled off the top sit above the box; a click can only
             // land on what is visible.
-            let top = bounds.top()
-                + px(
-                    (self.rows_above(row_index).saturating_sub(self.scroll_row)) as f32
-                        * row_height(),
-                );
+            let visible_row = self.rows_above(row_index) as isize - self.scroll_row as isize;
+            let top = bounds.top() + px(visible_row as f32 * row_height());
             if top < bounds.top() {
                 continue;
             }
@@ -386,8 +451,49 @@ impl Editor {
     /// Scroll the visible window by whole rows, clamped to the content. This
     /// is the wheel's path; typing keeps following the caret.
     fn scroll_by(&mut self, rows: i64, cx: &mut Context<Self>) {
+        self.follow_cursor = false;
         let max_scroll = self.total_rows().saturating_sub(self.max_visible_rows());
         let next = (self.scroll_row as i64 + rows).clamp(0, max_scroll as i64) as usize;
+        if next != self.scroll_row {
+            self.scroll_row = next;
+            self.follow_cursor = false;
+            cx.notify();
+        }
+    }
+
+    /// `(thumb top, thumb height)` in window coordinates.
+    fn scrollbar_geometry(&self, bounds: Bounds<Pixels>) -> Option<(Pixels, Pixels)> {
+        let visible = self.max_visible_rows();
+        let total = self.total_rows();
+        if total <= visible {
+            return None;
+        }
+        let track = f32::from(bounds.size.height);
+        let thumb_height = (track * visible as f32 / total as f32).max(24.0).min(track);
+        let travel = (track - thumb_height).max(0.0);
+        let max_scroll = total.saturating_sub(visible).max(1);
+        let thumb_top = f32::from(bounds.top())
+            + travel * self.scroll_row.min(max_scroll) as f32 / max_scroll as f32;
+        Some((px(thumb_top), px(thumb_height)))
+    }
+
+    fn scroll_thumb_to(
+        &mut self,
+        pointer_y: Pixels,
+        grab: f32,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, thumb_height)) = self.scrollbar_geometry(bounds) else {
+            return;
+        };
+        let track = f32::from(bounds.size.height);
+        let thumb_height = f32::from(thumb_height);
+        let travel = (track - thumb_height).max(1.0);
+        let top = (f32::from(pointer_y - bounds.top()) - grab).clamp(0.0, travel);
+        let max_scroll = self.total_rows().saturating_sub(self.max_visible_rows());
+        let next = (top / travel * max_scroll as f32).round() as usize;
+        self.follow_cursor = false;
         if next != self.scroll_row {
             self.scroll_row = next;
             cx.notify();
@@ -398,7 +504,7 @@ impl Editor {
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let total = self.total_rows();
@@ -407,6 +513,7 @@ impl Editor {
         }
         let pixels = event.delta.pixel_delta(px(row_height())).y;
         self.scroll_by((-pixels / px(row_height())).round() as i64, cx);
+        window.prevent_default();
     }
 
     // -- editing -----------------------------------------------------------
@@ -444,6 +551,8 @@ impl Editor {
         self.marked_range = None;
         // Content just moved under the caret: reshaped rows land later.
         self.lines.clear();
+        self.shape_key = None;
+        self.follow_cursor = true;
         self.ensure_cursor_visible(cx);
         cx.emit(EditorEvent::Change);
         cx.notify();
@@ -617,6 +726,25 @@ impl Editor {
     ) {
         // Clicking anywhere in the editor takes focus so typing works.
         window.focus(&self.focus_handle);
+        if let Some(bounds) = self.last_bounds {
+            if let Some((thumb_top, thumb_height)) = self.scrollbar_geometry(bounds) {
+                if event.position.x >= bounds.right() - px(12.0) {
+                    let y = f32::from(event.position.y);
+                    let top = f32::from(thumb_top);
+                    let height = f32::from(thumb_height);
+                    let grab = if y >= top && y <= top + height {
+                        y - top
+                    } else {
+                        height / 2.0
+                    };
+                    self.scrollbar_grab = Some(grab);
+                    self.scroll_thumb_to(event.position.y, grab, bounds, cx);
+                    self.is_selecting = false;
+                    window.prevent_default();
+                    return;
+                }
+            }
+        }
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -627,9 +755,14 @@ impl Editor {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.scrollbar_grab = None;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(grab), Some(bounds)) = (self.scrollbar_grab, self.last_bounds) {
+            self.scroll_thumb_to(event.position.y, grab, bounds, cx);
+            return;
+        }
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -1048,6 +1181,125 @@ mod tests {
         );
         assert!(scroll < 12, "the scroll window ran past the content");
     }
+
+    /// Once the editor is scrolled, its first visible row owns the top of the
+    /// hitbox. Previously `saturating_sub` stacked every hidden row there, so
+    /// clicking visible line 5 put the caret in line 1.
+    #[gpui::test]
+    fn a_click_after_scrolling_hits_the_visible_row(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(cx);
+            editor.set_text(
+                (0..14)
+                    .map(|row| format!("line {row}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                cx,
+            );
+            editor
+        });
+        struct EditorRoot(Entity<Editor>);
+        impl Render for EditorRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().w(px(320.0)).h(px(300.0)).child(self.0.clone())
+            }
+        }
+        let (_root, cx) = cx.add_window_view(|_window, _cx| EditorRoot(editor.clone()));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+        let hitbox: &'static str = Box::leak(
+            editor
+                .read_with(cx, |editor, _cx| editor.hitbox_id.clone())
+                .to_string()
+                .into_boxed_str(),
+        );
+        let bounds = cx.debug_bounds(hitbox).expect("editor hitbox");
+        let (first_visible_byte, scroll_row) = editor.read_with(cx, |editor, _cx| {
+            let row = editor.scroll_row;
+            (editor.lines[row].byte_start, row)
+        });
+        assert!(scroll_row > 0, "fixture did not scroll");
+
+        let position = point(
+            bounds.left() + px(2.0),
+            bounds.top() + px(row_height() / 2.0),
+        );
+        cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let selected = editor.read_with(cx, |editor, _cx| editor.selected_range.clone());
+        assert!(
+            selected.start >= first_visible_byte,
+            "top visible row starts at {first_visible_byte}, click landed at {}",
+            selected.start
+        );
+    }
+
+    /// Wheel/thumb scrolling is a deliberate viewport move and must survive
+    /// the next paint instead of snapping straight back to the caret.
+    #[gpui::test]
+    fn dragging_the_vertical_thumb_keeps_the_new_scroll_position(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(cx);
+            editor.set_text(
+                (0..20)
+                    .map(|row| format!("line {row}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                cx,
+            );
+            editor
+        });
+        struct EditorRoot(Entity<Editor>);
+        impl Render for EditorRoot {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().w(px(320.0)).h(px(300.0)).child(self.0.clone())
+            }
+        }
+        let (_root, cx) = cx.add_window_view(|_window, _cx| EditorRoot(editor.clone()));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+        let hitbox: &'static str = Box::leak(
+            editor
+                .read_with(cx, |editor, _cx| editor.hitbox_id.clone())
+                .to_string()
+                .into_boxed_str(),
+        );
+        let bounds = cx.debug_bounds(hitbox).expect("editor hitbox");
+        editor.update(cx, |editor, cx| {
+            editor.selected_range = 0..0;
+            editor.scroll_row = 0;
+            editor.follow_cursor = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let start = point(bounds.right() - px(2.0), bounds.top() + px(4.0));
+        let end = point(bounds.right() - px(2.0), bounds.bottom() - px(4.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _cx| {
+            assert!(editor.scroll_row > 0, "thumb drag did not scroll");
+            assert!(!editor.follow_cursor, "paint re-enabled caret following");
+            assert!(editor.scrollbar_grab.is_none(), "thumb stayed grabbed");
+        });
+    }
 }
 
 impl Focusable for Editor {
@@ -1229,7 +1481,7 @@ impl IntoElement for EditorElement {
 }
 
 impl Element for EditorElement {
-    type RequestLayoutState = ();
+    type RequestLayoutState = Rc<RefCell<Option<RequestedShape>>>;
     type PrepaintState = PrepaintState;
 
     fn id(&self) -> Option<ElementId> {
@@ -1252,41 +1504,64 @@ impl Element for EditorElement {
         // a one-row-tall box, outside its own hitbox — clicks and drags on
         // that row then went nowhere, and a drag that crossed a row seemed to
         // select the wrong span.
-        let content = self.entity.read(cx).content.clone();
-        let single_line = self.entity.read(cx).single_line;
-        let wrap_long_lines = self.entity.read(cx).wrap_long_lines;
+        let (content, placeholder, single_line, wrap_long_lines, cached_key, cached_rows) = {
+            let editor = self.entity.read(cx);
+            (
+                editor.content.clone(),
+                editor.placeholder.clone(),
+                editor.single_line,
+                editor.wrap_long_lines,
+                editor.shape_key.clone(),
+                editor.total_rows(),
+            )
+        };
         let text_style = window.text_style();
         let font = text_style.font();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let color = if content.is_empty() {
+            hsla(0., 0., 0.5, 0.45)
+        } else {
+            text_style.color
+        };
+        let display_text: SharedString = if content.is_empty() {
+            placeholder
+        } else {
+            content.clone().into()
+        };
         let line_height = px(row_height());
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        let requested_shape: Rc<RefCell<Option<RequestedShape>>> = Rc::new(RefCell::new(None));
 
         let layout_id = window.request_measured_layout(style, {
+            let requested_shape = requested_shape.clone();
             move |known, available, window, _cx| {
-                let rows = if content.is_empty() || (single_line && !wrap_long_lines) {
-                    1
+                let width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let wrap_width = if single_line && !wrap_long_lines {
+                    None
                 } else {
-                    let width = known.width.or(match available.width {
-                        gpui::AvailableSpace::Definite(width) => Some(width),
-                        _ => None,
-                    });
-                    let run = TextRun {
-                        len: content.len(),
-                        font: font.clone(),
-                        color: gpui::black(),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let wrapped = window
-                        .text_system()
-                        .shape_text(content.clone().into(), font_size, &[run], width, None)
-                        .unwrap_or_default();
-                    wrapped
+                    width
+                };
+                let key = EditorShapeKey {
+                    text: display_text.clone(),
+                    wrap_width,
+                    font: font.clone(),
+                    font_size,
+                    color,
+                };
+                let rows = if cached_key.as_ref() == Some(&key) && cached_rows > 0 {
+                    cached_rows
+                } else {
+                    let wrapped = shape_editor_text(window, &key);
+                    let rows = wrapped
                         .iter()
                         .map(|line| line.wrap_boundaries().len() + 1)
-                        .sum::<usize>()
+                        .sum::<usize>();
+                    *requested_shape.borrow_mut() = Some(RequestedShape { key, wrapped });
+                    rows
                 };
                 gpui::Size::new(
                     known.width.unwrap_or(px(0.0)),
@@ -1294,7 +1569,7 @@ impl Element for EditorElement {
                 )
             }
         });
-        (layout_id, ())
+        (layout_id, requested_shape)
     }
 
     fn prepaint(
@@ -1302,156 +1577,151 @@ impl Element for EditorElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let editor = self.entity.read(cx);
-        let content = editor.content.clone();
-        let selected_range = editor.selected_range.clone();
-        let cursor = editor.cursor_offset();
-        let scroll_row = editor.scroll_row;
+        let (
+            content,
+            placeholder,
+            selected_range,
+            cursor,
+            scroll_row,
+            single_line,
+            wrap_long_lines,
+            cached_key,
+            cached_lines,
+        ) = {
+            let editor = self.entity.read(cx);
+            (
+                editor.content.clone(),
+                editor.placeholder.clone(),
+                editor.selected_range.clone(),
+                editor.cursor_offset(),
+                editor.scroll_row,
+                editor.single_line,
+                editor.wrap_long_lines,
+                editor.shape_key.clone(),
+                editor.lines.clone(),
+            )
+        };
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-
-        let run = TextRun {
-            len: content.len(),
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-
-        let wrapped = if content.is_empty() {
-            let placeholder_run = TextRun {
-                len: editor.placeholder.len(),
-                font: style.font(),
-                color: hsla(0., 0., 0.5, 0.45),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_text(
-                    editor.placeholder.clone(),
-                    font_size,
-                    &[placeholder_run],
-                    Some(bounds.size.width),
-                    None,
-                )
-                .unwrap_or_default()
+        let display_text: SharedString = if content.is_empty() {
+            placeholder
         } else {
-            window
-                .text_system()
-                .shape_text(
-                    content.clone().into(),
-                    font_size,
-                    &[run],
-                    Some(bounds.size.width),
-                    None,
-                )
-                .unwrap_or_default()
+            content.clone().into()
         };
-
-        // Byte offsets for each logical line.
-        let mut lines: Vec<LineEntry> = Vec::with_capacity(wrapped.len());
-        let mut byte_start = 0usize;
-        for line in wrapped {
-            lines.push(LineEntry { byte_start, line });
-            // Advance past this line's text plus the newline that follows it.
-            let text_len = {
-                let remainder = &content[byte_start.min(content.len())..];
-                match remainder.find('\n') {
-                    Some(newline) => newline,
-                    None => remainder.len(),
-                }
-            };
-            byte_start += text_len + 1;
-        }
+        let key = EditorShapeKey {
+            text: display_text,
+            wrap_width: (!(single_line && !wrap_long_lines)).then_some(bounds.size.width),
+            font: style.font(),
+            font_size,
+            color: if content.is_empty() {
+                hsla(0., 0., 0.5, 0.45)
+            } else {
+                style.color
+            },
+        };
+        let lines = if cached_key.as_ref() == Some(&key) && !cached_lines.is_empty() {
+            cached_lines
+        } else if let Some(requested) = request_layout
+            .borrow()
+            .as_ref()
+            .filter(|requested| requested.key == key)
+        {
+            line_entries(&content, requested.wrapped.clone())
+        } else {
+            line_entries(&content, shape_editor_text(window, &key))
+        };
 
         // Cursor + selection.
         let mut cursor_quad = None;
         let mut selection_quads = Vec::new();
         let is_focused = self.entity.read(cx).focus_handle.is_focused(window);
-        if is_focused {
-            let row_for = |byte: usize, lines: &[LineEntry]| -> Option<usize> {
-                lines.iter().rposition(|entry| entry.byte_start <= byte)
+        let row_for = |byte: usize, lines: &[LineEntry]| -> Option<usize> {
+            lines.iter().rposition(|entry| entry.byte_start <= byte)
+        };
+        if selected_range.is_empty() {
+            if let (true, Some(row)) = (is_focused, row_for(cursor, &lines)) {
+                let entry = &lines[row];
+                let rows_above: usize = lines[..row]
+                    .iter()
+                    .map(|entry| entry.line.wrap_boundaries().len() + 1)
+                    .sum();
+                if let Some(local) = entry
+                    .line
+                    .position_for_index(cursor - entry.byte_start, px(row_height()))
+                {
+                    let y = bounds.top()
+                        + px((rows_above as f32 - scroll_row as f32) * row_height())
+                        + local.y;
+                    cursor_quad = Some(fill(
+                        Bounds::new(
+                            point(bounds.left() + local.x, y),
+                            size(px(2.0), px(row_height())),
+                        ),
+                        gpui::blue(),
+                    ));
+                }
+            }
+        } else {
+            // One quad per wrapped row the selection covers: a selection
+            // that crosses a row boundary used to paint the whole logical
+            // line as one block, which read as "everything got selected".
+            //
+            // The highlight keeps painting after the editor lost focus, in a
+            // dimmed color — a retained selection must not read as gone just
+            // because a message was clicked in the meantime.
+            let selection_color = if is_focused {
+                Theme::selection()
+            } else {
+                Theme::selection_unfocused()
             };
-            if selected_range.is_empty() {
-                if let Some(row) = row_for(cursor, &lines) {
-                    let entry = &lines[row];
-                    let rows_above: usize = lines[..row]
-                        .iter()
-                        .map(|entry| entry.line.wrap_boundaries().len() + 1)
-                        .sum();
-                    if let Some(local) = entry
-                        .line
-                        .position_for_index(cursor - entry.byte_start, px(row_height()))
-                    {
+            let start = selected_range.start.min(selected_range.end);
+            let end = selected_range.start.max(selected_range.end);
+            let mut rows_above = 0usize;
+            for entry in &lines {
+                let row_ends: Vec<usize> = entry
+                    .line
+                    .wrap_boundaries()
+                    .iter()
+                    .map(|boundary| {
+                        entry.line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                            .index
+                    })
+                    .chain([entry.line.len()])
+                    .collect();
+                let mut row_start = 0usize;
+                for (visual_row, row_end) in row_ends.iter().enumerate() {
+                    let intersect_start = start.max(entry.byte_start + row_start);
+                    let intersect_end = end.min(entry.byte_start + row_end);
+                    if intersect_start < intersect_end {
+                        // `position_for_index` assigns a wrap boundary to the
+                        // preceding row. Computing x from the unwrapped line
+                        // and subtracting this visual row's origin avoids a
+                        // second-row selection starting at the previous row's
+                        // right edge.
+                        let local_start = intersect_start - entry.byte_start;
+                        let local_end = intersect_end - entry.byte_start;
+                        let row_origin = entry.line.unwrapped_layout.x_for_index(row_start);
+                        let from_x =
+                            entry.line.unwrapped_layout.x_for_index(local_start) - row_origin;
+                        let to_x = entry.line.unwrapped_layout.x_for_index(local_end) - row_origin;
+                        let visible_row = rows_above + visual_row;
                         let y = bounds.top()
-                            + px((rows_above as f32 - scroll_row as f32) * row_height())
-                            + local.y;
-                        cursor_quad = Some(fill(
+                            + px((visible_row as f32 - scroll_row as f32) * row_height());
+                        selection_quads.push(fill(
                             Bounds::new(
-                                point(bounds.left() + local.x, y),
-                                size(px(2.0), px(row_height())),
+                                point(bounds.left() + from_x, y),
+                                size((to_x - from_x).max(px(2.0)), px(row_height())),
                             ),
-                            gpui::blue(),
+                            selection_color,
                         ));
                     }
+                    row_start = *row_end;
                 }
-            } else {
-                // One quad per wrapped row the selection covers: a selection
-                // that crosses a row boundary used to paint the whole logical
-                // line as one block, which read as "everything got selected".
-                let start = selected_range.start.min(selected_range.end);
-                let end = selected_range.start.max(selected_range.end);
-                let mut rows_above = 0usize;
-                for entry in &lines {
-                    let row_ends: Vec<usize> = entry
-                        .line
-                        .wrap_boundaries()
-                        .iter()
-                        .map(|boundary| {
-                            entry.line.unwrapped_layout.runs[boundary.run_ix].glyphs
-                                [boundary.glyph_ix]
-                                .index
-                        })
-                        .chain([entry.line.len()])
-                        .collect();
-                    let mut row_start = 0usize;
-                    for row_end in &row_ends {
-                        let intersect_start = start.max(entry.byte_start + row_start);
-                        let intersect_end = end.min(entry.byte_start + row_end);
-                        if intersect_start < intersect_end {
-                            if let (Some(from), Some(to)) = (
-                                entry.line.position_for_index(
-                                    intersect_start - entry.byte_start,
-                                    px(row_height()),
-                                ),
-                                entry.line.position_for_index(
-                                    intersect_end - entry.byte_start,
-                                    px(row_height()),
-                                ),
-                            ) {
-                                let y = bounds.top()
-                                    + px((rows_above as f32 - scroll_row as f32) * row_height())
-                                    + from.y;
-                                selection_quads.push(fill(
-                                    Bounds::new(
-                                        point(bounds.left() + from.x, y),
-                                        size((to.x - from.x).max(px(2.0)), px(row_height())),
-                                    ),
-                                    rgba(0x3311ff30),
-                                ));
-                            }
-                        }
-                        row_start = *row_end;
-                    }
-                    rows_above += row_ends.len();
-                }
+                rows_above += row_ends.len();
             }
         }
 
@@ -1468,17 +1738,18 @@ impl Element for EditorElement {
         // box, positioned from the same rows the text is painted from.
         let thumb_quad = if content_rows > 8 {
             let track = bounds.size.height;
-            let thumb_height = (track * 8.0 / content_rows.max(1) as f32).max(px(24.0));
-            let thumb_top = bounds.top()
-                + track
-                    * (scroll_row as f32 / (content_rows - 8).max(1) as f32)
-                    * (1.0 - thumb_height / track).min(1.0);
+            let thumb_height = (track * 8.0 / content_rows.max(1) as f32)
+                .max(px(24.0))
+                .min(track);
+            let travel = (track - thumb_height).max(px(0.0));
+            let thumb_top =
+                bounds.top() + travel * (scroll_row as f32 / (content_rows - 8).max(1) as f32);
             Some(fill(
                 Bounds::new(
-                    point(bounds.right() - px(6.0), thumb_top),
-                    size(px(3.0), thumb_height),
+                    point(bounds.right() - px(7.0), thumb_top),
+                    size(px(4.0), thumb_height),
                 ),
-                rgba(0xffffff2c),
+                Theme::scrollbar_thumb(),
             ))
         } else {
             None
@@ -1489,7 +1760,11 @@ impl Element for EditorElement {
         // caret stays in view after every reshape.
         self.entity.update(cx, |editor, cx| {
             editor.lines = lines.clone();
-            editor.ensure_cursor_visible(cx);
+            editor.shape_key = Some(key);
+            if editor.follow_cursor {
+                editor.ensure_cursor_visible(cx);
+                editor.follow_cursor = false;
+            }
         });
 
         PrepaintState {

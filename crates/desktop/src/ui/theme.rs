@@ -1,4 +1,4 @@
-use gpui::{hsla, px, rgb, Hsla, Pixels, WindowAppearance};
+use gpui::{px, rgb, Hsla, Pixels, Rgba, WindowAppearance};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use van_goal_core::settings::{AppearanceMode, FontSize};
 
@@ -120,7 +120,12 @@ impl Theme {
     /// The highlight under selected message text. Same blue the accent uses,
     /// translucent, so selected glyphs stay readable on every fill they sit on.
     pub fn selection() -> Hsla {
-        rgba_hex(if Self::is_light() { 0x276df1 } else { 0x4f8cff }, 0.30)
+        rgba_hex(if Self::is_light() { 0x276df1 } else { 0x4f8cff }, 0.40)
+    }
+    /// The same selection once its field lost focus: dimmer and grayer, so a
+    /// retained selection stays visible without competing with the active one.
+    pub fn selection_unfocused() -> Hsla {
+        rgba_hex(if Self::is_light() { 0x276df1 } else { 0x9aa4b2 }, 0.24)
     }
     pub fn scrollbar_thumb_active() -> Hsla {
         rgba_hex(if Self::is_light() { 0x1c1c21 } else { 0xffffff }, 0.45)
@@ -143,16 +148,28 @@ impl Theme {
 }
 
 pub fn rgba_hex(value: u32, alpha: f32) -> Hsla {
-    let r = ((value >> 16) & 0xff) as f32 / 255.0;
-    let g = ((value >> 8) & 0xff) as f32 / 255.0;
-    let b = (value & 0xff) as f32 / 255.0;
-    hsla(r, g, b, alpha)
+    Rgba {
+        r: ((value >> 16) & 0xff) as f32 / 255.0,
+        g: ((value >> 8) & 0xff) as f32 / 255.0,
+        b: (value & 0xff) as f32 / 255.0,
+        a: alpha.clamp(0.0, 1.0),
+    }
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Theme;
-    use gpui::{Hsla, WindowAppearance};
+    use super::{rgba_hex, Theme};
+    use gpui::{Hsla, Rgba, WindowAppearance};
+
+    #[test]
+    fn translucent_hex_colors_are_converted_from_rgb_not_treated_as_hsl() {
+        let color: Rgba = rgba_hex(0x276df1, 0.4).into();
+        assert!((color.r - 0x27 as f32 / 255.0).abs() < 0.001);
+        assert!((color.g - 0x6d as f32 / 255.0).abs() < 0.001);
+        assert!((color.b - 0xf1 as f32 / 255.0).abs() < 0.001);
+        assert!((color.a - 0.4).abs() < 0.001);
+    }
     use van_goal_core::settings::AppearanceMode;
 
     /// A label that does not contrast with its fill renders as a blank pill,

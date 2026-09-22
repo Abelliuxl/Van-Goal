@@ -221,6 +221,23 @@ impl Backend {
         }
     }
 
+    /// Stop treating any previous session as the one on screen.
+    ///
+    /// Frontends call this when they move to a genuinely new, still-empty chat.
+    /// A connection can keep delivering the session it was previously scoped
+    /// to until the new session is created; leaving that scope in place lets an
+    /// old reply land in the blank conversation during that window.
+    pub fn clear_session_scope(&mut self) {
+        match self {
+            Backend::Hermes(b) => b.clear_session_scope(),
+            Backend::OpenCode(b) | Backend::MiMoCode(b) => b.clear_session_scope(),
+            Backend::OpenClaw(b) => b.clear_session_scope(),
+            // Local CLI processes do not multiplex unrelated sessions onto one
+            // event stream, so there is no adapter-side scope to clear.
+            Backend::Codex(_) | Backend::ClaudeCode(_) | Backend::Pi(_) => {}
+        }
+    }
+
     pub fn disconnect(&mut self) {
         match self {
             Backend::Hermes(b) => b.disconnect(),

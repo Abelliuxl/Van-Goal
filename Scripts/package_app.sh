@@ -20,7 +20,11 @@ BUNDLE_ID="com.abelliuxl.VanGoal"
 # This is a Cargo workspace, so `cargo metadata` lists every member and the
 # order is not guaranteed — ask for the desktop package by name instead of
 # taking packages[0], which would silently stamp the wrong version (or fail).
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+# `/usr/local/bin/python3` may be an Intel-only Homebrew shim on Apple Silicon.
+# The system interpreter is sufficient for this small JSON query and avoids a
+# packaging failure before the release build even starts.
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+VERSION="$(cargo metadata --no-deps --format-version 1 | "$PYTHON_BIN" -c '
 import json, sys
 packages = json.load(sys.stdin)["packages"]
 app = next(p for p in packages if p["name"] == "van-goal")

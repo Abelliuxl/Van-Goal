@@ -109,6 +109,9 @@ pub struct Client {
 struct OpenSession {
     live_id: Option<String>,
     stored_id: Option<String>,
+    /// Bumped whenever the user changes which conversation is on screen. An
+    /// async history/resume result may only mutate the view that issued it.
+    generation: u64,
     /// The messages on screen, folded from events by [`Conversation`].
     conversation: Conversation,
     /// Conversations for sessions that are not on screen. Switching away and
@@ -138,7 +141,8 @@ impl OpenSession {
 
     /// Put the conversation on screen away and bring back the one for `id`, if
     /// this client has seen it before.
-    fn switch_to(&mut self, id: Option<&str>) {
+    fn switch_to(&mut self, id: Option<&str>) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
         if let Some(key) = self.key() {
             let parked = std::mem::take(&mut self.conversation);
             self.parked.insert(key, parked);
@@ -151,6 +155,11 @@ impl OpenSession {
             }
         }
         self.conversation = id.and_then(|id| self.parked.remove(id)).unwrap_or_default();
+        self.generation
+    }
+
+    fn is_current(&self, generation: u64, id: Option<&str>) -> bool {
+        self.generation == generation && self.key().as_deref() == id
     }
 }
 
@@ -299,30 +308,63 @@ async fn open_on(
     open: &Arc<Mutex<OpenSession>>,
     id: &str,
 ) {
-    {
+    let generation = {
         let mut session = open.lock().unwrap();
-        session.switch_to(Some(id));
+        let generation = session.switch_to(Some(id));
         // Not attached to it yet: `accepts_turn_events` holds turn traffic off
         // until the backend confirms, which is why the live id is cleared here.
         session.live_id = None;
         session.stored_id = Some(id.to_string());
-    }
+        generation
+    };
     // What this client already drew for the session, tool calls and all, before
     // the backend has said anything.
     push_transcript(events, open);
 
     if let Ok(messages) = backend.lock().await.messages(config, id).await {
-        // A turn the client watched is richer than what the backend reports, so
-        // the two are merged rather than replaced.
-        open.lock().unwrap().conversation.merge_transcript(messages);
+        {
+            let mut session = open.lock().unwrap();
+            // The user can switch again while chat.history is in flight. That
+            // reply belongs to the view that requested it, never to whichever
+            // conversation happens to be on screen when it arrives.
+            if !session.is_current(generation, Some(id)) {
+                return;
+            }
+            // A turn the client watched is richer than what the backend reports,
+            // so the two are merged rather than replaced.
+            session.conversation.merge_transcript(messages);
+        }
         push_transcript(events, open);
     }
-    match backend.lock().await.resume_session(config, id).await {
+    if !open.lock().unwrap().is_current(generation, Some(id)) {
+        return;
+    }
+    let resumed = backend.lock().await.resume_session(config, id).await;
+    match resumed {
         Ok(ids) => {
-            {
+            let (stale, stale_blank) = {
                 let mut session = open.lock().unwrap();
-                session.live_id = Some(ids.live_id.clone());
-                session.stored_id = ids.stored_id.clone().or(Some(id.to_string()));
+                if !session.is_current(generation, Some(id)) {
+                    (true, session.key().is_none())
+                } else {
+                    session.live_id = Some(ids.live_id.clone());
+                    session.stored_id = ids.stored_id.clone().or(Some(id.to_string()));
+                    (false, false)
+                }
+            };
+            if stale {
+                // `resume_session` changes the adapter's own event scope. If the
+                // user moved to a blank new chat while it was in flight, clear
+                // that stale scope after the request releases the backend lock.
+                // A newer named session has its own `open_on` operation queued
+                // and will establish its scope.
+                if stale_blank {
+                    let mut backend = backend.lock().await;
+                    if open.lock().unwrap().key().is_none() {
+                        backend.clear_session_scope();
+                    }
+                }
+                return;
             }
             push(events, json!({ "event": "session", "id": ids.live_id }));
         }
@@ -752,18 +794,30 @@ impl Client {
     /// Start a chat that has no session on the backend yet. The session itself
     /// is created on the first send, so opening one costs nothing.
     fn new_session(&self) -> Result<()> {
-        {
+        let generation = {
             let mut open = self.open.lock().unwrap();
-            open.switch_to(None);
+            let generation = open.switch_to(None);
             open.live_id = None;
             open.stored_id = None;
-        }
+            generation
+        };
         // The user asked for a new chat, so that — not the conversation they
         // were in — is what a relaunch should come back to.
         forget_session(&self.settings);
         let events = self.events.clone();
         let open = self.open.clone();
         push_transcript(&events, &open);
+        // Until the first prompt creates this chat, the adapter must not remain
+        // scoped to the session the user just left. Otherwise its late frames
+        // are the only labelled frames that pass the protocol filter and they
+        // land in this blank conversation.
+        let backend = self.backend();
+        self.runtime.spawn(async move {
+            let mut backend = backend.lock().await;
+            if open.lock().unwrap().is_current(generation, None) {
+                backend.clear_session_scope();
+            }
+        });
         Ok(())
     }
 
@@ -814,20 +868,27 @@ impl Client {
                 }
                 // A chat with no session at all: the only case that needs one
                 // created.
-                SendTarget::Create => match backend.lock().await.create_session(&config).await {
-                    Ok(SessionIDs { live_id, stored_id }) => {
-                        let mut open = open.lock().unwrap();
-                        open.live_id = Some(live_id.clone());
-                        open.stored_id = stored_id.or_else(|| open.stored_id.take());
-                        live_id
+                SendTarget::Create => {
+                    let created = {
+                        let mut backend = backend.lock().await;
+                        backend.clear_session_scope();
+                        backend.create_session(&config).await
+                    };
+                    match created {
+                        Ok(SessionIDs { live_id, stored_id }) => {
+                            let mut open = open.lock().unwrap();
+                            open.live_id = Some(live_id.clone());
+                            open.stored_id = stored_id.or_else(|| open.stored_id.take());
+                            live_id
+                        }
+                        Err(error) => {
+                            push_error(&events, format!("could not start a session: {error}"));
+                            open.lock().unwrap().conversation.finish_turn();
+                            push_transcript(&events, &open);
+                            return;
+                        }
                     }
-                    Err(error) => {
-                        push_error(&events, format!("could not start a session: {error}"));
-                        open.lock().unwrap().conversation.finish_turn();
-                        push_transcript(&events, &open);
-                        return;
-                    }
-                },
+                }
             };
             // The prompt goes to this session, so this is the conversation a
             // relaunch has to come back to.
@@ -1361,6 +1422,26 @@ mod tests {
         open.switch_to(Some("a"));
         assert_eq!(open.conversation.messages().len(), 1);
         assert_eq!(open.conversation.messages()[0].content, "在 A 里说的话");
+    }
+
+    #[test]
+    fn a_late_open_result_cannot_mutate_a_newer_view() {
+        let mut open = OpenSession::default();
+        let opening_a = open.switch_to(Some("a"));
+        open.stored_id = Some("a".into());
+        assert!(open.is_current(opening_a, Some("a")));
+
+        let opening_b = open.switch_to(Some("b"));
+        open.live_id = None;
+        open.stored_id = Some("b".into());
+        assert!(!open.is_current(opening_a, Some("a")));
+        assert!(open.is_current(opening_b, Some("b")));
+
+        let blank = open.switch_to(None);
+        open.live_id = None;
+        open.stored_id = None;
+        assert!(!open.is_current(opening_b, Some("b")));
+        assert!(open.is_current(blank, None));
     }
 
     /// Only the session on screen and the one just left are ever wanted, so the

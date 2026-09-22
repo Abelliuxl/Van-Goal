@@ -1,14 +1,14 @@
 use crate::state::AppState;
 use crate::ui::editor::{Editor, EditorEvent};
 use crate::ui::markdown_view::{render_blocks, SelectionBlock};
-use crate::ui::selectable_text::SelectionHost;
+use crate::ui::selectable_text::{SelectionHost, SelectionOrder};
 use crate::ui::theme::Theme;
 use gpui::{
     actions, div, list, point, prelude::*, px, AnyElement, Context, Entity, FocusHandle, Focusable,
     FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, Styled, Window,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use van_goal_core::models::{
     compact_token_count, duration_string, ContextUsage, MessageRole, PermissionMode,
 };
 
-actions!(chat, [CopySelection, QuoteSelection]);
+actions!(chat, [CopySelection]);
 
 /// Smallest overlay-scrollbar thumb, as a fraction of the track.
 const MIN_THUMB_FRACTION: f32 = 0.06;
@@ -150,6 +150,12 @@ pub struct ChatView {
     transcript_focus_handle: FocusHandle,
     /// The one active text selection across every block the transcript draws.
     text_selection: Option<TextSelection>,
+    /// Text of every currently rendered selectable block, in transcript order.
+    /// This is what lets one mouse drag span separate Markdown elements.
+    selection_blocks: BTreeMap<SelectionOrder, RegisteredSelectionBlock>,
+    /// Fixed end of the live drag. The moving end may be in any registered
+    /// block, including a different paragraph or message.
+    selection_drag: Option<SelectionEndpoint>,
     /// The right-click menu for the current selection, positioned relative to
     /// the view.
     context_menu: Option<ContextMenu>,
@@ -165,13 +171,22 @@ struct ContextMenu {
     text: String,
 }
 
-/// What a selected range in one markdown block holds while it is live.
+#[derive(Clone)]
+struct RegisteredSelectionBlock {
+    key: u64,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionEndpoint {
+    order: SelectionOrder,
+    index: usize,
+}
+
+/// One logical selection, cut into the range painted by each Markdown block.
 #[derive(Clone)]
 struct TextSelection {
-    /// Which block the selection belongs to: a SelectableText only paints a
-    /// range whose key matches its own.
-    key: u64,
-    range: Range<usize>,
+    ranges: HashMap<u64, Range<usize>>,
     text: String,
 }
 
@@ -265,6 +280,8 @@ impl ChatView {
             list_synced: false,
             transcript_focus_handle: cx.focus_handle(),
             text_selection: None,
+            selection_blocks: BTreeMap::new(),
+            selection_drag: None,
             context_menu: None,
             view_origin: None,
         }
@@ -334,6 +351,8 @@ impl ChatView {
             // Every bubble in the old session is out of scope.
             self.markdown_memo.clear();
             self.text_selection = None;
+            self.selection_blocks.clear();
+            self.selection_drag = None;
             self.context_menu = None;
         } else if message_count != self.last_list_count {
             let old_count = self.last_list_count;
@@ -613,22 +632,25 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Quote the selected text into the composer: `----` above it, so the next
-    /// prompt opens with what the agent is being asked to look at.
-    fn quote_text_selection(
+    /// Quote `text` into the composer: the quoted material first, then a
+    /// `----` line under it, and the caret on the empty line below that — the
+    /// next prompt is written where the caret sits, with what the agent is
+    /// being asked to look at above it.
+    ///
+    /// The menu's Quote acts on the text the menu opened for, not the live
+    /// selection: the press that lands the click must not depend on the
+    /// selection having survived it.
+    fn quote_text_into_composer(
         &mut self,
-        _: &QuoteSelection,
-        _: &mut gpui::Window,
+        text: String,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(selection) = self.text_selection.take() else {
-            return;
-        };
-        if selection.text.is_empty() {
+        if text.is_empty() {
             return;
         }
         self.context_menu = None;
-        let quoted = format!("----\n{}\n", selection.text);
+        let quoted = format!("{}\n----\n", text);
         self.editor.update(cx, |editor, cx| {
             let draft = editor.text().to_string();
             let combined = if draft.trim().is_empty() {
@@ -636,31 +658,135 @@ impl ChatView {
             } else {
                 format!("{quoted}{draft}")
             };
+            // `set_text` leaves the caret at the end: on the empty line under
+            // the separator when the draft was empty.
             editor.set_text(combined, cx);
         });
+        // The right-click left the focus on the transcript; without moving it
+        // the caret is invisible and the next keystrokes go nowhere.
+        let handle = self.editor.focus_handle(cx);
+        window.on_next_frame(move |window, _cx| window.focus(&handle));
         cx.notify();
     }
 }
 
-/// The transcript is the selection's home: every selectable markdown block
-/// stores and reads its range through here.
-impl SelectionHost for Entity<ChatView> {
-    fn selection(&self, cx: &gpui::App) -> Option<(u64, std::ops::Range<usize>, String)> {
-        self.read(cx).text_selection.as_ref().map(|selection| {
-            (
-                selection.key,
-                selection.range.clone(),
-                selection.text.clone(),
-            )
-        })
+fn transcript_selection(
+    blocks: &BTreeMap<SelectionOrder, RegisteredSelectionBlock>,
+    anchor: SelectionEndpoint,
+    head: SelectionEndpoint,
+) -> TextSelection {
+    let (first, last, forward) = if anchor.order <= head.order {
+        (anchor, head, true)
+    } else {
+        (head, anchor, false)
+    };
+    let mut ranges = HashMap::new();
+    let mut pieces = Vec::new();
+
+    for (order, block) in blocks.range(first.order..=last.order) {
+        let len = block.text.len();
+        let clamp = |mut byte: usize| {
+            byte = byte.min(len);
+            while byte > 0 && !block.text.is_char_boundary(byte) {
+                byte -= 1;
+            }
+            byte
+        };
+        let range = if first.order == last.order {
+            let a = clamp(anchor.index);
+            let b = clamp(head.index);
+            a.min(b)..a.max(b)
+        } else if *order == first.order {
+            let edge = clamp(if forward { anchor.index } else { head.index });
+            edge..len
+        } else if *order == last.order {
+            let edge = clamp(if forward { head.index } else { anchor.index });
+            0..edge
+        } else {
+            0..len
+        };
+        if !range.is_empty() {
+            pieces.push(block.text[range.clone()].replace('\u{200b}', ""));
+        }
+        ranges.insert(block.key, range);
     }
 
-    fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut gpui::App) {
+    TextSelection {
+        ranges,
+        text: pieces.join("\n\n"),
+    }
+}
+
+/// The transcript is the selection's home: every selectable Markdown block
+/// registers its text here, while one drag is cut into a range per block.
+impl SelectionHost for Entity<ChatView> {
+    fn register_block(&self, key: u64, order: SelectionOrder, text: String, cx: &mut gpui::App) {
+        self.update(cx, |chat, _cx| {
+            chat.selection_blocks
+                .insert(order, RegisteredSelectionBlock { key, text });
+        });
+    }
+
+    fn selection_for(&self, key: u64, cx: &gpui::App) -> Option<Range<usize>> {
+        self.read(cx)
+            .text_selection
+            .as_ref()
+            .and_then(|selection| selection.ranges.get(&key).cloned())
+    }
+
+    fn begin_selection(&self, _key: u64, order: SelectionOrder, index: usize, cx: &mut gpui::App) {
         self.update(cx, |chat, cx| {
-            chat.text_selection = Some(TextSelection { key, range, text });
+            let endpoint = SelectionEndpoint { order, index };
+            chat.selection_drag = Some(endpoint);
+            chat.text_selection = Some(transcript_selection(
+                &chat.selection_blocks,
+                endpoint,
+                endpoint,
+            ));
             chat.context_menu = None;
             cx.notify();
         });
+    }
+
+    fn select_range(&self, key: u64, range: Range<usize>, text: String, cx: &mut gpui::App) {
+        self.update(cx, |chat, cx| {
+            chat.selection_drag = None;
+            chat.text_selection = Some(TextSelection {
+                ranges: HashMap::from([(key, range)]),
+                text: text.replace('\u{200b}', ""),
+            });
+            chat.context_menu = None;
+            cx.notify();
+        });
+    }
+
+    fn extend_selection(&self, _key: u64, order: SelectionOrder, index: usize, cx: &mut gpui::App) {
+        self.update(cx, |chat, cx| {
+            let Some(anchor) = chat.selection_drag else {
+                return;
+            };
+            let head = SelectionEndpoint { order, index };
+            chat.text_selection = Some(transcript_selection(&chat.selection_blocks, anchor, head));
+            chat.context_menu = None;
+            cx.notify();
+        });
+    }
+
+    fn is_selecting(&self, cx: &gpui::App) -> bool {
+        self.read(cx).selection_drag.is_some()
+    }
+
+    fn end_selection(&self, cx: &mut gpui::App) {
+        self.update(cx, |chat, _cx| chat.selection_drag = None);
+    }
+
+    fn selection_text_for(&self, key: u64, cx: &gpui::App) -> Option<String> {
+        self.read(cx).text_selection.as_ref().and_then(|selection| {
+            selection
+                .ranges
+                .contains_key(&key)
+                .then(|| selection.text.clone())
+        })
     }
 
     fn press_outside(&self, position: gpui::Point<Pixels>, cx: &mut gpui::App) {
@@ -683,6 +809,7 @@ impl SelectionHost for Entity<ChatView> {
             if chat.text_selection.take().is_some() {
                 changed = true;
             }
+            chat.selection_drag = None;
             if chat.context_menu.take().is_some() {
                 changed = true;
             }
@@ -723,6 +850,11 @@ impl ChatView {
         let menu = self.context_menu.clone()?;
         let chat = cx.entity();
         let menu_for_close = chat.clone();
+        // Each item acts on the text the menu opened for, not the live
+        // selection: the selection under the pointer may have moved on. Both
+        // click handlers are `move`, so each carries its own copy.
+        let menu_text = menu.text.clone();
+        let quote_text = menu.text.clone();
         Some(
             div()
                 .id("selection-context-menu")
@@ -739,9 +871,16 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
+                // The menu floats above the message it selected: without
+                // occluding, a press on a menu item is also "hovered" by the
+                // SelectableText underneath, whose mouse-down then treats the
+                // press as a press on the text — it rebuilds the selection and
+                // closes the menu, so the click on Copy / Quote never lands.
+                .occlude()
                 .child(
                     div()
                         .id("menu-copy-selection")
+                        .debug_selector(|| "menu-copy-item".into())
                         .px_2()
                         .py_1()
                         .text_size(Theme::text_px(12.0))
@@ -751,9 +890,9 @@ impl ChatView {
                             // The menu carries the text it opened for: the
                             // selection under the pointer may have moved on.
                             menu_for_close.update(cx, |chat, cx| {
-                                if !menu.text.is_empty() {
+                                if !menu_text.is_empty() {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        menu.text.clone(),
+                                        menu_text.clone(),
                                     ));
                                 }
                                 chat.context_menu = None;
@@ -765,6 +904,7 @@ impl ChatView {
                 .child(
                     div()
                         .id("menu-quote-selection")
+                        .debug_selector(|| "menu-quote-item".into())
                         .px_2()
                         .py_1()
                         .text_size(Theme::text_px(12.0))
@@ -772,7 +912,7 @@ impl ChatView {
                         .hover(|style| style.bg(Theme::surface_hover()))
                         .on_click(move |_event, window, cx| {
                             chat.update(cx, |chat, cx| {
-                                chat.quote_text_selection(&QuoteSelection, window, cx);
+                                chat.quote_text_into_composer(quote_text.clone(), window, cx);
                             });
                         })
                         .child("Quote"),
@@ -784,6 +924,11 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every selectable element registers again during layout. Dropping
+        // last frame's registry prevents removed or virtualized blocks from
+        // being folded into a later cross-paragraph drag.
+        self.selection_blocks.clear();
+
         // Focus the composer once on first paint so typing works immediately.
         if self.needs_initial_focus {
             self.needs_initial_focus = false;
@@ -1830,6 +1975,7 @@ fn render_message_bubble(
     let id_hash = crate::ui::hash_id(&message.id);
     let selection = SelectionBlock {
         message_id: message.id.clone(),
+        message_index: index,
         host: Rc::new(chat.clone()),
     };
     let bubble = match message.role {
@@ -1844,6 +1990,14 @@ fn render_message_bubble(
                     .id(gpui::ElementId::NamedInteger("user-bubble".into(), id_hash))
                     .debug_selector(move || format!("user-bubble-{index}"))
                     .max_w(px(USER_BUBBLE_MAX_WIDTH))
+                    // `max_w` caps a wide window but does not by itself let a
+                    // flex item shrink below its intrinsic width. A cron prompt
+                    // full of paths and ids can therefore remain 640px wide in
+                    // a 627px transcript and, because it is right aligned, be
+                    // positioned at a negative x. The zero minimum and explicit
+                    // shrink keep both edges inside the message column.
+                    .min_w(px(0.0))
+                    .flex_shrink()
                     .px(px(USER_BUBBLE_PADDING_X))
                     .py(px(10.0))
                     .rounded_lg()
@@ -1872,6 +2026,8 @@ fn render_message_bubble(
                             // message. Capping the text as well means the
                             // intrinsic pass already sees the final line count.
                             .max_w(px(USER_BUBBLE_TEXT_MAX_WIDTH))
+                            .min_w(px(0.0))
+                            .flex_shrink()
                             .text_size(Theme::text_px(13.0))
                             .text_color(Theme::text())
                             .child(render_blocks(&blocks, Some(&selection))),
@@ -2651,6 +2807,10 @@ mod message_width_tests {
     /// was measured narrower than it was finally laid out.
     const CRON_PROMPT: &str = "[cron:057a3b4d-44ae-4d5e-9ec6-b81cb715369e 情话-晚间档 20:05] 运行每日情话任务（晚间档）：执行 python3 /home/liuxl/.openclaw/workspace/skills/flirt/scripts/send_love.py。脚本会生成情话并通过 macbridge 发 iMessage 给雪宝，自带日志和失败 Bark 告警。不要重复发送，只执行一次并确认日志写入\n。\nCurrent time: Monday, September 14th, 2026 - 8:05 PM (Asia/Shanghai)\nReference UTC: 2026-09-14 12:05 UTC";
 
+    /// The exact shape that exposed the narrow-window bug: several long ASCII
+    /// ids and paths inside a user-role message fetched from `chat.history`.
+    const WIDE_CRON_PROMPT: &str = "[cron:350aa5dd-f8ea-48a7-b438-3e9d5ba5b8b5 deepseek-harness commit 监控（微信总结层）] 检查文件 /home/liuxl/.openclaw/workspace/data/deepseek-harness-watch/pending.txt 是否存在：\n1. 不存在：直接回复 NO_REPLY\n2. 存在：先用 exec 读取文件内容；然后必须用 message 工具发送到当前主人的微信：channel=openclaw-weixin，target=o9cq806Xt5rX7xaIDxOqjPwhnBkA@im.wechat，accountId=32ba044c17f8-im-bot。message 内容就是 pending.txt 的完整内容。确认 message 工具发送成功后，再用 exec 执行 rm -f /home/liuxl/.openclaw/workspace/data/deepseek-harness-watch/pending.txt。最后回复 NO_REPLY。不要把内容只写在自己的回复里，必须调用 message 工具发送。\nCurrent time: Saturday, September 19th, 2026 - 2:00 PM (Asia/Shanghai)\nReference UTC: 2026-09-19 06:00 UTC";
+
     fn render_roles<'a>(
         cx: &'a mut TestAppContext,
         messages: Vec<(MessageRole, &str)>,
@@ -2792,6 +2952,34 @@ mod message_width_tests {
         );
     }
 
+    #[gpui::test]
+    fn a_synchronised_cron_prompt_stays_inside_a_retina_sized_window(cx: &mut TestAppContext) {
+        let cx = render_sized(
+            cx,
+            vec![
+                (MessageRole::User, WIDE_CRON_PROMPT),
+                (MessageRole::Assistant, "NO_REPLY"),
+            ],
+            627.0,
+        );
+        let bubble = cx.debug_bounds("user-bubble-0").expect("bubble");
+        let column = cx.debug_bounds("message-column-0").expect("message column");
+        let bubble_left = f32::from(bubble.origin.x);
+        let bubble_right = bubble_left + f32::from(bubble.size.width);
+        let column_left = f32::from(column.origin.x) + MESSAGE_GUTTER;
+        let column_right =
+            f32::from(column.origin.x) + f32::from(column.size.width) - MESSAGE_GUTTER;
+
+        assert!(
+            bubble_left >= column_left - 0.5,
+            "cron bubble begins at {bubble_left}, left of its message gutter at {column_left}"
+        );
+        assert!(
+            bubble_right <= column_right + 0.5,
+            "cron bubble ends at {bubble_right}, right of its message gutter at {column_right}"
+        );
+    }
+
     /// A prompt that is one long unbreakable run: the bubble still has to
     /// reserve the height its wrapped text needs.
     #[gpui::test]
@@ -2825,8 +3013,118 @@ mod selection_tests {
 
     impl Render for SizedChat {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(900.0)).h(px(600.0)).child(self.0.clone())
+            // Flex column, like the copy-button tests: a bare div gives the
+            // list nothing to stretch into and it lays out with no height.
+            div()
+                .w(px(900.0))
+                .h(px(600.0))
+                .flex()
+                .flex_col()
+                .child(self.0.clone())
         }
+    }
+
+    #[test]
+    fn transcript_selection_cuts_a_drag_across_every_intermediate_block() {
+        let blocks = BTreeMap::from([
+            (
+                SelectionOrder {
+                    message: 0,
+                    block: 0,
+                },
+                RegisteredSelectionBlock {
+                    key: 1,
+                    text: "alpha".into(),
+                },
+            ),
+            (
+                SelectionOrder {
+                    message: 0,
+                    block: 1,
+                },
+                RegisteredSelectionBlock {
+                    key: 2,
+                    text: "beta".into(),
+                },
+            ),
+            (
+                SelectionOrder {
+                    message: 0,
+                    block: 2,
+                },
+                RegisteredSelectionBlock {
+                    key: 3,
+                    text: "gamma".into(),
+                },
+            ),
+        ]);
+        let first = SelectionEndpoint {
+            order: SelectionOrder {
+                message: 0,
+                block: 0,
+            },
+            index: 2,
+        };
+        let last = SelectionEndpoint {
+            order: SelectionOrder {
+                message: 0,
+                block: 2,
+            },
+            index: 3,
+        };
+
+        for (anchor, head) in [(first, last), (last, first)] {
+            let selection = transcript_selection(&blocks, anchor, head);
+            assert_eq!(selection.ranges.get(&1), Some(&(2..5)));
+            assert_eq!(selection.ranges.get(&2), Some(&(0..4)));
+            assert_eq!(selection.ranges.get(&3), Some(&(0..3)));
+            assert_eq!(selection.text, "pha\n\nbeta\n\ngam");
+        }
+    }
+
+    /// Paragraphs are separate GPUI elements, but a normal mouse drag must
+    /// still produce one transcript selection and finish when the button is
+    /// released over the second paragraph.
+    #[gpui::test]
+    fn a_mouse_drag_selects_across_markdown_paragraphs(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.conversation.set_transcript(vec![ChatMessage::new(
+                MessageRole::Assistant,
+                "first paragraph\n\nsecond paragraph".to_string(),
+            )]);
+        });
+        let (host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+        let view: Entity<ChatView> = host.read_with(cx, |sized, _cx| sized.0.clone());
+        let first = cx
+            .debug_bounds("markdown-block-0")
+            .expect("first paragraph");
+        let second = cx
+            .debug_bounds("markdown-block-1")
+            .expect("second paragraph");
+        let start = point(first.left() + px(8.0), first.center().y);
+        let end = point(second.right() - px(8.0), second.center().y);
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        view.read_with(cx, |chat, _cx| {
+            let selection = chat.text_selection.as_ref().expect("no selection");
+            assert_eq!(selection.ranges.len(), 2, "drag stayed inside one block");
+            assert!(selection.text.contains("\n\n"));
+            assert!(
+                chat.selection_drag.is_none(),
+                "drag stayed live after mouse-up"
+            );
+        });
     }
 
     /// A press on the context menu itself must leave the selection and the
@@ -2860,8 +3158,7 @@ mod selection_tests {
 
         entity.update(cx, |chat, _cx| {
             chat.text_selection = Some(TextSelection {
-                key: 7,
-                range: 0..5,
+                ranges: HashMap::from([(7, 0..5)]),
                 text: "hello".to_string(),
             });
             chat.context_menu = Some(ContextMenu {
@@ -2899,6 +3196,121 @@ mod selection_tests {
             assert!(
                 chat.context_menu.is_none(),
                 "the menu survived an outside press"
+            );
+        });
+    }
+
+    /// A full click on the menu's Copy and Quote items must act on the menu's
+    /// text. The menu floats over the selected block, and the block's own
+    /// mouse-down used to claim the press — it rebuilt the selection and
+    /// closed the menu, so the click landed on nothing and both items were
+    /// dead.
+    #[gpui::test]
+    fn a_click_on_the_menu_items_acts_on_the_menus_text(cx: &mut TestAppContext) {
+        let state = cx.new(AppState::new);
+        state.update(cx, |state, _cx| {
+            state.selected_session = None;
+            state.conversation.set_transcript(vec![ChatMessage::new(
+                MessageRole::Assistant,
+                "hello brave world".to_string(),
+            )]);
+        });
+        let (host, cx) =
+            cx.add_window_view(|_window, cx| SizedChat(cx.new(|cx| ChatView::new(state, cx))));
+        for _ in 0..3 {
+            cx.update(|window, _cx| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let view: Entity<ChatView> = host.read_with(cx, |sized, _cx| sized.0.clone());
+        let entity: Entity<ChatView> = view.clone();
+
+        // Open the menu over the assistant's block, the way a right-click on
+        // a selection does, so the block sits under it.
+        let block = cx
+            .debug_bounds("assistant-message-0")
+            .expect("the assistant block was not laid out");
+        let view_origin = view.read_with(cx, |chat, _cx| chat.view_origin.unwrap_or_default());
+        let menu_position = point(
+            block.origin.x - view_origin.x,
+            block.origin.y - view_origin.y,
+        );
+        entity.update(cx, |chat, cx| {
+            chat.text_selection = Some(TextSelection {
+                ranges: HashMap::from([(7, 0..5)]),
+                text: "hello".to_string(),
+            });
+            chat.context_menu = Some(ContextMenu {
+                position: menu_position,
+                text: "hello".to_string(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Copy: the click has to survive the mouse-down underneath the menu.
+        let copy_item = cx
+            .debug_bounds("menu-copy-item")
+            .expect("the menu's copy item was not laid out");
+        cx.simulate_mouse_down(
+            copy_item.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(
+            copy_item.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        let copied = cx.update(|_window, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(
+            copied.as_deref(),
+            Some("hello"),
+            "the Copy item's click never reached the clipboard"
+        );
+        view.read_with(cx, |chat, _cx| {
+            assert!(chat.context_menu.is_none(), "the menu stayed open");
+            assert!(
+                chat.text_selection.is_some(),
+                "Copy dropped the selection it copied"
+            );
+        });
+
+        // Quote: reopened on the same selection, it quotes the menu's text
+        // into the empty composer.
+        entity.update(cx, |chat, cx| {
+            chat.context_menu = Some(ContextMenu {
+                position: menu_position,
+                text: "hello".to_string(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let quote_item = cx
+            .debug_bounds("menu-quote-item")
+            .expect("the menu's quote item was not laid out");
+        cx.simulate_mouse_down(
+            quote_item.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(
+            quote_item.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |chat, cx| {
+            assert!(chat.context_menu.is_none(), "the menu stayed open");
+            assert_eq!(
+                chat.editor.read(cx).text().to_string(),
+                "hello\n----\n",
+                "the Quote item did not quote the menu's text"
             );
         });
     }

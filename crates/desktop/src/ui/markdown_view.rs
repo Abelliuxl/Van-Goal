@@ -8,7 +8,7 @@ use gpui::{
 };
 use van_goal_core::markdown::{InlineStyle, MarkdownBlock};
 
-use crate::ui::selectable_text::{SelectableText, SelectionHost};
+use crate::ui::selectable_text::{SelectableText, SelectionHost, SelectionOrder};
 
 const MAX_TABLE_COLUMNS: usize = 8;
 const MAX_TABLE_ROWS: usize = 80;
@@ -21,6 +21,9 @@ pub struct SelectionBlock {
     /// The id of the message the blocks belong to; keys the transcript's
     /// active selection under, one key per (message, block).
     pub message_id: String,
+    /// Position in the transcript, so selection order is independent of
+    /// hashed ids and remains correct across messages.
+    pub message_index: usize,
     pub host: Rc<dyn SelectionHost>,
 }
 
@@ -28,6 +31,13 @@ impl SelectionBlock {
     /// The key one block's selection is stored under.
     fn key(&self, seed: u64) -> u64 {
         crate::ui::hash_id(&format!("{}:{}", self.message_id, seed))
+    }
+
+    fn order(&self, block: u64) -> SelectionOrder {
+        SelectionOrder {
+            message: self.message_index,
+            block,
+        }
     }
 }
 
@@ -71,6 +81,9 @@ fn render_block(
     is_first: bool,
     selection: Option<&SelectionBlock>,
 ) -> AnyElement {
+    // Leave ample room below each top-level block for table cells while
+    // preserving the visual order of every selectable leaf.
+    let block_order = seed.saturating_mul(1_000_000);
     match block {
         MarkdownBlock::Heading(level, text) => {
             // Sized against the 13px body text: a heading has to read as a
@@ -89,7 +102,7 @@ fn render_block(
                 .font_weight(weight)
                 .text_size(Theme::text_px(size))
                 .text_color(Theme::text())
-                .child(render_inline(text, seed, selection))
+                .child(render_inline(text, block_order, selection))
                 .into_any()
         }
         MarkdownBlock::Paragraph(text) => div()
@@ -97,7 +110,7 @@ fn render_block(
             .my(Theme::text_px(PARAGRAPH_SPACE))
             .text_size(Theme::text_px(13.0))
             .text_color(Theme::text())
-            .child(render_inline(text, seed, selection))
+            .child(render_inline(text, block_order, selection))
             .into_any(),
         MarkdownBlock::Bullet(text) => div()
             .min_w(px(0.0))
@@ -116,7 +129,7 @@ fn render_block(
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
-                    .child(render_inline(text, seed, selection)),
+                    .child(render_inline(text, block_order, selection)),
             )
             .into_any(),
         MarkdownBlock::Numbered(number, text) => div()
@@ -137,7 +150,7 @@ fn render_block(
                     .text_color(crate::ui::theme::Theme::text())
                     .flex_1()
                     .min_w(px(0.0))
-                    .child(render_inline(text, seed, selection)),
+                    .child(render_inline(text, block_order, selection)),
             )
             .into_any(),
         MarkdownBlock::Quote(text) => div()
@@ -147,7 +160,7 @@ fn render_block(
             .pl_2()
             .text_size(Theme::text_px(13.0))
             .text_color(crate::ui::theme::Theme::text_secondary())
-            .child(render_inline(text, seed, selection))
+            .child(render_inline(text, block_order, selection))
             .into_any(),
         MarkdownBlock::Code(text) => div()
             .id(gpui::ElementId::NamedInteger(
@@ -172,7 +185,8 @@ fn render_block(
                                 "code-block-text".into(),
                                 crate::ui::hash_id(text),
                             ),
-                            selection.key(seed),
+                            selection.key(block_order),
+                            selection.order(block_order),
                             text.clone(),
                             Vec::new(),
                             Vec::new(),
@@ -185,7 +199,7 @@ fn render_block(
             )
             .into_any(),
         MarkdownBlock::Table(headers, rows) => {
-            render_table(headers, rows, seed, selection).into_any()
+            render_table(headers, rows, block_order, selection).into_any()
         }
         MarkdownBlock::Separator => div()
             .h(px(1.0))
@@ -254,6 +268,7 @@ fn render_inline(source: &str, seed: u64, selection: Option<&SelectionBlock>) ->
                 crate::ui::hash_id(source).wrapping_add(seed),
             ),
             selection.key(seed),
+            selection.order(seed),
             parsed.text,
             highlights,
             links,
@@ -319,7 +334,7 @@ fn render_table(
             &fractions,
             0,
             true,
-            seed.wrapping_mul(1000),
+            seed.saturating_add(1),
             selection,
         )
         .into_any(),
@@ -332,8 +347,8 @@ fn render_table(
                 &fractions,
                 row_index + 1,
                 false,
-                seed.wrapping_mul(1000)
-                    .wrapping_add(((row_index + 1) * column_count) as u64),
+                seed.saturating_add(1)
+                    .saturating_add(((row_index + 1) * column_count) as u64),
                 selection,
             )
             .into_any(),

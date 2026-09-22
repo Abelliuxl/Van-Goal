@@ -10,15 +10,34 @@ use gpui::{
 
 use crate::ui::theme::Theme;
 
+/// Visual order of a selectable block in the transcript. Selections use this
+/// instead of the block's hash so a drag can continue through later/earlier
+/// Markdown blocks and messages.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SelectionOrder {
+    pub message: usize,
+    pub block: u64,
+}
+
 /// Where a [`SelectableText`] keeps its selection.
 ///
 /// Implemented on the transcript view: one selection is active at a time, and
 /// clicking another block replaces it instead of leaving two highlights.
 pub trait SelectionHost {
-    /// The active selection's key, byte range and rendered text, if any.
-    fn selection(&self, cx: &App) -> Option<(u64, Range<usize>, String)>;
-    /// Replace the active selection with this one and request a redraw.
-    fn set_selection(&self, key: u64, range: Range<usize>, text: String, cx: &mut App);
+    /// Make a block available to the transcript-wide selection coordinator.
+    fn register_block(&self, key: u64, order: SelectionOrder, text: String, cx: &mut App);
+    /// The part of the active transcript selection painted by this block.
+    fn selection_for(&self, key: u64, cx: &App) -> Option<Range<usize>>;
+    /// Start a drag at one byte boundary in one block.
+    fn begin_selection(&self, key: u64, order: SelectionOrder, index: usize, cx: &mut App);
+    /// Replace the selection with a self-contained range (double click).
+    fn select_range(&self, key: u64, range: Range<usize>, text: String, cx: &mut App);
+    /// Continue the live drag into this block.
+    fn extend_selection(&self, key: u64, order: SelectionOrder, index: usize, cx: &mut App);
+    fn is_selecting(&self, cx: &App) -> bool;
+    fn end_selection(&self, cx: &mut App);
+    /// The complete copied text when this block is part of the selection.
+    fn selection_text_for(&self, key: u64, cx: &App) -> Option<String>;
     /// A left press landed outside this block. Clears an active selection,
     /// except when the press is on the open context menu — the menu's own
     /// items have yet to act on the selection.
@@ -44,6 +63,7 @@ pub struct SelectableText {
     /// Selection identity: a block cannot hold another block's selection.
     /// Stable across frames so a repaint keeps the highlight.
     key: u64,
+    order: SelectionOrder,
     text: SharedString,
     /// The block's own highlights; the selection is re-cut against them per
     /// frame (see [`selection_over`]).
@@ -70,6 +90,7 @@ impl SelectableText {
     pub fn new(
         id: impl Into<ElementId>,
         key: u64,
+        order: SelectionOrder,
         text: impl Into<SharedString>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
         links: Vec<(Range<usize>, String)>,
@@ -80,6 +101,7 @@ impl SelectableText {
         Self {
             id: id.into(),
             key,
+            order,
             text,
             highlights,
             styled,
@@ -126,12 +148,10 @@ impl Element for SelectableText {
         // separately painted highlight underneath loses that fight to the code
         // spans' own backgrounds, which is what made selected rows and spans
         // look unselected.
-        let selection = self
-            .host
-            .as_ref()
-            .and_then(|host| host.selection(cx))
-            .filter(|(key, _, _)| *key == self.key)
-            .map(|(_, range, _)| range);
+        let selection = self.host.as_ref().and_then(|host| {
+            host.register_block(self.key, self.order, self.text.to_string(), cx);
+            host.selection_for(self.key, cx)
+        });
         self.styled = StyledText::new(self.text.clone()).with_highlights(selection_over(
             self.text.len(),
             self.highlights.clone(),
@@ -184,11 +204,13 @@ impl Element for SelectableText {
             let drag_down = drag.clone();
             let key = self.key;
             let links = Rc::new(self.links.clone());
-            let drag_move = drag.clone();
             let drag_up = drag.clone();
             let hitbox = prepaint.hitbox.clone();
+            let move_hitbox = prepaint.hitbox.clone();
+            let up_hitbox = prepaint.hitbox.clone();
             let layout = prepaint.layout.clone();
             let text = prepaint.text.clone();
+            let order = self.order;
 
             window.on_mouse_event({
                 let layout = layout.clone();
@@ -200,11 +222,9 @@ impl Element for SelectableText {
                         // block with an active selection of its own opens the
                         // copy / quote menu at the pointer.
                         if phase.bubble() && hitbox.is_hovered(window) {
-                            if let Some((selection_key, _, selection_text)) = host.selection(cx) {
-                                if selection_key == key {
-                                    host.open_context_menu(event.position, selection_text, cx);
-                                    window.prevent_default();
-                                }
+                            if let Some(selection_text) = host.selection_text_for(key, cx) {
+                                host.open_context_menu(event.position, selection_text, cx);
+                                window.prevent_default();
                             }
                         }
                         return;
@@ -216,16 +236,17 @@ impl Element for SelectableText {
                         let index = index_at(&layout, event.position);
                         drag_down.pending.set(true);
                         drag_down.anchor.set(Some(index));
-                        let range = match event.click_count {
-                            2 => word_range_around(&text, index),
-                            _ => index..index,
-                        };
-                        host.set_selection(
-                            key,
-                            range.clone(),
-                            text.get(range.clone()).unwrap_or("").to_string(),
-                            cx,
-                        );
+                        if event.click_count == 2 {
+                            let range = word_range_around(&text, index);
+                            host.select_range(
+                                key,
+                                range.clone(),
+                                text.get(range).unwrap_or("").to_string(),
+                                cx,
+                            );
+                        } else {
+                            host.begin_selection(key, order, index, cx);
+                        }
                         host.focus_transcript(window, cx);
                         window.prevent_default();
                     } else if phase.capture() {
@@ -237,29 +258,30 @@ impl Element for SelectableText {
 
             window.on_mouse_event({
                 let layout = layout.clone();
-                let text = text.clone();
                 let host = host.clone();
-                move |event: &MouseMoveEvent, phase, _window, cx| {
-                    if phase.capture() || !drag_move.pending.get() {
+                move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase.capture() || !host.is_selecting(cx) || !move_hitbox.is_hovered(window)
+                    {
                         return;
                     }
-                    let Some(anchor) = drag_move.anchor.get() else {
-                        return;
-                    };
                     let head = index_at(&layout, event.position);
-                    let range = anchored_range(anchor, head);
-                    host.set_selection(
-                        key,
-                        range.clone(),
-                        text.get(range.clone()).unwrap_or("").to_string(),
-                        cx,
-                    );
+                    host.extend_selection(key, order, head, cx);
                 }
             });
 
             window.on_mouse_event({
                 let layout = layout.clone();
-                move |event: &MouseUpEvent, phase, _window, cx| {
+                move |event: &MouseUpEvent, phase, window, cx| {
+                    // A drag may end over another paragraph or in the gap
+                    // between blocks. The block that started it still sees
+                    // the capture phase and must terminate the host drag, or
+                    // later pointer movement would keep changing selection.
+                    if phase.capture() && drag_up.pending.get() && !up_hitbox.is_hovered(window) {
+                        drag_up.pending.set(false);
+                        drag_up.anchor.set(None);
+                        host.end_selection(cx);
+                        return;
+                    }
                     if !phase.bubble() {
                         return;
                     }
@@ -279,6 +301,7 @@ impl Element for SelectableText {
                             }
                         }
                     }
+                    host.end_selection(cx);
                 }
             });
             ((), drag)
@@ -300,6 +323,7 @@ fn index_at(layout: &TextLayout, position: gpui::Point<Pixels>) -> usize {
 }
 
 /// The byte range a selection covers, from its two ends in either order.
+#[cfg(test)]
 fn anchored_range(anchor: usize, head: usize) -> Range<usize> {
     if head < anchor {
         head..anchor
@@ -385,18 +409,53 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         stored: RefCell<StoredSelection>,
+        dragging: Cell<bool>,
     }
 
     impl SelectionHost for FakeSink {
-        fn selection(&self, _cx: &App) -> Option<(u64, Range<usize>, String)> {
+        fn register_block(&self, _key: u64, _order: SelectionOrder, _text: String, _cx: &mut App) {}
+
+        fn selection_for(&self, key: u64, _cx: &App) -> Option<Range<usize>> {
             self.stored
                 .borrow()
                 .as_ref()
-                .map(|(key, range, text)| (*key, range.clone(), text.clone()))
+                .and_then(|(stored, range, _)| (*stored == key).then(|| range.clone()))
         }
 
-        fn set_selection(&self, key: u64, range: Range<usize>, text: String, _cx: &mut App) {
+        fn begin_selection(&self, key: u64, _order: SelectionOrder, index: usize, _cx: &mut App) {
+            self.dragging.set(true);
+            *self.stored.borrow_mut() = Some((key, index..index, String::new()));
+        }
+
+        fn select_range(&self, key: u64, range: Range<usize>, text: String, _cx: &mut App) {
             *self.stored.borrow_mut() = Some((key, range, text));
+        }
+
+        fn extend_selection(&self, key: u64, _order: SelectionOrder, index: usize, _cx: &mut App) {
+            let mut stored = self.stored.borrow_mut();
+            let Some((stored_key, range, text)) = stored.as_mut() else {
+                return;
+            };
+            if *stored_key == key {
+                let anchor = range.start;
+                *range = anchored_range(anchor, index);
+                *text = "hello brave world"[range.clone()].to_string();
+            }
+        }
+
+        fn is_selecting(&self, _cx: &App) -> bool {
+            self.dragging.get()
+        }
+
+        fn end_selection(&self, _cx: &mut App) {
+            self.dragging.set(false);
+        }
+
+        fn selection_text_for(&self, key: u64, _cx: &App) -> Option<String> {
+            self.stored
+                .borrow()
+                .as_ref()
+                .and_then(|(stored, _, text)| (*stored == key).then(|| text.clone()))
         }
 
         fn press_outside(&self, _position: gpui::Point<Pixels>, _cx: &mut App) {
@@ -424,6 +483,10 @@ mod tests {
                     SelectableText::new(
                         "probe",
                         42,
+                        SelectionOrder {
+                            message: 0,
+                            block: 0,
+                        },
                         self.text.clone(),
                         Vec::new(),
                         Vec::new(),

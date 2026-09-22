@@ -212,6 +212,10 @@ impl OpenClawBackend {
         Ok(())
     }
 
+    pub fn clear_session_scope(&mut self) {
+        self.gateway.clear_active_session();
+    }
+
     pub fn disconnect(&mut self) {
         self.gateway.disconnect();
     }
@@ -389,7 +393,7 @@ enum GatewayCommand {
         params: serde_json::Value,
         responder: oneshot::Sender<Result<serde_json::Value>>,
     },
-    SetActive(String),
+    SetActive(Option<String>),
     Close,
 }
 
@@ -434,7 +438,18 @@ impl GatewayHandle {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            let _ = sender.unbounded_send(GatewayCommand::SetActive(key));
+            let _ = sender.unbounded_send(GatewayCommand::SetActive(Some(key)));
+        }
+    }
+
+    fn clear_active_session(&self) {
+        if let Some(sender) = self
+            .command_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = sender.unbounded_send(GatewayCommand::SetActive(None));
         }
     }
 
@@ -587,7 +602,7 @@ async fn run_gateway(
                         }
                     }
                     Some(GatewayCommand::SetActive(key)) => {
-                        *active_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
+                        *active_session.lock().unwrap_or_else(|e| e.into_inner()) = key;
                     }
                     Some(GatewayCommand::Close) | None => {
                         let _ = sink.send(Message::Close(None)).await;

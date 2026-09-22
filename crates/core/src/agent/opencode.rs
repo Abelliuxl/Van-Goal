@@ -308,6 +308,13 @@ impl OpenCodeBackend {
         Ok(())
     }
 
+    pub fn clear_session_scope(&mut self) {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_session_id = None;
+    }
+
     pub fn disconnect(&mut self) {
         if let Some(task) = self
             .event_task

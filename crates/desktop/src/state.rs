@@ -120,6 +120,10 @@ pub struct AppState {
     pub(crate) backend_caps: BackendCaps,
     cache_store: SessionCacheStore,
     cached_state: CachedState,
+    /// Identifies the most recent operation that changed which conversation is
+    /// on screen. Async history/resume/create results captured under an older
+    /// value must not mutate the new conversation.
+    session_view_generation: u64,
     live_gateway_session_id: Option<String>,
     stored_gateway_session_id: Option<String>,
     event_tx: UnboundedSender<AgentEvent>,
@@ -193,6 +197,7 @@ impl AppState {
             backend_caps: Backend::make(kind).capabilities(),
             cache_store,
             cached_state,
+            session_view_generation: 0,
             live_gateway_session_id: None,
             stored_gateway_session_id: None,
             event_tx,
@@ -362,6 +367,12 @@ impl AppState {
     }
 
     pub fn connect(&mut self, cx: &mut gpui::Context<Self>) {
+        // An explicit refresh can arrive while an earlier reconnect is still
+        // probing the backend. Do not stack another probe/stream/session resume
+        // on top of it; the in-flight connect owns that work.
+        if self.connection_state == ConnectionState::Connecting || self.gateway_connecting {
+            return;
+        }
         log_debug!("app", "connect requested");
         self.connection_state = ConnectionState::Connecting;
         self.transport_ready = false;
@@ -496,6 +507,19 @@ impl AppState {
     }
 
     pub fn refresh_sessions(&mut self, show_progress: bool, cx: &mut gpui::Context<Self>) {
+        // The toolbar/keyboard refresh is also the user's way to recover after
+        // the app has slept long enough for its event stream to die. Merely
+        // listing sessions is insufficient: some backends can satisfy that
+        // request over HTTP, and OpenClaw can lazily open a request-only socket,
+        // neither of which restores the event stream that carries replies.
+        // A full connect also re-lists sessions and resumes the chat on screen.
+        // Silent refreshes are backend hints and must not restart a healthy
+        // stream (or turn one disconnect into a retry loop).
+        if refresh_needs_reconnect(show_progress, self.transport_ready) {
+            log_debug!("app", "explicit refresh reconnecting dead transport");
+            self.connect(cx);
+            return;
+        }
         if show_progress {
             self.is_refreshing_sessions = true;
             cx.notify();
@@ -556,6 +580,7 @@ impl AppState {
     }
 
     pub fn resume_session(&mut self, session: AgentSession, cx: &mut gpui::Context<Self>) {
+        let view_generation = self.advance_session_view();
         self.selected_session = Some(session.clone());
         self.pending_clarify = None;
         // The session on screen is not the one this connection is subscribed to
@@ -601,8 +626,20 @@ impl AppState {
             let result = join
                 .await
                 .unwrap_or(Err(anyhow::anyhow!("resume task failed")));
-            let _ =
-                this.update(cx, |state, cx| match result {
+            let _ = this.update(cx, |state, cx| {
+                if !session_view_is_current(
+                    view_generation,
+                    state.session_view_generation,
+                    state
+                        .selected_session
+                        .as_ref()
+                        .map(|session| session.id.as_str()),
+                    Some(resumed_id.as_str()),
+                ) {
+                    log_debug!("app", "stale resume result ignored session={resumed_id}");
+                    return;
+                }
+                match result {
                     Ok(ids) => {
                         state.live_gateway_session_id = Some(ids.live_id.clone());
                         state.stored_gateway_session_id =
@@ -642,12 +679,14 @@ impl AppState {
                         }
                         log_debug!("app", "resume gateway failed: {error}");
                     }
-                });
+                }
+            });
         })
         .detach();
     }
 
     pub fn start_fresh_chat(&mut self, cx: &mut gpui::Context<Self>) {
+        let view_generation = self.advance_session_view();
         self.selected_session = None;
         self.conversation = Conversation::new();
         self.pending_clarify = None;
@@ -661,13 +700,27 @@ impl AppState {
         let profile = self.settings.normalized_profile();
         let backend_id = self.backend_id().to_string();
         let join = tokio_spawn(cx, async move {
-            backend.lock().await.create_session(&config).await
+            let mut backend = backend.lock().await;
+            backend.clear_session_scope();
+            backend.create_session(&config).await
         });
         cx.spawn(async move |this, cx| {
             let result = join
                 .await
                 .unwrap_or(Err(anyhow::anyhow!("create task failed")));
             let _ = this.update(cx, |state, cx| {
+                if !session_view_is_current(
+                    view_generation,
+                    state.session_view_generation,
+                    state
+                        .selected_session
+                        .as_ref()
+                        .map(|session| session.id.as_str()),
+                    None,
+                ) {
+                    log_debug!("app", "stale create result ignored");
+                    return;
+                }
                 match result {
                     Ok(ids) => {
                         state.live_gateway_session_id = Some(ids.live_id.clone());
@@ -1264,6 +1317,7 @@ impl AppState {
     }
 
     pub fn clear_cache(&mut self, cx: &mut gpui::Context<Self>) {
+        self.advance_session_view();
         self.cached_state = CachedState::default();
         self.cache_store.clear();
         self.sessions = Vec::new();
@@ -1277,6 +1331,7 @@ impl AppState {
     /// so its switch is turned on — which turns every other backend off, since
     /// only one can be connected at a time.
     pub fn switch_backend(&mut self, kind: BackendKind, cx: &mut gpui::Context<Self>) {
+        self.advance_session_view();
         self.settings.set_backend_enabled(kind, true);
         let backend = self.backend.clone();
         tokio_spawn(cx, async move {
@@ -1332,6 +1387,7 @@ impl AppState {
 
     pub fn disconnect(&mut self, cx: &mut gpui::Context<Self>) {
         log_debug!("app", "disconnect requested");
+        self.advance_session_view();
         self.cache_save_task = None;
         let backend = self.backend.clone();
         tokio_spawn(cx, async move {
@@ -1681,6 +1737,7 @@ impl AppState {
             .map(|session| session.id.clone())
         {
             if ids.contains(&selected) {
+                self.advance_session_view();
                 self.selected_session = None;
                 self.conversation = Conversation::new();
                 self.live_gateway_session_id = None;
@@ -1701,6 +1758,7 @@ impl AppState {
         let session_id = session.id.clone();
         let backend_id = self.settings.backend_kind.id().to_string();
         let session_key = session_id.clone();
+        let view_generation = self.session_view_generation;
         let join = tokio_spawn(cx, async move {
             backend.lock().await.messages(&config, &session_id).await
         });
@@ -1709,6 +1767,18 @@ impl AppState {
                 .await
                 .unwrap_or(Err(anyhow::anyhow!("messages task failed")));
             let _ = this.update(cx, |state, cx| {
+                if !session_view_is_current(
+                    view_generation,
+                    state.session_view_generation,
+                    state
+                        .selected_session
+                        .as_ref()
+                        .map(|session| session.id.as_str()),
+                    Some(session_key.as_str()),
+                ) {
+                    log_debug!("app", "stale history result ignored session={session_key}");
+                    return;
+                }
                 match result {
                     Ok(fetched) => {
                         let visible = AppState::visible_messages(&fetched);
@@ -1730,11 +1800,6 @@ impl AppState {
                             let cache = state.cache_store.clone();
                             let snapshot = state.cached_state.clone();
                             cache.save(snapshot);
-                            return;
-                        }
-                        if !state.conversation.messages().is_empty()
-                            && fetched.len() <= state.conversation.messages().len()
-                        {
                             return;
                         }
                         // The backend reports a turn as text alone, so the two
@@ -1761,6 +1826,13 @@ impl AppState {
         })
         .detach();
     }
+
+    /// Invalidate every async result belonging to the conversation previously
+    /// on screen and return the token for the new one.
+    fn advance_session_view(&mut self) -> u64 {
+        self.session_view_generation = self.session_view_generation.wrapping_add(1);
+        self.session_view_generation
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,6 +1841,15 @@ impl AppState {
 
 fn cache_key(session: &AgentSession, backend_id: &str) -> String {
     format!("{backend_id}::{}", session.id)
+}
+
+fn session_view_is_current(
+    operation_generation: u64,
+    current_generation: u64,
+    selected_session: Option<&str>,
+    expected_session: Option<&str>,
+) -> bool {
+    operation_generation == current_generation && selected_session == expected_session
 }
 
 fn backend_static_id(kind: BackendKind) -> &'static str {
@@ -1880,6 +1961,12 @@ fn accepts_turn_events(live: Option<&str>, stored: Option<&str>) -> bool {
     live.is_some() || stored.is_none()
 }
 
+/// A user refresh means "make this view current", including restoring a dead
+/// transport. Backend-originated quiet refreshes only update session metadata.
+fn refresh_needs_reconnect(show_progress: bool, transport_ready: bool) -> bool {
+    show_progress && !transport_ready
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,6 +1995,25 @@ mod tests {
     #[test]
     fn a_live_session_without_a_stored_key_still_takes_its_traffic() {
         assert!(accepts_turn_events(Some("live-1"), None));
+    }
+
+    #[test]
+    fn an_async_session_result_only_mutates_the_view_that_started_it() {
+        assert!(session_view_is_current(7, 7, Some("a"), Some("a")));
+        assert!(!session_view_is_current(7, 8, Some("b"), Some("a")));
+        assert!(!session_view_is_current(7, 7, None, Some("a")));
+        assert!(session_view_is_current(9, 9, None, None));
+    }
+
+    #[test]
+    fn an_explicit_refresh_restores_a_dead_transport() {
+        assert!(refresh_needs_reconnect(true, false));
+        assert!(!refresh_needs_reconnect(true, true));
+    }
+
+    #[test]
+    fn a_quiet_refresh_never_starts_a_reconnect() {
+        assert!(!refresh_needs_reconnect(false, false));
     }
 
     fn session_row(id: &str, used: Option<i64>, window: Option<i64>) -> AgentSession {
