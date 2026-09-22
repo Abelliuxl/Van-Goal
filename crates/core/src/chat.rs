@@ -625,6 +625,69 @@ mod tests {
         assert!(!conversation.is_sending());
     }
 
+    /// MiMoCode ends a turn by reporting the session idle, and a `mimo serve`
+    /// turn was measured reporting it twice. The second report must not leave a
+    /// second bubble behind, or every mimo reply would come with an empty one.
+    #[test]
+    fn a_turn_that_reports_its_end_twice_leaves_one_reply() {
+        let mut conversation = Conversation::new();
+        // The desktop's own shape: the prompt and its placeholder are added
+        // together, and the backend's events arrive afterwards.
+        conversation.begin_turn_with_placeholder("说点什么");
+
+        // The exact sequence measured from `mimo serve` 0.1.8: the assistant
+        // message opens, one part carries the whole text so far, then idle.
+        conversation.apply(&AgentEvent::MessageStart);
+        conversation.apply(&delta("STUB-OK"));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 2, "a second bubble appeared: {messages:#?}");
+        assert_eq!(messages[1].content, "STUB-OK");
+        assert!(!messages[1].is_streaming);
+        assert!(!conversation.is_sending());
+    }
+
+    /// A failed mimo turn is followed by the same idle pair. The desktop sends
+    /// the failure down the completion path so it lands in the transcript, and
+    /// the report that follows it must not add a second bubble or leave the
+    /// composer blocked — the failure a user is most likely to meet here is
+    /// "unknown certificate verification error", which says nothing about
+    /// whether the turn ended.
+    #[test]
+    fn a_failed_turn_tells_the_user_once_and_ends_the_turn() {
+        let mut conversation = Conversation::new();
+        // The desktop's own shape: the prompt and its placeholder are added
+        // together, and the backend's events arrive afterwards.
+        conversation.begin_turn_with_placeholder("说点什么");
+
+        conversation.apply(&AgentEvent::MessageStart);
+        conversation.complete_message(Some(
+            "Error: unknown certificate verification error",
+        ));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+        conversation.apply(&AgentEvent::MessageComplete(None));
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 2, "{messages:#?}");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert!(
+            messages[1]
+                .content
+                .contains("unknown certificate verification error"),
+            "{messages:#?}"
+        );
+        assert!(
+            !conversation.is_sending(),
+            "the turn is over, so the composer must not stay blocked"
+        );
+        assert!(
+            messages.iter().all(|message| !message.is_streaming),
+            "a spinner was left running: {messages:#?}"
+        );
+    }
+
     /// The regression the mobile client was rebuilt for: a turn that runs four
     /// tools used to draw four bubbles and four "Thinking…" spinners, because
     /// every event started a placeholder of its own.
