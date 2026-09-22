@@ -158,7 +158,7 @@ impl ManagedServer {
     /// list and edits a different tree. Hermes keeps its workspace in its own
     /// config file, so passing one would be a second, contradictory place to
     /// set it.
-    fn uses_workspace(self) -> bool {
+    pub fn uses_workspace(self) -> bool {
         matches!(self, ManagedServer::MiMoCode)
     }
 }
@@ -193,6 +193,11 @@ impl LocalServerManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The server this app started, if one is running.
+    pub fn managed_server(&self) -> Option<ManagedServer> {
+        *self.server.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether a server this app started is still running. A server the user
@@ -345,7 +350,7 @@ impl LocalServerManager {
         credential: &str,
     ) -> Result<String> {
         let ours = self.is_managing();
-        self.stop().await;
+        self.stop();
         if ours {
             // Wait for the port to go quiet. `ensure_running` would otherwise
             // find the server we just stopped still answering and keep using it,
@@ -391,7 +396,9 @@ impl LocalServerManager {
         status.map(|status| status.to_string())
     }
 
-    pub async fn stop(&self) {
+    /// Stop the server this app started, if any. Synchronous on purpose: an app
+    /// on its way out has a moment to signal, not a moment to wait.
+    pub fn stop(&self) {
         let managed = self.server.lock().unwrap_or_else(|e| e.into_inner()).take();
         let was_managing = self.is_managing();
         if let Some(child) = self
@@ -635,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_nothing_says_so() {
         let manager = LocalServerManager::default();
-        manager.stop().await;
+        manager.stop();
         assert_eq!(
             manager.take_message(),
             "No server started by Van-Goal is running."

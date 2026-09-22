@@ -213,7 +213,7 @@ async fn main() {
         println!("leaving {} running on {base_url}", server.label());
         return;
     }
-    manager.stop().await;
+    manager.stop();
     println!("{}", manager.take_message());
 }
 

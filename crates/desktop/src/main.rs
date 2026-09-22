@@ -128,6 +128,28 @@ fn main() {
         let state = cx.global::<StateGlobal>().0.clone();
         state.update(cx, |state, cx| state.bootstrap(cx));
 
+        // A managed server whose backend is scoped by a workspace does not
+        // outlive the app: its project is fixed when it starts, so a server left
+        // behind pins the chat to a directory the app can no longer change, and
+        // the next launch would reuse it and quietly ignore the setting. Hermes
+        // is not scoped that way and its lifetime is left as it has always been.
+        cx.on_app_quit({
+            let state = cx.global::<StateGlobal>().0.clone();
+            move |cx| {
+                let server = state.read(cx).local_server.clone();
+                if server
+                    .managed_server()
+                    .is_some_and(|server| server.uses_workspace())
+                {
+                    // Signalled here, not in the future below: quitting gives a
+                    // handler a moment, and a signal needs none.
+                    server.stop();
+                }
+                async {}
+            }
+        })
+        .detach();
+
         // App-level actions.
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &NewSession, cx| {

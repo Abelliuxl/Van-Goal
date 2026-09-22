@@ -1414,10 +1414,8 @@ impl AppState {
     }
 
     pub fn stop_managed_local(&mut self, cx: &mut gpui::Context<Self>) {
-        let server = self.local_server.clone();
-        tokio_spawn(cx, async move {
-            server.stop().await;
-        });
+        self.local_server.stop();
+        cx.notify();
     }
 
     /// Put the managed server into the directory the settings now name.
