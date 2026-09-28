@@ -2,6 +2,7 @@
 .DS_Store
 Build/
 *.log
+.zcode/
 
 # Flutter / Dart
 /app/build/
