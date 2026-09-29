@@ -194,7 +194,11 @@ struct TextSelection {
 /// key binding lives in the context that is focused when it should fire.
 pub fn bind_chat_keys(cx: &mut gpui::App) {
     cx.bind_keys([gpui::KeyBinding::new(
-        "cmd-c",
+        if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        },
         CopySelection,
         Some("Transcript"),
     )]);

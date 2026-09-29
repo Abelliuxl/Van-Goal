@@ -1,10 +1,10 @@
 # Van-Goal
 
-**A native macOS client for local and remote coding agents — rebuilt on [GPUI](https://gpui.rs) (Rust).**
+**A native macOS and Windows client for local and remote coding agents — built with [GPUI](https://gpui.rs) (Rust).**
 
-Van-Goal is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit) (SwiftUI). It is a thin, fast frontend: the selected agent backend stays the runtime, model gateway, tool executor, memory system, and session owner — Van-Goal just gives it a beautiful home on your Mac, now rendered by Zed's GPU-accelerated UI framework.
+Van-Goal is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit) (SwiftUI). It is a thin, fast frontend: the selected agent backend stays the runtime, model gateway, tool executor, memory system, and session owner — Van-Goal gives it a native desktop home on macOS and Windows, rendered by Zed's GPU-accelerated UI framework.
 
-![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-000000?style=flat-square&logo=apple)
+![Platform](https://img.shields.io/badge/platform-macOS%2012%2B%20%2F%20Windows%2010%2B-000000?style=flat-square)
 ![Language](https://img.shields.io/badge/language-Rust-DEA584?style=flat-square&logo=rust)
 ![UI](https://img.shields.io/badge/UI-GPUI%200.2-084CCF?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-4c3d2e?style=flat-square)
@@ -20,9 +20,11 @@ Van-Goal is the GPUI sibling of [Hermit](https://github.com/Abelliuxl/Hermit) (S
 - **Permission modes** — Full access / Ask first / Restricted tools, applied through `hermes config set`.
 - **One switch per backend** — each backend has its own on/off switch in Settings. Switching one on connects it and switches the others off; switching it off disconnects it and keeps it off after a restart. The backend you were last using is the one that comes back on launch.
 - **Text size** — Small / Default / Large / Extra Large in Settings scales every font in the app at once: transcript, markdown, sidebar, composer and the settings window itself.
-- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
+- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, close-to-minimize window behavior, Windows system tray, native menu bar with ⌘N / ⌘R / ⌘, shortcuts.
 
 ## Build
+
+### macOS
 
 Requires macOS 12+ and a recent stable Rust toolchain.
 
@@ -55,6 +57,22 @@ Run the tests:
 ```bash
 cargo test --workspace
 ```
+
+### Windows
+
+Requires Windows 10 or later, stable Rust, Visual Studio Build Tools with the
+**Desktop development with C++** workload, a Windows 10/11 SDK, and CMake.
+Package a portable x64 folder as a zip:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Scripts/package_windows.ps1
+```
+
+The archive is written to `Build/VanGoal-windows-x86_64-<version>.zip` (the
+version comes from Cargo metadata). Extract it and launch `VanGoal.exe`. The
+package embeds the Van-Goal icon in the executable and also includes the icon
+files for reference. Closing the main window keeps the process in the Windows
+system tray; use the tray menu to show the window or exit Van-Goal.
 
 ## Backends
 

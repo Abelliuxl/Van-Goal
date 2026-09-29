@@ -42,7 +42,7 @@ actions!(
 );
 
 pub fn bind_editor_keys(cx: &mut App) {
-    cx.bind_keys([
+    let mut keys = vec![
         KeyBinding::new("backspace", Backspace, Some("Editor")),
         KeyBinding::new("delete", Delete, Some("Editor")),
         KeyBinding::new("left", Left, Some("Editor")),
@@ -53,16 +53,28 @@ pub fn bind_editor_keys(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, Some("Editor")),
         KeyBinding::new("shift-up", SelectUp, Some("Editor")),
         KeyBinding::new("shift-down", SelectDown, Some("Editor")),
-        KeyBinding::new("cmd-a", SelectAll, Some("Editor")),
         KeyBinding::new("home", Home, Some("Editor")),
         KeyBinding::new("end", End, Some("Editor")),
-        KeyBinding::new("cmd-v", Paste, Some("Editor")),
-        KeyBinding::new("cmd-c", Copy, Some("Editor")),
-        KeyBinding::new("cmd-x", Cut, Some("Editor")),
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("Editor")),
         KeyBinding::new("shift-enter", Newline, Some("Editor")),
         KeyBinding::new("enter", Submit, Some("Editor")),
-    ]);
+    ];
+    if cfg!(target_os = "macos") {
+        keys.extend([
+            KeyBinding::new("cmd-a", SelectAll, Some("Editor")),
+            KeyBinding::new("cmd-v", Paste, Some("Editor")),
+            KeyBinding::new("cmd-c", Copy, Some("Editor")),
+            KeyBinding::new("cmd-x", Cut, Some("Editor")),
+            KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("Editor")),
+        ]);
+    } else {
+        keys.extend([
+            KeyBinding::new("ctrl-a", SelectAll, Some("Editor")),
+            KeyBinding::new("ctrl-v", Paste, Some("Editor")),
+            KeyBinding::new("ctrl-c", Copy, Some("Editor")),
+            KeyBinding::new("ctrl-x", Cut, Some("Editor")),
+        ]);
+    }
+    cx.bind_keys(keys);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1044,7 +1056,11 @@ mod tests {
             "drag did not select 'brave'"
         );
 
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
         cx.run_until_parked();
         let copied = cx.update(|_window, cx| {
             cx.read_from_clipboard()

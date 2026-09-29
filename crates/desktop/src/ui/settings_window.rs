@@ -410,22 +410,19 @@ impl Render for SettingsView {
                         },
                     )
                 })
-                .when(
-                    settings.is_managed_local_backend(),
-                    |this| {
-                        this.child(small_button(
-                            "stop-managed",
-                            "Stop Managed Local",
-                            Theme::danger(),
-                            {
-                                let state = state.clone();
-                                move |_event, _window, cx| {
-                                    state.update(cx, |state, cx| state.stop_managed_local(cx));
-                                }
-                            },
-                        ))
-                    },
-                ),
+                .when(settings.is_managed_local_backend(), |this| {
+                    this.child(small_button(
+                        "stop-managed",
+                        "Stop Managed Local",
+                        Theme::danger(),
+                        {
+                            let state = state.clone();
+                            move |_event, _window, cx| {
+                                state.update(cx, |state, cx| state.stop_managed_local(cx));
+                            }
+                        },
+                    ))
+                }),
         );
         if !last_server_message.is_empty() {
             connection = connection.child(hint(&last_server_message));

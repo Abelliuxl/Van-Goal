@@ -345,10 +345,7 @@ fn urlencode(value: &str) -> String {
 /// Read a session's transcript out of the message list both servers return:
 /// `info.role` plus the message's parts, of which only the text parts are the
 /// conversation.
-fn messages_from_value(
-    value: &serde_json::Value,
-    display_name: &str,
-) -> Result<Vec<ChatMessage>> {
+fn messages_from_value(value: &serde_json::Value, display_name: &str) -> Result<Vec<ChatMessage>> {
     let rows = value
         .as_array()
         .ok_or_else(|| anyhow!("{display_name} returned an invalid message list."))?;
@@ -630,7 +627,6 @@ fn handle_event_json(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{handle_event_json, SharedState};
@@ -721,18 +717,13 @@ mod tests {
         ]);
 
         match probe.events().as_slice() {
-            [
-                AgentEvent::MessageStart,
-                AgentEvent::MessageDelta {
-                    text: first,
-                    source: DeltaSource::EventStream,
-                },
-                AgentEvent::MessageDelta {
-                    text: second,
-                    source: DeltaSource::EventStream,
-                },
-                AgentEvent::MessageComplete(None),
-            ] => {
+            [AgentEvent::MessageStart, AgentEvent::MessageDelta {
+                text: first,
+                source: DeltaSource::EventStream,
+            }, AgentEvent::MessageDelta {
+                text: second,
+                source: DeltaSource::EventStream,
+            }, AgentEvent::MessageComplete(None)] => {
                 assert_eq!(first, "PONG", "the reply's first report is its whole text");
                 assert_eq!(
                     second, ", as asked.",
@@ -881,7 +872,10 @@ mod history_tests {
         ]);
 
         let messages = messages_from_value(&value, "MiMoCode").expect("a message list");
-        assert!(messages.is_empty(), "an empty bubble was left behind: {messages:#?}");
+        assert!(
+            messages.is_empty(),
+            "an empty bubble was left behind: {messages:#?}"
+        );
     }
 
     /// The model's own reply is never filtered: a reasoning part and a tool part

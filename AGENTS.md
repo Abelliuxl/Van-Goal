@@ -1,18 +1,19 @@
 # Working in this repository
 
-Van-Goal is a client for coding agents: a macOS app (GPUI) and an Android app
-(Flutter), both drawing on one Rust core that speaks seven agent protocols. The
-backend stays the runtime, the model gateway, the tool executor and the owner of
-every session. The client translates a protocol into one event model and draws
-it. [docs/architecture.md](docs/architecture.md) is the full picture;
-[docs/sessions.md](docs/sessions.md) and [docs/mobile.md](docs/mobile.md) cover
-the two parts that are easiest to get subtly wrong.
+Van-Goal is a client for coding agents: macOS and Windows desktop apps (GPUI)
+and an Android app (Flutter), all drawing on one Rust core that speaks seven
+agent protocols. The backend stays the runtime, the model gateway, the tool
+executor and the owner of every session. The client translates a protocol into
+one event model and draws it. [docs/architecture.md](docs/architecture.md) is
+the full picture; [docs/sessions.md](docs/sessions.md) and
+[docs/mobile.md](docs/mobile.md) cover the two parts that are easiest to get
+subtly wrong.
 
 ## Layout
 
 ```
 crates/core        protocols, models, settings, markdown — no UI of any kind
-crates/desktop     the macOS client (GPUI)
+crates/desktop     the macOS and Windows clients (GPUI)
 crates/mobile      the C ABI the Flutter app links against
 app/               the Flutter client
 assets/            the app icon
@@ -136,6 +137,16 @@ cargo run --release -p van-goal
 Scripts/package_app.sh                        # -> Build/VanGoal.app
 ```
 
+Windows desktop (PowerShell; needs the MSVC C++ build tools, Windows SDK, and
+CMake):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Scripts/package_windows.ps1
+```
+
+The portable x64 zip is written under
+`Build/VanGoal-windows-x86_64-<version>.zip`.
+
 Android (the toolchain installs without `sudo`, into the user's own directories):
 
 ```bash
@@ -166,14 +177,15 @@ downgrade** over an install made with `--build-number`. Pass a higher one:
 * **The release APK is debug-signed** (`TODO` in `app/android/app/build.gradle.kts`)
   and Flutter does not put `INTERNET` in the release manifest — it is added
   explicitly there.
-* **OpenClaw identifies the device as `darwin`/`desktop`** from compile-time
-  constants (`agent/device_identity.rs`), so a phone looks like a Mac in
-  `openclaw devices list`. The name it *calls itself* is separate and **is**
-  per-frontend (`OPENCLAW_DISPLAY_NAME`, `OPENCLAW_SESSION_NAMESPACE`): the
-  Gateway titles a session after the client that created it, so one shared name
-  fills the session list with identical entries and picking the wrong one is
-  indistinguishable from a client that crossed two conversations. Measured:
-  ten sessions all titled "Van-Goal".
+* **OpenClaw device identity is platform-specific** in
+  `agent/device_identity.rs`: macOS and mobile report `darwin`, Windows reports
+  `win32`, and both desktop builds use the `desktop` device family. Mobile still
+  looks like a Mac in `openclaw devices list`. The name it *calls itself* is
+  separate and **is** per-frontend (`OPENCLAW_DISPLAY_NAME`,
+  `OPENCLAW_SESSION_NAMESPACE`): the Gateway titles a session after the client
+  that created it, so one shared name fills the session list with identical
+  entries and picking the wrong one is indistinguishable from a client that
+  crossed two conversations. Measured: ten sessions all titled "Van-Goal".
 * **`chat.history` carries no tool calls.** Tool activity is only known for turns
   this client watched; reopening a session merges back what the client recorded
   (`Conversation::merge_transcript`) and nothing more.
