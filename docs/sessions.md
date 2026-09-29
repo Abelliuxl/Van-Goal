@@ -163,8 +163,8 @@ anywhere. But they still have to be *nameable*, and that is a separate thing:
   exactly like a client that crossed two conversations, which is why
   `OPENCLAW_DISPLAY_NAME` and `OPENCLAW_SESSION_NAMESPACE` are per-frontend.
 
-The remaining shared thing is the *device* identity (`darwin`/`desktop`), which
-is still one set of compile-time constants: a phone reports itself as a desktop
-in `openclaw devices list`. That one is part of the signed device payload, so
-changing it would be an authentication change rather than a naming one, and it
-has not been verified against a Gateway.
+The *device* identity is also part of the signed payload. macOS and mobile keep
+their existing `darwin` platform value; Windows reports Node's `win32` platform
+value. The Windows app stores a separate device key under `%LOCALAPPDATA%`, so
+its first OpenClaw connection is paired as its own device. Mobile continues to
+appear as `darwin`/`desktop` in `openclaw devices list`.

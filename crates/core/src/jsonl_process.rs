@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,6 +15,10 @@ pub enum ProcessOutput {
 #[cfg(unix)]
 const SIGINT: i32 = 2;
 #[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(not(unix))]
+const SIGINT: i32 = 2;
+#[cfg(not(unix))]
 const SIGTERM: i32 = 15;
 
 struct TransportInner {
@@ -62,10 +66,11 @@ impl JsonlProcessTransport {
         self.stop().await;
         let executable = find_executable(executable_name)
             .ok_or_else(|| anyhow!("Could not find the {executable_name} executable."))?;
+        let (program, arguments) = command_for_executable(&executable, arguments);
 
-        let mut command = Command::new(&executable);
+        let mut command = Command::new(&program);
         command
-            .args(arguments)
+            .args(&arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -168,7 +173,7 @@ impl JsonlProcessTransport {
         Ok(())
     }
 
-    /// SIGINT the child (Claude Code interrupt semantics).
+    /// Interrupt the CLI (SIGINT on Unix, process-tree termination on Windows).
     pub fn interrupt(&self) {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(inner) = guard.as_ref() {
@@ -213,56 +218,137 @@ fn signal_pid(pid: u32, sig: i32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn signal_pid(_pid: u32, _sig: i32) {}
 
-/// Mirror the Swift PATH augmentation so CLIs installed via npm / homebrew /
-/// ~/.local are found even when launched from Finder.
-pub fn augmented_path() -> String {
+#[cfg(windows)]
+pub(crate) fn terminate_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn signal_pid(pid: u32, _sig: i32) {
+    terminate_process_tree(pid);
+}
+
+/// Add common user-installed CLI locations so backends remain discoverable
+/// when the app is launched from Explorer or the macOS Finder.
+pub fn cli_search_directories() -> Vec<PathBuf> {
     let home = crate::logger::dirs::home();
-    let required = [
-        home.join(".npm-global/bin"),
+    let mut directories = vec![
+        home.join(".cargo/bin"),
         home.join(".local/bin"),
+        home.join(".npm-global/bin"),
         home.join(".pi/bin"),
         home.join(".mimo/bin"),
         home.join(".opencode/bin"),
         home.join(".hermes/bin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
     ];
-    let existing = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let mut parts: Vec<String> = required
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    parts.extend(existing.split(':').map(str::to_string));
-    parts.join(":")
+
+    #[cfg(target_os = "windows")]
+    {
+        directories.push(home.join("AppData/Roaming/npm"));
+        directories.push(home.join("scoop/shims"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        directories.extend([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+        ]);
+    }
+
+    directories
+}
+
+/// Mirror the user-installed CLI locations into the child process PATH.
+pub fn augmented_path() -> String {
+    let mut paths = cli_search_directories();
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    } else {
+        #[cfg(target_os = "macos")]
+        paths.extend([
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/sbin"),
+            PathBuf::from("/sbin"),
+        ]);
+    }
+    std::env::join_paths(paths)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn find_executable(name: &str) -> Option<PathBuf> {
-    let home = crate::logger::dirs::home();
-    let candidates = [
-        home.join(format!(".npm-global/bin/{name}")),
-        home.join(format!(".local/bin/{name}")),
-        home.join(format!(".pi/bin/{name}")),
-        home.join(format!(".mimo/bin/{name}")),
-        home.join(format!(".opencode/bin/{name}")),
-        home.join(format!(".hermes/bin/{name}")),
-        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
-        PathBuf::from(format!("/usr/local/bin/{name}")),
-        PathBuf::from(format!("/usr/bin/{name}")),
-    ];
-    candidates.into_iter().find(|p| {
-        #[cfg(unix)]
+    let mut directories = cli_search_directories();
+    if let Some(path) = std::env::var_os("PATH") {
+        directories.extend(std::env::split_paths(&path));
+    }
+    directories
+        .into_iter()
+        .map(|directory| directory.join(name))
+        .flat_map(executable_candidates)
+        .find(|p| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(p)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                p.is_file()
+            }
+        })
+}
+
+/// `npm` installs Windows command-line tools as `.cmd` shims. They need
+/// `cmd.exe` as the process image; native `.exe` tools stay direct children.
+pub fn command_for_executable(executable: &Path, arguments: &[String]) -> (PathBuf, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    if executable.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    }) {
+        let command = std::iter::once(executable.to_string_lossy().into_owned())
+            .chain(arguments.iter().cloned())
+            .map(|argument| format!("\"{}\"", argument.replace('%', "^%")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (
+            PathBuf::from("cmd.exe"),
+            vec![
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                format!("\"{command}\""),
+            ],
+        );
+    }
+
+    (executable.to_path_buf(), arguments.to_vec())
+}
+
+fn executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    let mut candidates = vec![path.clone()];
+    #[cfg(target_os = "windows")]
+    if path.extension().is_none() {
+        let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        for extension in extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(p)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
+            let mut candidate = path.clone();
+            candidate.set_extension(extension.trim_start_matches('.'));
+            candidates.push(candidate);
         }
-        #[cfg(not(unix))]
-        {
-            p.is_file()
-        }
-    })
+    }
+    candidates
 }

@@ -663,9 +663,7 @@ mod tests {
         conversation.begin_turn_with_placeholder("说点什么");
 
         conversation.apply(&AgentEvent::MessageStart);
-        conversation.complete_message(Some(
-            "Error: unknown certificate verification error",
-        ));
+        conversation.complete_message(Some("Error: unknown certificate verification error"));
         conversation.apply(&AgentEvent::MessageComplete(None));
         conversation.apply(&AgentEvent::MessageComplete(None));
 

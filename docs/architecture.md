@@ -15,7 +15,7 @@ and what is the smallest thing the client can do to show it faithfully".
 
 ```
 crates/core        no UI of any kind — protocols, models, settings, markdown
-crates/desktop     the macOS client (GPUI)          ─┐
+crates/desktop     the macOS + Windows client (GPUI) ─┐
 crates/mobile      the C ABI a phone links against   ├─ two consumers of core
 app/               the Flutter client                 ─┘
 ```
@@ -101,8 +101,9 @@ openclaw-device-identity.json  the Ed25519 key the Gateway knows this device by
 van-goal.log                the debug log
 ```
 
-On macOS that directory is `~/Library/Application Support/VanGoal`, resolved
-once, with a migration from the pre-rename `HermitGPUI` directory.
+On macOS that directory is `~/Library/Application Support/VanGoal`; on Windows
+it is `%LOCALAPPDATA%/VanGoal`. Both paths are resolved once, with a migration
+from the pre-rename `HermitGPUI` directory.
 
 Android and iOS do not hand an app a home directory, so the host names one
 first — `vg_set_data_dir`, before any other call. The choice is made once, and a
@@ -153,3 +154,6 @@ forgotten:
   it.
 * Xcode 26+ ships the Metal shader compiler separately:
   `xcodebuild -downloadComponent MetalToolchain`.
+* The Windows desktop build needs the MSVC C++ build tools, a Windows SDK, and
+  CMake. `Scripts/package_windows.ps1` creates a portable x64 zip from a release
+  build.

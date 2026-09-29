@@ -201,7 +201,12 @@ async fn main() {
                     println!(
                         "  {:?}: {}",
                         message.role,
-                        message.content.replace('\n', " ").chars().take(200).collect::<String>()
+                        message
+                            .content
+                            .replace('\n', " ")
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
                     );
                 }
             }

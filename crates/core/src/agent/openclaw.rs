@@ -1177,6 +1177,9 @@ mod tests {
         if cfg!(any(target_os = "android", target_os = "ios")) {
             assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Mobile");
             assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-mobile");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Windows");
+            assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-windows");
         } else {
             assert_eq!(OPENCLAW_DISPLAY_NAME, "Van-Goal Desktop");
             assert_eq!(OPENCLAW_SESSION_NAMESPACE, "van-goal-desktop");

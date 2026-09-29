@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-/// Minimal debug logger writing to `~/Library/Application Support/VanGoal/VanGoal.log`.
+/// Minimal debug logger writing to the app's local data directory.
 /// Mirrors the SwiftUI sibling's logger: disabled by default, opt-in from Settings.
 pub struct VanGoalLogger {
     enabled: AtomicBool,
@@ -107,16 +107,49 @@ pub mod dirs {
     static RESOLVED_APP_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
     pub fn home() -> PathBuf {
-        std::env::var("HOME")
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(home) = std::env::var_os("USERPROFILE") {
+                return PathBuf::from(home);
+            }
+            if let (Some(drive), Some(path)) =
+                (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+            {
+                let mut home = drive;
+                home.push(path);
+                return PathBuf::from(home);
+            }
+        }
+
+        std::env::var_os("HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/"))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// Only the non-test path resolves through here, since tests redirect to a
     /// temporary directory.
     #[cfg_attr(any(test, feature = "testing"), allow(dead_code))]
     pub fn app_support() -> PathBuf {
-        home().join("Library/Application Support")
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+                return PathBuf::from(local_app_data);
+            }
+            return home().join("AppData/Local");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            home().join("Library/Application Support")
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".local/share"))
+        }
     }
 
     /// Directory holding settings, the session cache and the OpenClaw device

@@ -158,10 +158,11 @@ pub fn select_model(option: &ModelOption) -> Result<()> {
 
 fn run_config_set(key: &str, value: &str) -> Result<()> {
     let (executable, prefix) = hermes_command();
-    let output = Command::new(executable)
-        .args(prefix)
-        .args(["config", "set", key, value])
-        .output()?;
+    let mut arguments = prefix;
+    arguments.extend(["config".into(), "set".into(), key.into(), value.into()]);
+    let (program, arguments) =
+        crate::jsonl_process::command_for_executable(&executable, &arguments);
+    let output = Command::new(program).args(arguments).output()?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(anyhow!(if message.is_empty() {
@@ -175,34 +176,14 @@ fn run_config_set(key: &str, value: &str) -> Result<()> {
 
 /// Locate the hermes CLI, preferring well-known install locations.
 pub fn hermes_executable_path() -> Option<PathBuf> {
-    let home = dirs::home();
-    let candidates = [
-        home.join(".local/bin/hermes"),
-        PathBuf::from("/opt/homebrew/bin/hermes"),
-        PathBuf::from("/usr/local/bin/hermes"),
-    ];
-    candidates.into_iter().find(|p| is_executable(p))
+    crate::jsonl_process::find_executable("hermes")
 }
 
 fn hermes_command() -> (PathBuf, Vec<String>) {
     match hermes_executable_path() {
         Some(path) => (path, Vec::new()),
+        None if cfg!(target_os = "windows") => (PathBuf::from("hermes"), Vec::new()),
         None => (PathBuf::from("/usr/bin/env"), vec!["hermes".to_string()]),
-    }
-}
-
-pub(crate) fn is_executable(path: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(path) {
-            Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
     }
 }
 

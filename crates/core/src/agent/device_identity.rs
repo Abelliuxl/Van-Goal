@@ -8,6 +8,9 @@ pub const OPENCLAW_CLIENT_ID: &str = "gateway-client";
 pub const OPENCLAW_CLIENT_MODE: &str = "backend";
 pub const OPENCLAW_ROLE: &str = "operator";
 pub const OPENCLAW_SCOPES: &[&str] = &["operator.read", "operator.write", "operator.approvals"];
+#[cfg(target_os = "windows")]
+pub const OPENCLAW_PLATFORM: &str = "win32";
+#[cfg(not(target_os = "windows"))]
 pub const OPENCLAW_PLATFORM: &str = "darwin";
 pub const OPENCLAW_DEVICE_FAMILY: &str = "desktop";
 
@@ -26,8 +29,16 @@ pub const OPENCLAW_DEVICE_FAMILY: &str = "desktop";
 /// frontend here does not disturb an existing device pairing.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Mobile";
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    not(target_os = "windows")
+))]
 pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Desktop";
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    target_os = "windows"
+))]
+pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Windows";
 
 /// The namespace a session key this frontend proposes is filed under.
 ///
@@ -38,8 +49,16 @@ pub const OPENCLAW_DISPLAY_NAME: &str = "Van-Goal Desktop";
 /// instead of one that could belong to either client.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub const OPENCLAW_SESSION_NAMESPACE: &str = "van-goal-mobile";
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    not(target_os = "windows")
+))]
 pub const OPENCLAW_SESSION_NAMESPACE: &str = "van-goal-desktop";
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    target_os = "windows"
+))]
+pub const OPENCLAW_SESSION_NAMESPACE: &str = "van-goal-windows";
 
 /// Stable Ed25519 device identity persisted in Van-Goal's local app data, used to answer
 /// the OpenClaw Gateway connect challenge (port of OpenClawDeviceIdentity).

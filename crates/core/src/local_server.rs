@@ -1,5 +1,5 @@
 use crate::agent::opencode;
-use crate::hermes_config::{hermes_executable_path, is_executable};
+use crate::hermes_config::hermes_executable_path;
 use crate::log_debug;
 use crate::logger::global_logger;
 use crate::settings::BackendKind;
@@ -64,11 +64,7 @@ impl ManagedServer {
             ManagedServer::Hermes => {
                 hermes_executable_path().unwrap_or_else(|| PathBuf::from("hermes"))
             }
-            ManagedServer::MiMoCode => self
-                .binary_search_directories()
-                .iter()
-                .map(|dir| dir.join("mimo"))
-                .find(|path| is_executable(path))
+            ManagedServer::MiMoCode => crate::jsonl_process::find_executable("mimo")
                 .unwrap_or_else(|| PathBuf::from("mimo")),
         }
     }
@@ -76,27 +72,10 @@ impl ManagedServer {
     /// Directories a CLI of this kind is normally installed in, searched first
     /// as a list of candidate paths and then prepended to the child's `PATH`.
     ///
-    /// The second half matters: `mimo` is a `#!/usr/bin/env node` script, so the
-    /// process it is started as needs to find `node` on its own `PATH`. An app
-    /// launched from Finder inherits only the system default
-    /// (`/usr/bin:/bin:/usr/sbin:/sbin`), where neither a user's own bin
-    /// directory nor Homebrew appears — the CLI would be found and then fail to
-    /// run at all.
-    fn binary_search_directories(self) -> Vec<PathBuf> {
-        let home = crate::logger::dirs::home();
-        match self {
-            ManagedServer::Hermes => vec![
-                home.join(".local/bin"),
-                PathBuf::from("/opt/homebrew/bin"),
-                PathBuf::from("/usr/local/bin"),
-            ],
-            ManagedServer::MiMoCode => vec![
-                home.join(".npm-global/bin"),
-                home.join(".local/bin"),
-                PathBuf::from("/opt/homebrew/bin"),
-                PathBuf::from("/usr/local/bin"),
-            ],
-        }
+    /// The second half matters: the managed CLI and its runtime (for example,
+    /// Node for MiMoCode) both need to be discoverable in the child process.
+    fn binary_search_directories() -> Vec<PathBuf> {
+        crate::jsonl_process::cli_search_directories()
     }
 
     /// The `PATH` its process is started with: the directories above, then
@@ -108,7 +87,7 @@ impl ManagedServer {
                 parts.push(value);
             }
         };
-        for dir in self.binary_search_directories() {
+        for dir in Self::binary_search_directories() {
             push(dir.into_os_string());
         }
         if let Some(existing) = std::env::var_os("PATH") {
@@ -226,9 +205,13 @@ impl LocalServerManager {
             ));
             return;
         }
-        let mut command = Command::new(server.executable());
+        let arguments = server.arguments(port);
+        let executable = server.executable();
+        let (program, arguments) =
+            crate::jsonl_process::command_for_executable(&executable, &arguments);
+        let mut command = Command::new(program);
         command
-            .args(server.arguments(port))
+            .args(arguments)
             .env("PATH", server.child_path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -274,7 +257,10 @@ impl LocalServerManager {
                 });
             }
             Err(error) => {
-                self.set_message(format!("Failed to start {}: {error}", server.display_name()));
+                self.set_message(format!(
+                    "Failed to start {}: {error}",
+                    server.display_name()
+                ));
             }
         }
     }
@@ -302,10 +288,9 @@ impl LocalServerManager {
             if is_reachable(&url, server, credential).await {
                 *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 self.set_message(match self.started_in() {
-                    Some(directory) => format!(
-                        "Local {} is ready in {directory}.",
-                        server.display_name()
-                    ),
+                    Some(directory) => {
+                        format!("Local {} is ready in {directory}.", server.display_name())
+                    }
                     None => format!("Local {} is ready.", server.display_name()),
                 });
                 return Ok(url);
@@ -386,10 +371,7 @@ impl LocalServerManager {
         };
         if status.is_some() {
             *guard = None;
-            self.server
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            self.server.lock().unwrap_or_else(|e| e.into_inner()).take();
             *self.started_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
         }
@@ -409,10 +391,7 @@ impl LocalServerManager {
         {
             stop_process_group(child);
         }
-        self.child
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
         *self.started_in.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.is_launching.lock().unwrap_or_else(|e| e.into_inner()) = false;
         match managed {
@@ -427,11 +406,8 @@ impl LocalServerManager {
     }
 }
 
-/// Stop a spawned server, and whatever it spawned in turn.
-///
-/// The child was started in its own process group, so the group is the unit to
-/// signal: the wrapper and the server it runs are one thing to the app even
-/// though they are two processes to the operating system.
+/// Stop a spawned server and whatever it spawned in turn: the Unix process
+/// group or the Windows process tree is the unit the app owns.
 fn stop_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -440,6 +416,10 @@ fn stop_process_group(child: &mut tokio::process::Child) {
         unsafe {
             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        crate::jsonl_process::terminate_process_tree(pid);
     }
     // The child itself, for a platform with no process groups and as a backstop
     // when the group leader is already gone.
@@ -574,9 +554,9 @@ mod tests {
         let entries: Vec<String> = std::env::split_paths(&path)
             .map(|dir| dir.to_string_lossy().into_owned())
             .collect();
-        let home = crate::logger::dirs::home().to_string_lossy().into_owned();
+        let home = crate::logger::dirs::home();
         for directory in [".local/bin", ".npm-global/bin"] {
-            let expected = format!("{home}/{directory}");
+            let expected = home.join(directory).to_string_lossy().into_owned();
             assert!(
                 entries.contains(&expected),
                 "{expected} must be on the child's PATH, so its own runtime is found: {entries:?}"

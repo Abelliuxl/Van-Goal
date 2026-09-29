@@ -1,5 +1,9 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod state;
 mod ui;
+#[cfg(target_os = "windows")]
+mod windows_tray;
 
 use gpui::prelude::*;
 use gpui::{
@@ -60,13 +64,24 @@ fn open_main_window(
             window_bounds: Some(bounds),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some("Van-Goal".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(12.0), px(12.0))),
+                // GPUI hides the native titlebar when this is true. Keep the
+                // macOS presentation, but retain the system controls on
+                // Windows (close, minimize, and maximize).
+                appears_transparent: cfg!(target_os = "macos"),
+                traffic_light_position: if cfg!(target_os = "macos") {
+                    Some(point(px(12.0), px(12.0)))
+                } else {
+                    None
+                },
             }),
             window_min_size: Some(size(px(560.0), px(480.0))),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| RootView::new(state, window, cx)),
+        |window, cx| {
+            #[cfg(target_os = "windows")]
+            windows_tray::install_close_handler(window, cx);
+            cx.new(|cx| RootView::new(state, window, cx))
+        },
     )
 }
 
@@ -112,6 +127,18 @@ fn main() {
         ui::editor::bind_editor_keys(cx);
         ui::chat::bind_chat_keys(cx);
 
+        #[cfg(target_os = "windows")]
+        let tray_receiver = match windows_tray::WindowsTrayGlobal::create() {
+            Ok((tray, receiver)) => {
+                cx.set_global(tray);
+                Some(receiver)
+            }
+            Err(error) => {
+                log_debug!("app", "failed to create Windows system tray icon: {error}");
+                None
+            }
+        };
+
         let state = cx.new(|cx| AppState::new(cx));
         cx.set_global(StateGlobal(state.clone()));
 
@@ -123,6 +150,11 @@ fn main() {
             Err(error) => {
                 log_debug!("app", "failed to open main window: {error}");
             }
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(receiver) = tray_receiver {
+            windows_tray::start_command_pump(cx, receiver);
         }
 
         let state = cx.global::<StateGlobal>().0.clone();
@@ -151,7 +183,13 @@ fn main() {
         .detach();
 
         // App-level actions.
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| {
+            #[cfg(target_os = "windows")]
+            if let Some(tray) = cx.try_global::<windows_tray::WindowsTrayGlobal>() {
+                tray.request_quit();
+            }
+            cx.quit();
+        });
         cx.on_action(|_: &NewSession, cx| {
             let state = cx.global::<StateGlobal>().0.clone();
             state.update(cx, |state, cx| state.start_fresh_chat(cx));
@@ -196,13 +234,24 @@ fn main() {
         });
 
         // Keyboard shortcuts for the app actions.
-        cx.bind_keys([
-            KeyBinding::new("cmd-n", NewSession, None),
-            KeyBinding::new("cmd-r", RefreshSessions, None),
-            KeyBinding::new("cmd-b", ToggleSidebar, None),
-            KeyBinding::new("cmd-,", OpenSettings, None),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
+        let app_shortcuts = if cfg!(target_os = "macos") {
+            [
+                KeyBinding::new("cmd-n", NewSession, None),
+                KeyBinding::new("cmd-r", RefreshSessions, None),
+                KeyBinding::new("cmd-b", ToggleSidebar, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("cmd-q", Quit, None),
+            ]
+        } else {
+            [
+                KeyBinding::new("ctrl-n", NewSession, None),
+                KeyBinding::new("ctrl-r", RefreshSessions, None),
+                KeyBinding::new("ctrl-b", ToggleSidebar, None),
+                KeyBinding::new("ctrl-,", OpenSettings, None),
+                KeyBinding::new("ctrl-q", Quit, None),
+            ]
+        };
+        cx.bind_keys(app_shortcuts);
 
         // Native menu bar.
         cx.set_menus(vec![

@@ -1,6 +1,6 @@
 [package]
 name = "van-goal"
-description = "Van-Goal — a native macOS client for local and remote coding agents, rebuilt on GPUI"
+description = "Van-Goal — a native desktop client for local and remote coding agents, built with GPUI"
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
@@ -23,6 +23,20 @@ anyhow.workspace = true
 rfd.workspace = true
 # Grapheme segmentation for the composer's cursor movement.
 unicode-segmentation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only system-tray support. Keeping this target-specific prevents any
+# tray code or Windows dependencies from entering the macOS and mobile builds.
+tray-icon = "0.25.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embed the Van-Goal icon in VanGoal.exe so Explorer and the taskbar do not use
+# the generic executable icon.
+winresource = "0.1.31"
 
 [dev-dependencies]
 # See the `testing` feature in crates/core: it keeps the test suite off the

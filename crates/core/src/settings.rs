@@ -195,9 +195,8 @@ impl BackendKind {
     }
 }
 
-/// Persistent app settings. Stored as JSON in
-/// `~/Library/Application Support/VanGoal/settings.json`
-/// (UserDefaults equivalent for a non-bundled GPUI app).
+/// Persistent app settings. Stored as JSON in the Van-Goal app data directory
+/// (local Application Support on macOS, `%LOCALAPPDATA%` on Windows).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub backend_kind: BackendKind,
@@ -766,7 +765,7 @@ mod tests {
 
     /// A settings file in a private directory. Every test here goes through an
     /// explicit path, so none of them can touch the real
-    /// `~/Library/Application Support/VanGoal/settings.json`.
+    /// the Van-Goal app data directory.
     struct TempSettings(std::path::PathBuf);
 
     impl TempSettings {
