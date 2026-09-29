@@ -18,8 +18,15 @@ read -r -a ABIS <<<"${VAN_GOAL_ABIS:-arm64-v8a}"
 JNI_LIBS="app/android/app/src/main/jniLibs"
 
 TARGET_FLAGS=()
+FLUTTER_TARGETS=()
 for abi in "${ABIS[@]}"; do
     TARGET_FLAGS+=(-t "$abi")
+    case "$abi" in
+        arm64-v8a) FLUTTER_TARGETS+=(android-arm64) ;;
+        armeabi-v7a) FLUTTER_TARGETS+=(android-arm) ;;
+        x86_64) FLUTTER_TARGETS+=(android-x64) ;;
+        *) echo "Unsupported Android ABI: $abi" >&2; exit 1 ;;
+    esac
 done
 
 echo "==> Cross-compiling van-goal-mobile for: ${ABIS[*]}"
@@ -28,8 +35,11 @@ cargo ndk "${TARGET_FLAGS[@]}" -o "$JNI_LIBS" build --release -p van-goal-mobile
 echo
 echo "==> Packaging the APK"
 cd app
-flutter build apk --release
+flutter build apk --release --split-per-abi \
+    --target-platform "$(IFS=,; echo "${FLUTTER_TARGETS[*]}")"
 
 echo
 echo "==> Done"
-ls -lh build/app/outputs/flutter-apk/*.apk
+for abi in "${ABIS[@]}"; do
+    ls -lh "build/app/outputs/flutter-apk/app-${abi}-release.apk"
+done

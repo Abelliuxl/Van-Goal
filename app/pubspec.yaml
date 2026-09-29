@@ -1,7 +1,7 @@
 name: van_goal
 description: "Van-Goal — a client for local and remote coding agents."
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.1.0+4006
 
 environment:
   sdk: ^3.13.3
