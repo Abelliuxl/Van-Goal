@@ -4,7 +4,7 @@
 
 Van-Goal is a thin, fast frontend: the selected agent backend stays the runtime, model gateway, tool executor, memory system, and session owner. The Rust core (`crates/core`, behind the C ABI in `crates/desktop`) speaks the agents' protocols and owns the conversation; the window in `desktop/` is native UI that MyGo draws on the GPU, in pure Go without cgo.
 
-![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-000000?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-macOS%2012%2B%20%7C%20Windows%2010%2B-000000?style=flat-square)
 ![Language](https://img.shields.io/badge/language-Rust%20%2B%20Go-DEA584?style=flat-square&logo=rust)
 ![UI](https://img.shields.io/badge/UI-MyGo-084CCF?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-4c3d2e?style=flat-square)
@@ -22,7 +22,7 @@ Van-Goal is a thin, fast frontend: the selected agent backend stays the runtime,
 - **Text size** — Small / Default / Large / Extra Large in Settings scales every font in the app at once: transcript, markdown, sidebar, composer and the settings window itself.
 - **Interface zoom** — View → Zoom In / Zoom Out / Actual Size (⌘+ / ⌘− / ⌘0) magnifies the whole window, text and chrome together, and the level survives a restart. It is independent of Text size, so you can enlarge type without inflating the layout around it.
 - **Comes back on its own** — a dropped connection is retried with a backoff and the open chat is re-attached; a prompt that cannot be delivered goes back to the composer with the reason, never into another chat.
-- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, native menu bar with ⌘N / ⌘R / ⌘B / ⌘, / ⌘+ / ⌘− / ⌘0 shortcuts.
+- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, and a native menu with Command shortcuts on macOS and Ctrl shortcuts on Windows (N / R / B / , / + / − / 0).
 
 ## Build
 
@@ -52,7 +52,27 @@ cd desktop && GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0 go test ./...   # the view, hea
 
 ### Windows
 
-Not ported yet. The core builds as `van_goal_desktop.dll` and the window cross-compiles with `GOOS=windows`, but `Scripts/package_windows.ps1` and the tray still belong to the previous GPUI client.
+Requires Windows 10 or later, Rust (either the MSVC or the GNU toolchain), and Go. The window is native MyGo UI, so it needs no WebView2 runtime.
+
+```powershell
+cargo build -p van-goal-desktop             # the core, as van_goal_desktop.dll
+cd desktop
+$env:GOTOOLCHAIN = "go1.27.3"; $env:CGO_ENABLED = "0"
+go run .
+```
+
+```powershell
+Scripts/package_windows.ps1                 # -> Build\VanGoal-windows-x86_64 and its zip
+```
+
+The package holds `VanGoal.exe`, `van_goal_desktop.dll` and `AppIcon.png`; keep the three together. The script embeds the app icon, a per-monitor-DPI manifest and version information into the executable with `windres` (mingw-w64) when it is installed; without it the exe builds anyway and the window still takes its icon from `AppIcon.png`. Settings and the local cache live in `%LOCALAPPDATA%\VanGoal`.
+
+Run the tests the same way:
+
+```powershell
+cargo test --workspace
+cd desktop; $env:GOTOOLCHAIN = "go1.27.3"; $env:CGO_ENABLED = "0"; go test ./...
+```
 
 ## Backends
 

@@ -5,7 +5,8 @@ package main
 // reaches a value the core would clamp behind the window's back.
 var zoomLevels = []float32{0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2}
 
-// zoomIn enlarges the interface one step, as ⌘+ does in macOS apps.
+// zoomIn enlarges the interface one step, as Cmd+Plus (macOS) and Ctrl+Plus
+// (Windows) do.
 func (a *app) zoomIn() { a.setZoom(nextZoom(a.settings.UIScale, 1)) }
 
 // zoomOut shrinks it one step.

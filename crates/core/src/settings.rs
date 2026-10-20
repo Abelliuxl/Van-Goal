@@ -325,15 +325,36 @@ pub struct PerBackendConnection {
 
 /// The directory a fresh install starts from.
 ///
-/// A bundled app is launched with `/` as its working directory, which is no
-/// project at all — a coding agent scoped to the filesystem root is worse than
-/// one scoped to nothing. The home directory is where a terminal would have put
-/// the user, and the field is theirs to change.
+/// A bundled app is launched with `/` as its working directory (macOS) or
+/// from the folder holding its executable (Windows), which is no project at
+/// all — a coding agent scoped to the filesystem root or to Program Files is
+/// worse than one scoped to nothing. The home directory is where a terminal
+/// would have put the user, and the field is theirs to change.
 fn default_workspace_path() -> String {
     match std::env::current_dir() {
-        Ok(dir) if dir != std::path::Path::new("/") => dir.to_string_lossy().to_string(),
-        _ => std::env::var("HOME").unwrap_or_default(),
+        Ok(dir) if !is_launch_directory(&dir) => dir.to_string_lossy().to_string(),
+        _ => crate::logger::dirs::home().to_string_lossy().to_string(),
     }
+}
+
+/// is_launch_directory reports a working directory that says nothing about
+/// what the user was doing: the filesystem root, or on Windows the folder the
+/// executable was started from (Explorer's "Start in"), which for an
+/// installed app is its own folder rather than a project.
+fn is_launch_directory(dir: &std::path::Path) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        if let (Ok(exe_dir), Ok(dir)) = (exe_dir.canonicalize(), dir.canonicalize()) {
+            return exe_dir == dir;
+        }
+    }
+    false
 }
 
 fn default_true() -> bool {
@@ -345,7 +366,8 @@ fn default_ui_scale() -> f32 {
 }
 
 /// Write a file only the current user can read. Settings hold credentials, so
-/// the mode is applied at creation time rather than fixed up afterwards.
+/// the Unix mode is applied at creation time rather than fixed up afterwards;
+/// on Windows the file inherits the user profile directory's ACL.
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
@@ -687,7 +709,13 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, FontSize, SavedWindow, Settings};
+    use super::{is_launch_directory, BackendKind, FontSize, SavedWindow, Settings};
+
+    #[test]
+    fn the_root_and_the_app_folder_are_not_projects() {
+        assert!(is_launch_directory(std::path::Path::new("/")));
+        assert!(!is_launch_directory(&std::env::temp_dir()));
+    }
 
     #[test]
     fn full_websocket_url_preserves_reverse_proxy_path() {

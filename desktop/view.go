@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"math"
-	"runtime"
 	"strings"
 	"time"
 
@@ -42,8 +41,8 @@ func (a *app) shortcuts(c *ui.Context) {
 	case c.Shortcut(ui.Cmd, ui.KeyB):
 		a.toggleSidebar()
 	case c.Shortcut(ui.Cmd, ui.KeyEqual):
-		// The menu binds ⌘+ (which needs Shift); Cmd+= is what other macOS
-		// apps accept without it.
+		// The menu binds the + key (which needs Shift); = is what apps accept
+		// without it.
 		a.zoomIn()
 	case c.Shortcut(ui.Cmd, ui.KeyComma):
 		a.openSettings()
@@ -63,26 +62,28 @@ func (a *app) toggleSidebar() {
 }
 
 // titleRoom is the room the window controls take, and the height the bars
-// that sit under them share.
-func (a *app) titleRoom(c *ui.Context) (height, left float32) {
+// that sit under them share. The controls are on the left on macOS and at the
+// top-right corner on Windows, so both sides have to stay clear: a header
+// that ended at the padding would put its last button under Close.
+func (a *app) titleRoom(c *ui.Context) (height, left, right float32) {
 	bar := c.TitleBar()
-	return max(bar.Height, a.px(46)), bar.Left
+	return max(bar.Height, a.px(46)), bar.Left, bar.Right
 }
 
 // ---------------------------------------------------------------- sidebar
 
 func (a *app) sidebar(c *ui.Context) {
 	p := a.p
-	height, left := a.titleRoom(c)
+	height, left, _ := a.titleRoom(c)
 	ui.Column(c).Width(a.px(sidebarWidth)).Background(p.sidebar).BorderWidth(0, 1, 0, 0).BorderColor(p.line).Children(func() {
-		// The bar under the traffic lights: drag the window, toggle the list.
+		// The bar under the window controls: drag the window, toggle the list.
 		ui.Row(c).Height(height).PaddingStart(max(left, a.px(12))).PaddingEnd(a.px(10)).AlignItems(ui.Center).DragWindow().Children(func() {
 			ui.Spacer(c)
-			a.iconButton(c, iconSidebar, "Hide sidebar  ⌘B", a.toggleSidebar)
+			a.iconButton(c, iconSidebar, "Hide sidebar  "+shortcut("B"), a.toggleSidebar)
 		})
 
 		ui.Column(c).Padding(a.px(4), a.px(12), a.px(10), a.px(12)).Gap(a.px(2)).Children(func() {
-			a.navRow(c, iconCompose, "New chat", "⌘N", a.newChat)
+			a.navRow(c, iconCompose, "New chat", shortcut("N"), a.newChat)
 		})
 
 		ui.Row(c).Padding(a.px(10), a.px(20), a.px(6), a.px(20)).AlignItems(ui.Center).Children(func() {
@@ -262,14 +263,16 @@ func (a *app) statusDot(c *ui.Context, size float32) {
 
 func (a *app) header(c *ui.Context) {
 	p := a.p
-	height, left := a.titleRoom(c)
+	height, left, right := a.titleRoom(c)
 	if a.sidebarOpen {
 		left = 0
 	}
-	ui.Row(c).Height(height).PaddingStart(max(left+a.px(8), a.px(16))).PaddingEnd(a.px(14)).Gap(a.px(8)).AlignItems(ui.Center).DragWindow().Children(func() {
+	// The caption buttons are over the view on Windows, so the last header
+	// button has to stop before them rather than under them.
+	ui.Row(c).Height(height).PaddingStart(max(left+a.px(8), a.px(16))).PaddingEnd(max(right+a.px(8), a.px(14))).Gap(a.px(8)).AlignItems(ui.Center).DragWindow().Children(func() {
 		if !a.sidebarOpen {
-			a.iconButton(c, iconSidebar, "Show sidebar  ⌘B", a.toggleSidebar)
-			a.iconButton(c, iconCompose, "New chat  ⌘N", a.newChat)
+			a.iconButton(c, iconSidebar, "Show sidebar  "+shortcut("B"), a.toggleSidebar)
+			a.iconButton(c, iconCompose, "New chat  "+shortcut("N"), a.newChat)
 		}
 		title := "New chat"
 		if a.state.Selected != nil {
@@ -278,7 +281,7 @@ func (a *app) header(c *ui.Context) {
 		ui.Text(c, title).SingleLine().FontSize(a.size(14)).FontWeight(600).TextColor(p.text).MinWidth(0).Shrink(1).Padding(0, a.px(6))
 		ui.Spacer(c)
 		a.contextMeter(c)
-		a.iconButton(c, iconRefresh, "Refresh  ⌘R", func() { a.do("refresh", nil) })
+		a.iconButton(c, iconRefresh, "Refresh  "+shortcut("R"), func() { a.do("refresh", nil) })
 	})
 }
 
@@ -356,5 +359,3 @@ func compact(n int64) string {
 }
 
 func trimZero(s string) string { return strings.TrimSuffix(s, ".0") }
-
-func isMac() bool { return runtime.GOOS == "darwin" }

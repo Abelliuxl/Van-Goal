@@ -82,7 +82,29 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # The core only: the Windows window and its packaging are not ported to
-      # MyGo yet.
+      # The debug build is what the Go tests load (target/debug); the release
+      # one is what the packaging script ships.
       - name: Build desktop core
-        run: cargo build --release -p van-goal-desktop
+        run: |
+          cargo build -p van-goal-desktop
+          cargo build --release -p van-goal-desktop
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: desktop/go.sum
+
+      # Formatting is checked by the macOS job, where the checkout keeps LF;
+      # actions/checkout converts to CRLF on Windows and gofmt would flag
+      # every file.
+      - name: Desktop window (vet, test)
+        working-directory: desktop
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Package the app
+        run: ./Scripts/package_windows.ps1

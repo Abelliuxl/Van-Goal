@@ -17,7 +17,9 @@ import (
 	"github.com/Abelliuxl/Van-Goal/desktop/bridge"
 )
 
-const version = "0.1.0"
+// version is stamped by the packaging scripts from the Cargo workspace
+// version; `go run` keeps the default.
+var version = "0.1.0"
 
 func main() {
 	if err := bridge.Load(libraryDirs()...); err != nil {
@@ -41,7 +43,7 @@ func main() {
 		a.openWindow()
 		go a.pump()
 	})
-	// Reopening from the Dock brings the window back.
+	// Reopening from the Dock brings the window back (macOS).
 	mygo.App.OnActivate(func(visible bool) {
 		if !visible && (a.win == nil || a.win.IsDestroyed()) {
 			a.openWindow()
@@ -63,7 +65,11 @@ func (a *app) openWindow() {
 		MinWidth:      640,
 		MinHeight:     480,
 		TitleBarStyle: mygo.TitleBarHidden,
-		Content:       ui.View(a.view),
+		// On Windows the caption buttons fill this height; matching the
+		// header's keeps them on the same line as its last button instead of
+		// sitting in the top half of it. macOS ignores it.
+		TitleBarHeight: 46,
+		Content:        ui.View(a.view),
 	}
 	if w := a.settings.Window; w != nil {
 		opts.X, opts.Y = int(w.X), int(w.Y)
@@ -73,6 +79,12 @@ func (a *app) openWindow() {
 	win := mygo.NewWindow(opts)
 	a.win = win
 	a.focusDraft = true
+	// Windows takes the taskbar icon from the executable's resources when it
+	// has them; this also covers a development run, where the icon is the PNG
+	// beside the workspace's assets.
+	if png := windowIcon(); png != nil {
+		_ = win.SetIcon(png)
+	}
 
 	// The window's place is remembered once it stops moving.
 	var timer *time.Timer
@@ -106,37 +118,97 @@ func (a *app) menu() *mygo.Menu {
 			}
 		}
 	}
+	file := &mygo.MenuItem{Label: "File", Submenu: []*mygo.MenuItem{
+		{Label: "New Chat", Accelerator: "CmdOrCtrl+N", Click: click(a.newChat)},
+		{Label: "Attach Files…", Accelerator: "CmdOrCtrl+O", Click: click(a.pickFiles)},
+	}}
+	view := &mygo.MenuItem{Label: "View", Submenu: []*mygo.MenuItem{
+		{Label: "Toggle Sidebar", Accelerator: "CmdOrCtrl+B", Click: click(a.toggleSidebar)},
+		{Label: "Refresh", Accelerator: "CmdOrCtrl+R", Click: click(func() { a.do("refresh", nil) })},
+		mygo.Separator(),
+		{Label: "Zoom In", Accelerator: "CmdOrCtrl+Plus", Click: click(a.zoomIn)},
+		{Label: "Zoom Out", Accelerator: "CmdOrCtrl+-", Click: click(a.zoomOut)},
+		{Label: "Actual Size", Accelerator: "CmdOrCtrl+0", Click: click(a.actualSize)},
+		mygo.Separator(),
+		{Role: mygo.RoleToggleFullScreen},
+	}}
+	if isMac() {
+		file.Submenu = append(file.Submenu, mygo.Separator(), &mygo.MenuItem{Role: mygo.RoleClose})
+		return mygo.NewMenu([]*mygo.MenuItem{
+			{Role: mygo.RoleAppMenu, Submenu: []*mygo.MenuItem{
+				{Role: mygo.RoleAbout},
+				mygo.Separator(),
+				{Label: "Settings…", Accelerator: "CmdOrCtrl+,", Click: click(a.openSettings)},
+				mygo.Separator(),
+				{Role: mygo.RoleHide},
+				{Role: mygo.RoleHideOthers},
+				{Role: mygo.RoleUnhide},
+				mygo.Separator(),
+				{Role: mygo.RoleQuit},
+			}},
+			file,
+			{Role: mygo.RoleEditMenu},
+			view,
+			{Role: mygo.RoleWindowMenu},
+		})
+	}
+	// Windows has no application menu: a Settings item inside one would be
+	// hidden with it, and Close would leave no way to quit the app. Settings
+	// goes in File, About in Help, and Exit replaces Close.
+	file.Submenu = append(file.Submenu,
+		mygo.Separator(),
+		&mygo.MenuItem{Label: "Settings…", Accelerator: "CmdOrCtrl+,", Click: click(a.openSettings)},
+		mygo.Separator(),
+		&mygo.MenuItem{Role: mygo.RoleQuit},
+	)
 	return mygo.NewMenu([]*mygo.MenuItem{
-		{Role: mygo.RoleAppMenu, Submenu: []*mygo.MenuItem{
-			{Role: mygo.RoleAbout},
-			mygo.Separator(),
-			{Label: "Settings…", Accelerator: "CmdOrCtrl+,", Click: click(a.openSettings)},
-			mygo.Separator(),
-			{Role: mygo.RoleHide},
-			{Role: mygo.RoleHideOthers},
-			{Role: mygo.RoleUnhide},
-			mygo.Separator(),
-			{Role: mygo.RoleQuit},
-		}},
-		{Label: "File", Submenu: []*mygo.MenuItem{
-			{Label: "New Chat", Accelerator: "CmdOrCtrl+N", Click: click(a.newChat)},
-			{Label: "Attach Files…", Accelerator: "CmdOrCtrl+O", Click: click(a.pickFiles)},
-			mygo.Separator(),
-			{Role: mygo.RoleClose},
-		}},
+		file,
 		{Role: mygo.RoleEditMenu},
-		{Label: "View", Submenu: []*mygo.MenuItem{
-			{Label: "Toggle Sidebar", Accelerator: "CmdOrCtrl+B", Click: click(a.toggleSidebar)},
-			{Label: "Refresh", Accelerator: "CmdOrCtrl+R", Click: click(func() { a.do("refresh", nil) })},
-			mygo.Separator(),
-			{Label: "Zoom In", Accelerator: "CmdOrCtrl+Plus", Click: click(a.zoomIn)},
-			{Label: "Zoom Out", Accelerator: "CmdOrCtrl+-", Click: click(a.zoomOut)},
-			{Label: "Actual Size", Accelerator: "CmdOrCtrl+0", Click: click(a.actualSize)},
-			mygo.Separator(),
-			{Role: mygo.RoleToggleFullScreen},
+		view,
+		{Label: "Help", Submenu: []*mygo.MenuItem{
+			{Label: "About Van-Goal", Click: click(a.showAbout)},
 		}},
-		{Role: mygo.RoleWindowMenu},
 	})
+}
+
+// showAbout is the About dialog the Help menu opens on Windows, where the
+// role that shows the system's own panel is macOS-only.
+func (a *app) showAbout() {
+	go func() {
+		_, _ = mygo.Dialog.Message(mygo.MessageOptions{
+			Parent:  a.win,
+			Type:    mygo.MessageInfo,
+			Title:   "About Van-Goal",
+			Message: "Van-Goal " + version,
+			Detail:  "A desktop client for coding agents.\nDrawn by MyGo over the Rust core.",
+			Buttons: []string{"OK"},
+		})
+	}()
+}
+
+// windowIcon is the app's PNG icon beside the executable, in its resources,
+// or in the workspace while developing. A packaged Windows build also embeds
+// it as the executable's icon; setting it here gives the window and its
+// taskbar button the same one in a development run.
+func windowIcon() []byte {
+	var candidates []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, "AppIcon.png"),
+			filepath.Join(dir, "..", "Resources", "AppIcon.png"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(wd, "..", "assets", "AppIcon.png"),
+			filepath.Join(wd, "assets", "AppIcon.png"))
+	}
+	for _, path := range candidates {
+		if data, err := os.ReadFile(path); err == nil {
+			return data
+		}
+	}
+	return nil
 }
 
 // libraryDirs is where the Rust core may be: inside the app's resources once

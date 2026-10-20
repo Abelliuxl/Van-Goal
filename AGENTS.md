@@ -108,6 +108,13 @@ reported as it came.
   the Go window every layout dimension goes through `a.px(...)` and every font
   size through `a.size(...)` — passing a raw number to `Padding`, `Gap`, `Size`,
   `Radius`, `Width`, `Height` or `FontSize` makes that one element ignore zoom.
+* **The window controls are in the layout**: `c.TitleBar()` reports room on the
+  left for macOS traffic lights and on the right for Windows caption buttons.
+  `titleRoom` returns both and the header reserves both; ending at its own
+  padding puts the refresh button under Close on Windows. A hidden title bar has
+  no visible menu bar on Windows either — Alt or F10 opens it in a popup, which
+  is why Settings lives in File there instead of the macOS app menu, and the
+  app has its own gear button.
 * **A turn's shape is decided once, in `Conversation`**: a placeholder only while
   a turn is in flight, tool calls folded into one bubble, duplicates within a
   turn dropped, every streaming message stopped when the turn ends (including
@@ -152,8 +159,24 @@ design is checked without a screen. `crates/desktop/examples/xuexiaomi_e2e.rs`
 and `desktop/live_test.go` run the bridge and the window against a live 雪小米
 gateway (`VG_XXM_URL`, `VG_XXM_TOKEN_FILE`); each run creates a session there.
 
-The Windows desktop has not been ported to MyGo yet:
-`Scripts/package_windows.ps1` still describes the GPUI build.
+Windows (same Go version and `CGO_ENABLED=0`; the window is native MyGo UI and
+needs no WebView2; Rust needs either the MSVC or the GNU toolchain):
+
+```powershell
+cargo build -p van-goal-desktop               # van_goal_desktop.dll
+cd desktop
+$env:GOTOOLCHAIN = "go1.27.3"; $env:CGO_ENABLED = "0"
+go run .                                      # VAN_GOAL_DATA_DIR=dir runs on throwaway settings
+go vet ./...; go test ./...
+cd ..
+Scripts/package_windows.ps1                   # -> Build\VanGoal-windows-x86_64 + zip
+```
+
+`package_windows.ps1` embeds the icon, a PerMonitorV2 manifest and the version
+into `VanGoal.exe` with mingw-w64's `windres` when it is on `PATH`; without it
+the exe still builds, and the window icon at run time comes from `AppIcon.png`.
+The package is the exe, `van_goal_desktop.dll` and `AppIcon.png` in one folder;
+`libraryDirs()` finds the DLL beside the exe.
 
 Android (the toolchain installs without `sudo`, into the user's own directories):
 
