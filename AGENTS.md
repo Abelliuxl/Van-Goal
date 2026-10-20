@@ -103,6 +103,11 @@ reported as it came.
 
 ## Behaviour worth matching
 
+* **Two scales, not one**: `Settings::font_size` grows type inside chrome that
+  stays put; `Settings::ui_scale` (View → Zoom) grows the whole interface. In
+  the Go window every layout dimension goes through `a.px(...)` and every font
+  size through `a.size(...)` — passing a raw number to `Padding`, `Gap`, `Size`,
+  `Radius`, `Width`, `Height` or `FontSize` makes that one element ignore zoom.
 * **A turn's shape is decided once, in `Conversation`**: a placeholder only while
   a turn is in flight, tool calls folded into one bubble, duplicates within a
   turn dropped, every streaming message stopped when the turn ends (including

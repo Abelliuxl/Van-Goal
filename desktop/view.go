@@ -41,6 +41,10 @@ func (a *app) shortcuts(c *ui.Context) {
 		a.do("refresh", nil)
 	case c.Shortcut(ui.Cmd, ui.KeyB):
 		a.toggleSidebar()
+	case c.Shortcut(ui.Cmd, ui.KeyEqual):
+		// The menu binds ⌘+ (which needs Shift); Cmd+= is what other macOS
+		// apps accept without it.
+		a.zoomIn()
 	case c.Shortcut(ui.Cmd, ui.KeyComma):
 		a.openSettings()
 	case c.Shortcut(0, ui.KeyEscape) && a.state.Sending:
@@ -62,7 +66,7 @@ func (a *app) toggleSidebar() {
 // that sit under them share.
 func (a *app) titleRoom(c *ui.Context) (height, left float32) {
 	bar := c.TitleBar()
-	return max(bar.Height, 46), bar.Left
+	return max(bar.Height, a.px(46)), bar.Left
 }
 
 // ---------------------------------------------------------------- sidebar
@@ -70,22 +74,22 @@ func (a *app) titleRoom(c *ui.Context) (height, left float32) {
 func (a *app) sidebar(c *ui.Context) {
 	p := a.p
 	height, left := a.titleRoom(c)
-	ui.Column(c).Width(a.size(sidebarWidth)).Background(p.sidebar).BorderWidth(0, 1, 0, 0).BorderColor(p.line).Children(func() {
+	ui.Column(c).Width(a.px(sidebarWidth)).Background(p.sidebar).BorderWidth(0, 1, 0, 0).BorderColor(p.line).Children(func() {
 		// The bar under the traffic lights: drag the window, toggle the list.
-		ui.Row(c).Height(height).PaddingStart(max(left, 12)).PaddingEnd(10).AlignItems(ui.Center).DragWindow().Children(func() {
+		ui.Row(c).Height(height).PaddingStart(max(left, a.px(12))).PaddingEnd(a.px(10)).AlignItems(ui.Center).DragWindow().Children(func() {
 			ui.Spacer(c)
 			a.iconButton(c, iconSidebar, "Hide sidebar  ⌘B", a.toggleSidebar)
 		})
 
-		ui.Column(c).Padding(4, 12, 10, 12).Gap(2).Children(func() {
+		ui.Column(c).Padding(a.px(4), a.px(12), a.px(10), a.px(12)).Gap(a.px(2)).Children(func() {
 			a.navRow(c, iconCompose, "New chat", "⌘N", a.newChat)
 		})
 
-		ui.Row(c).Padding(10, 20, 6, 20).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Padding(a.px(10), a.px(20), a.px(6), a.px(20)).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "Chats").FontSize(a.size(11.5)).FontWeight(600).TextColor(p.faint).LetterSpacing(0.4)
 			ui.Spacer(c)
 			if a.state.Refreshing {
-				ui.Spinner(c).Size(12, 12)
+				ui.Spinner(c).Size(a.px(12), a.px(12))
 			}
 		})
 		a.sessionList(c)
@@ -95,7 +99,7 @@ func (a *app) sidebar(c *ui.Context) {
 
 func (a *app) navRow(c *ui.Context, svg *ui.SVG, label, hint string, onClick func()) {
 	p := a.p
-	row := ui.ButtonBase(c.Key(label)).Padding(7, 10).Radius(8).Gap(10).AlignItems(ui.Center).Label(label)
+	row := ui.ButtonBase(c.Key(label)).Padding(a.px(7), a.px(10)).Radius(a.px(8)).Gap(a.px(10)).AlignItems(ui.Center).Label(label)
 	if row.Hovered() {
 		row.Background(p.raised)
 	}
@@ -115,9 +119,9 @@ func (a *app) navRow(c *ui.Context, svg *ui.SVG, label, hint string, onClick fun
 func (a *app) sessionList(c *ui.Context) {
 	p := a.p
 	sessions := a.state.Sessions
-	ui.Scroll(c).Grow(1).Padding(0, 8, 8, 8).Children(func() {
+	ui.Scroll(c).Grow(1).Padding(0, a.px(8), a.px(8), a.px(8)).Children(func() {
 		if len(sessions) == 0 {
-			ui.Column(c).Padding(24, 14).Gap(6).Children(func() {
+			ui.Column(c).Padding(a.px(24), a.px(14)).Gap(a.px(6)).Children(func() {
 				ui.Text(c, "No chats yet").FontSize(a.size(13)).FontWeight(500).TextColor(p.muted)
 				ui.Text(c, "Send a message to start one.").FontSize(a.size(12)).TextColor(p.faint)
 			})
@@ -127,7 +131,7 @@ func (a *app) sessionList(c *ui.Context) {
 		for _, s := range sessions {
 			if g := dayGroup(s.LastActive); g != group {
 				group = g
-				ui.Text(c.Key("group:"+g), g).FontSize(a.size(11)).FontWeight(500).TextColor(p.faint).Padding(12, 12, 4, 12)
+				ui.Text(c.Key("group:"+g), g).FontSize(a.size(11)).FontWeight(500).TextColor(p.faint).Padding(a.px(12), a.px(12), a.px(4), a.px(12))
 			}
 			a.sessionRow(c, s)
 		}
@@ -137,7 +141,7 @@ func (a *app) sessionList(c *ui.Context) {
 func (a *app) sessionRow(c *ui.Context, s bridge.Session) {
 	p := a.p
 	selected := a.state.Selected != nil && a.state.Selected.ID == s.ID
-	row := ui.ButtonBase(c.Key(s.ID)).Padding(8, 10).Radius(8).Gap(8).AlignItems(ui.Center).Label(s.Title)
+	row := ui.ButtonBase(c.Key(s.ID)).Padding(a.px(8), a.px(10)).Radius(a.px(8)).Gap(a.px(8)).AlignItems(ui.Center).Label(s.Title)
 	switch {
 	case selected:
 		row.Background(p.selected)
@@ -147,17 +151,17 @@ func (a *app) sessionRow(c *ui.Context, s bridge.Session) {
 	row.Transition(ui.ElementTransition{Colors: true, Duration: 90 * time.Millisecond})
 	hovered := row.Hovered()
 	row.Children(func() {
-		ui.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
+		ui.Column(c).Grow(1).MinWidth(0).Gap(a.px(2)).Children(func() {
 			ui.Text(c, s.Title).SingleLine().FontSize(a.size(13.5)).FontWeight(map[bool]int{true: 600, false: 450}[selected]).TextColor(p.text)
 			if s.Subtitle != "" {
 				ui.Text(c, s.Subtitle).SingleLine().FontSize(a.size(11.5)).TextColor(p.faint)
 			}
 		})
 		if s.Active {
-			ui.Box(c).Size(7, 7).Radius(4).Background(p.ok).Tooltip("Running")
+			ui.Box(c).Size(a.px(7), a.px(7)).Radius(a.px(4)).Background(p.ok).Tooltip("Running")
 		}
 		if hovered || selected {
-			more := ui.ButtonBase(c).Size(22, 22).Radius(6).Center().Label("More").Cursor(ui.CursorPointer)
+			more := ui.ButtonBase(c).Size(a.px(22), a.px(22)).Radius(a.px(6)).Center().Label("More").Cursor(ui.CursorPointer)
 			if more.Hovered() {
 				more.Background(p.selected.Mix(p.text, 0.08))
 			}
@@ -186,14 +190,14 @@ func (a *app) sessionRow(c *ui.Context, s bridge.Session) {
 // it is doing, and the way to settings.
 func (a *app) connectionFooter(c *ui.Context) {
 	p := a.p
-	ui.Column(c).Padding(8, 12, 12, 12).BorderWidth(1, 0, 0, 0).BorderColor(p.line).Children(func() {
-		row := ui.ButtonBase(c).Padding(8, 10).Radius(8).Gap(10).AlignItems(ui.Center).Label("Settings")
+	ui.Column(c).Padding(a.px(8), a.px(12), a.px(12), a.px(12)).BorderWidth(1, 0, 0, 0).BorderColor(p.line).Children(func() {
+		row := ui.ButtonBase(c).Padding(a.px(8), a.px(10)).Radius(a.px(8)).Gap(a.px(10)).AlignItems(ui.Center).Label("Settings")
 		if row.Hovered() {
 			row.Background(p.raised)
 		}
 		row.Children(func() {
 			a.statusDot(c, 8)
-			ui.Column(c).Grow(1).MinWidth(0).Gap(1).Children(func() {
+			ui.Column(c).Grow(1).MinWidth(0).Gap(a.px(1)).Children(func() {
 				ui.Text(c, a.backendName()).SingleLine().FontSize(a.size(13)).FontWeight(550).TextColor(p.text)
 				ui.Text(c, a.connectionWords()).SingleLine().FontSize(a.size(11.5)).TextColor(p.faint)
 			})
@@ -246,6 +250,7 @@ func (a *app) statusColor() ui.Color {
 }
 
 func (a *app) statusDot(c *ui.Context, size float32) {
+	size = a.px(size)
 	dot := ui.Box(c).Size(size, size).Radius(size / 2).Background(a.statusColor())
 	if a.state.Connection.State == "connecting" || a.state.Reconnecting {
 		pulse := dot.Loop("pulse", 1400*time.Millisecond, ui.Linear)
@@ -261,7 +266,7 @@ func (a *app) header(c *ui.Context) {
 	if a.sidebarOpen {
 		left = 0
 	}
-	ui.Row(c).Height(height).PaddingStart(max(left+8, 16)).PaddingEnd(14).Gap(8).AlignItems(ui.Center).DragWindow().Children(func() {
+	ui.Row(c).Height(height).PaddingStart(max(left+a.px(8), a.px(16))).PaddingEnd(a.px(14)).Gap(a.px(8)).AlignItems(ui.Center).DragWindow().Children(func() {
 		if !a.sidebarOpen {
 			a.iconButton(c, iconSidebar, "Show sidebar  ⌘B", a.toggleSidebar)
 			a.iconButton(c, iconCompose, "New chat  ⌘N", a.newChat)
@@ -270,7 +275,7 @@ func (a *app) header(c *ui.Context) {
 		if a.state.Selected != nil {
 			title = a.state.Selected.Title
 		}
-		ui.Text(c, title).SingleLine().FontSize(a.size(14)).FontWeight(600).TextColor(p.text).MinWidth(0).Shrink(1).Padding(0, 6)
+		ui.Text(c, title).SingleLine().FontSize(a.size(14)).FontWeight(600).TextColor(p.text).MinWidth(0).Shrink(1).Padding(0, a.px(6))
 		ui.Spacer(c)
 		a.contextMeter(c)
 		a.iconButton(c, iconRefresh, "Refresh  ⌘R", func() { a.do("refresh", nil) })
@@ -295,9 +300,9 @@ func (a *app) contextMeter(c *ui.Context) {
 		approx = ""
 	}
 	tip := fmt.Sprintf("Context: %s%s of %s tokens", approx, compact(ctx.Used), compact(ctx.Max))
-	ui.Row(c).Gap(6).AlignItems(ui.Center).Padding(4, 8).Radius(6).Tooltip(tip).Children(func() {
-		ui.Box(c).Size(34, 4).Radius(2).Background(p.line.Alpha(2)).Children(func() {
-			ui.Box(c).Height(4).Width(float32(math.Max(0.04, ctx.Ratio)) * 34).Radius(2).Background(color)
+	ui.Row(c).Gap(a.px(6)).AlignItems(ui.Center).Padding(a.px(4), a.px(8)).Radius(a.px(6)).Tooltip(tip).Children(func() {
+		ui.Box(c).Size(a.px(34), a.px(4)).Radius(a.px(2)).Background(p.line.Alpha(2)).Children(func() {
+			ui.Box(c).Height(a.px(4)).Width(float32(math.Max(0.04, ctx.Ratio)) * a.px(34)).Radius(a.px(2)).Background(color)
 		})
 		ui.Text(c, fmt.Sprintf("%d%%", int(math.Round(ctx.Ratio*100)))).FontSize(a.size(11)).TextColor(p.faint).FontFeatures("tnum")
 	})
@@ -306,7 +311,7 @@ func (a *app) contextMeter(c *ui.Context) {
 // iconButton is a quiet, square button that shows only an icon.
 func (a *app) iconButton(c *ui.Context, svg *ui.SVG, tip string, onClick func()) ui.Element {
 	p := a.p
-	b := ui.ButtonBase(c.Key(tip)).Size(30, 30).Radius(7).Center().Label(tip).Tooltip(tip)
+	b := ui.ButtonBase(c.Key(tip)).Size(a.px(30), a.px(30)).Radius(a.px(7)).Center().Label(tip).Tooltip(tip)
 	if b.Hovered() {
 		b.Background(p.raised)
 	}

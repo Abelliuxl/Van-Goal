@@ -218,6 +218,7 @@ pub fn settings(settings: &Settings) -> Value {
         "appearances": AppearanceMode::ALL.iter().map(|a| json!({ "id": a.id(), "name": a.display_name() })).collect::<Vec<_>>(),
         "font_size": settings.font_size.id(),
         "font_scale": settings.font_size.scale(),
+        "ui_scale": settings.ui_scale,
         "font_sizes": FontSize::ALL.iter().map(|f| json!({ "id": f.id(), "name": f.display_name() })).collect::<Vec<_>>(),
         "host": settings.backend_host,
         "port": settings.resolved_port(),

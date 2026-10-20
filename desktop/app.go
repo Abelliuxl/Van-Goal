@@ -40,9 +40,10 @@ type app struct {
 	toastError   string
 	settingsForm settingsForm
 
-	md    markdown.Options
-	p     palette
-	scale float32
+	md      markdown.Options
+	p       palette
+	scale   float32 // fonts: the text size setting times the interface zoom
+	pxScale float32 // layout: the interface zoom alone
 
 	// Called by commands that fail before the core is even asked; shown as
 	// a toast instead of the status line, which is the core's.
@@ -63,6 +64,7 @@ func newApp() *app {
 		copied:      map[string]time.Time{},
 		sidebarOpen: true,
 		scale:       1,
+		pxScale:     1,
 	}
 }
 

@@ -20,8 +20,9 @@ Van-Goal is a thin, fast frontend: the selected agent backend stays the runtime,
 - **Permission modes** — Full access / Ask first / Restricted tools, applied through `hermes config set`.
 - **One switch per backend** — each backend has its own on/off switch in Settings. Switching one on connects it and switches the others off; switching it off disconnects it and keeps it off after a restart. The backend you were last using is the one that comes back on launch.
 - **Text size** — Small / Default / Large / Extra Large in Settings scales every font in the app at once: transcript, markdown, sidebar, composer and the settings window itself.
+- **Interface zoom** — View → Zoom In / Zoom Out / Actual Size (⌘+ / ⌘− / ⌘0) magnifies the whole window, text and chrome together, and the level survives a restart. It is independent of Text size, so you can enlarge type without inflating the layout around it.
 - **Comes back on its own** — a dropped connection is retried with a backoff and the open chat is re-attached; a prompt that cannot be delivered goes back to the composer with the reason, never into another chat.
-- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, native menu bar with ⌘N / ⌘R / ⌘B / ⌘, shortcuts.
+- **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, native menu bar with ⌘N / ⌘R / ⌘B / ⌘, / ⌘+ / ⌘− / ⌘0 shortcuts.
 
 ## Build
 
