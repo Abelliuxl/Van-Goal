@@ -147,6 +147,7 @@ type Settings struct {
 	Appearances      []Choice        `json:"appearances"`
 	FontSize         string          `json:"font_size"`
 	FontScale        float32         `json:"font_scale"`
+	UIScale          float32         `json:"ui_scale"`
 	FontSizes        []Choice        `json:"font_sizes"`
 	Host             string          `json:"host"`
 	Port             int             `json:"port"`

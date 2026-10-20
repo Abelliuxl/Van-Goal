@@ -116,16 +116,13 @@ func (a *app) applyTheme(c *ui.Context) {
 	t.Focus = p.accent.Alpha(0.5)
 	t.Radius = 8
 	t.ScrollbarWidth = 6
-	scale := a.settings.FontScale
-	if scale <= 0 {
-		scale = 1
-	}
-	t.FontSize = 14 * scale
+	textScale, layoutScale := a.scaleFactors()
+	t.FontSize = 14 * textScale
 	c.SetTheme(&t)
-	a.scale = scale
+	a.scale, a.pxScale = textScale, layoutScale
 
 	a.md.Theme = &markdown.Theme{
-		FontSize:       15 * scale,
+		FontSize:       15 * textScale,
 		LineHeight:     1.62,
 		Text:           p.text,
 		Muted:          p.muted,
@@ -141,5 +138,27 @@ func (a *app) applyTheme(c *ui.Context) {
 	}
 }
 
-// size scales a design size by the text size the user chose.
+// scaleFactors returns the multiplier for fonts (the text-size setting times
+// the interface zoom) and for layout (the zoom alone). They differ on purpose:
+// text size grows type inside chrome that stays put, while zoom grows the
+// whole window together.
+func (a *app) scaleFactors() (text, layout float32) {
+	text = a.settings.FontScale
+	if text <= 0 {
+		text = 1
+	}
+	layout = a.settings.UIScale
+	if layout <= 0 {
+		layout = 1
+	}
+	return text * layout, layout
+}
+
+// size scales a design font size by the text size the user chose and the
+// interface zoom.
 func (a *app) size(v float32) float32 { return v * a.scale }
+
+// px scales a design layout dimension by the interface zoom alone, so the
+// text-size setting can grow type without pushing content out of the chrome,
+// while Zoom In grows the whole window together.
+func (a *app) px(v float32) float32 { return v * a.pxScale }

@@ -62,16 +62,24 @@ func (a *app) settingsDialog(c *ui.Context) {
 	p := a.p
 	ui.DialogBase(c, &a.settingsOpen, func(backdrop, panel ui.Element) {
 		backdrop.Background(p.overlayBg)
-		panel.Width(680).Height(560).Radius(16).Background(p.bg).Border(1, p.line).
+		// The panel is sized in design pixels, so at a high zoom it can outgrow
+		// a small window. Keep it inside what is on screen instead of letting
+		// the bottom and sides clip.
+		width, height := a.px(680), a.px(560)
+		if cw, ch := c.Size(); width > cw-a.px(40) || height > ch-a.px(40) {
+			width = min(width, max(cw-a.px(40), a.px(420)))
+			height = min(height, max(ch-a.px(40), a.px(320)))
+		}
+		panel.Width(width).Height(height).Radius(a.px(16)).Background(p.bg).Border(1, p.line).
 			Shadow(0, 24, 64, 0, p.shadow.Alpha(2)).Clip()
 		panel.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Scale: 0.97, Y: 6}})
 		ui.Row(c).Fill().AlignItems(ui.Stretch).Children(func() {
 			// Sections.
-			ui.Column(c).Width(180).Background(p.sidebar).BorderWidth(0, 1, 0, 0).BorderColor(p.line).Padding(18, 10).Gap(2).Children(func() {
-				ui.Text(c, "Settings").FontSize(15).FontWeight(650).TextColor(p.text).Padding(0, 10, 12, 10)
+			ui.Column(c).Width(a.px(180)).Background(p.sidebar).BorderWidth(0, 1, 0, 0).BorderColor(p.line).Padding(a.px(18), a.px(10)).Gap(a.px(2)).Children(func() {
+				ui.Text(c, "Settings").FontSize(a.size(15)).FontWeight(650).TextColor(p.text).Padding(0, a.px(10), a.px(12), a.px(10))
 				for i, name := range settingsSections {
 					i := i
-					row := ui.ButtonBase(c.Key(name)).Padding(7, 10).Radius(8).Justify(ui.Start).Label(name)
+					row := ui.ButtonBase(c.Key(name)).Padding(a.px(7), a.px(10)).Radius(a.px(8)).Justify(ui.Start).Label(name)
 					switch {
 					case a.settingsForm.section == i:
 						row.Background(p.selected)
@@ -79,7 +87,7 @@ func (a *app) settingsDialog(c *ui.Context) {
 						row.Background(p.raised)
 					}
 					row.Children(func() {
-						ui.Text(c, name).FontSize(13.5).FontWeight(map[bool]int{true: 600, false: 450}[a.settingsForm.section == i]).TextColor(p.text)
+						ui.Text(c, name).FontSize(a.size(13.5)).FontWeight(map[bool]int{true: 600, false: 450}[a.settingsForm.section == i]).TextColor(p.text)
 					})
 					if row.Clicked() {
 						a.settingsForm.section = i
@@ -88,11 +96,11 @@ func (a *app) settingsDialog(c *ui.Context) {
 			})
 			// The section.
 			ui.Column(c).Grow(1).MinWidth(0).Children(func() {
-				ui.Row(c).Padding(14, 14, 0, 0).Children(func() {
+				ui.Row(c).Padding(a.px(14), a.px(14), 0, 0).Children(func() {
 					ui.Spacer(c)
 					a.iconButton(c, iconX, "Close", func() { a.settingsOpen = false })
 				})
-				ui.Scroll(c).Grow(1).Padding(0, 28, 28, 28).Gap(22).Children(func() {
+				ui.Scroll(c).Grow(1).Padding(0, a.px(28), a.px(28), a.px(28)).Gap(a.px(22)).Children(func() {
 					switch a.settingsForm.section {
 					case 0:
 						a.agentSettings(c)
@@ -109,35 +117,35 @@ func (a *app) settingsDialog(c *ui.Context) {
 
 func (a *app) sectionTitle(c *ui.Context, title, hint string) {
 	p := a.p
-	ui.Column(c).Gap(4).Children(func() {
-		ui.Text(c, title).FontSize(17).FontWeight(650).TextColor(p.text)
+	ui.Column(c).Gap(a.px(4)).Children(func() {
+		ui.Text(c, title).FontSize(a.size(17)).FontWeight(650).TextColor(p.text)
 		if hint != "" {
-			ui.Text(c, hint).FontSize(12.5).LineHeight(1.45).TextColor(p.muted)
+			ui.Text(c, hint).FontSize(a.size(12.5)).LineHeight(1.45).TextColor(p.muted)
 		}
 	})
 }
 
 func (a *app) group(c *ui.Context, label string, fn func()) {
 	p := a.p
-	ui.Column(c.Key("group:" + label)).Gap(8).Children(func() {
+	ui.Column(c.Key("group:" + label)).Gap(a.px(8)).Children(func() {
 		if label != "" {
-			ui.Text(c, label).FontSize(11.5).FontWeight(600).TextColor(p.faint).LetterSpacing(0.3)
+			ui.Text(c, label).FontSize(a.size(11.5)).FontWeight(600).TextColor(p.faint).LetterSpacing(0.3)
 		}
-		ui.Column(c).Radius(12).Background(p.surface).Border(1, p.line).Clip().Children(fn)
+		ui.Column(c).Radius(a.px(12)).Background(p.surface).Border(1, p.line).Clip().Children(fn)
 	})
 }
 
 // field is one row of a group: a label on the left, the control on the right.
 func (a *app) field(c *ui.Context, label, hint string, control func()) {
 	p := a.p
-	ui.Row(c.Key("field:"+label)).Gap(16).Padding(12, 14).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.line).Children(func() {
-		ui.Column(c).Width(170).Gap(2).Children(func() {
-			ui.Text(c, label).FontSize(13).FontWeight(500).TextColor(p.text)
+	ui.Row(c.Key("field:"+label)).Gap(a.px(16)).Padding(a.px(12), a.px(14)).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.line).Children(func() {
+		ui.Column(c).Width(a.px(170)).Gap(a.px(2)).Children(func() {
+			ui.Text(c, label).FontSize(a.size(13)).FontWeight(500).TextColor(p.text)
 			if hint != "" {
-				ui.Text(c, hint).FontSize(11.5).LineHeight(1.4).TextColor(p.faint)
+				ui.Text(c, hint).FontSize(a.size(11.5)).LineHeight(1.4).TextColor(p.faint)
 			}
 		})
-		ui.Row(c).Grow(1).MinWidth(0).Gap(8).AlignItems(ui.Center).Children(control)
+		ui.Row(c).Grow(1).MinWidth(0).Gap(a.px(8)).AlignItems(ui.Center).Children(control)
 	})
 }
 
@@ -147,7 +155,7 @@ func (a *app) input(c *ui.Context, key string, value *string, placeholder string
 	p := a.p
 	f := &a.settingsForm
 	in := ui.TextInput(c.Key(key), value).Placeholder(placeholder).Grow(1).Label(key).
-		Background(p.bg).Border(1, p.line.Alpha(1.6)).Radius(8).Padding(6, 10).FontSize(13)
+		Background(p.bg).Border(1, p.line.Alpha(1.6)).Radius(a.px(8)).Padding(a.px(6), a.px(10)).FontSize(a.size(13))
 	if password {
 		in.Password()
 	}
@@ -187,20 +195,20 @@ func (a *app) agentSettings(c *ui.Context) {
 		for _, b := range s.Backends {
 			b := b
 			active := b.ID == s.Backend
-			row := ui.ButtonBase(c.Key("backend:"+b.ID)).Gap(12).Padding(11, 14).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.line).Label(b.Name)
+			row := ui.ButtonBase(c.Key("backend:"+b.ID)).Gap(a.px(12)).Padding(a.px(11), a.px(14)).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(p.line).Label(b.Name)
 			if active {
 				row.Background(p.accentBg)
 			} else if row.Hovered() {
 				row.Background(p.raised)
 			}
 			row.Children(func() {
-				ring := ui.Box(c).Size(16, 16).Radius(8).Border(1.5, p.line.Alpha(3)).Center()
+				ring := ui.Box(c).Size(a.px(16), a.px(16)).Radius(a.px(8)).Border(1.5, p.line.Alpha(3)).Center()
 				if active {
-					ring.Border(1.5, p.accent).Children(func() { ui.Box(c).Size(8, 8).Radius(4).Background(p.accent) })
+					ring.Border(1.5, p.accent).Children(func() { ui.Box(c).Size(a.px(8), a.px(8)).Radius(a.px(4)).Background(p.accent) })
 				}
-				ui.Column(c).Grow(1).MinWidth(0).Gap(2).Children(func() {
-					ui.Text(c, b.Name).FontSize(13.5).FontWeight(550).TextColor(p.text)
-					ui.Text(c, b.Description).SingleLine().FontSize(11.5).TextColor(p.faint)
+				ui.Column(c).Grow(1).MinWidth(0).Gap(a.px(2)).Children(func() {
+					ui.Text(c, b.Name).FontSize(a.size(13.5)).FontWeight(550).TextColor(p.text)
+					ui.Text(c, b.Description).SingleLine().FontSize(a.size(11.5)).TextColor(p.faint)
 				})
 				on := b.Enabled
 				if ui.Switch(c, &on).Label(b.Name + " on").Changed() {
@@ -240,7 +248,7 @@ func (a *app) agentSettings(c *ui.Context) {
 					if ui.Switch(c, &tls).Label("TLS").Changed() {
 						a.commit(map[string]any{"use_tls": tls})
 					}
-					ui.Text(c, "TLS").FontSize(12.5).TextColor(p.muted)
+					ui.Text(c, "TLS").FontSize(a.size(12.5)).TextColor(p.muted)
 				})
 			}
 			a.field(c, current.CredentialLabel, credentialHint(s, current.ID), func() {
@@ -251,7 +259,7 @@ func (a *app) agentSettings(c *ui.Context) {
 				if f.showSecret {
 					eye = "Hide"
 				}
-				if ui.Button(c, eye).Padding(4, 10).Clicked() {
+				if ui.Button(c, eye).Padding(a.px(4), a.px(10)).Clicked() {
 					f.showSecret = !f.showSecret
 				}
 			})
@@ -262,7 +270,7 @@ func (a *app) agentSettings(c *ui.Context) {
 					a.commit(map[string]any{"workspace": f.workspace})
 					a.do("apply_workspace", nil)
 				})
-				if ui.Button(c, "Choose…").Padding(4, 10).Clicked() {
+				if ui.Button(c, "Choose…").Padding(a.px(4), a.px(10)).Clicked() {
 					go func() {
 						paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: a.win, Title: "Choose the workspace", Directory: true})
 						if err != nil || len(paths) == 0 {
@@ -284,37 +292,37 @@ func (a *app) agentSettings(c *ui.Context) {
 				})
 			})
 		}
-		ui.Row(c).Gap(8).Padding(12, 14).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Gap(a.px(8)).Padding(a.px(12), a.px(14)).AlignItems(ui.Center).Children(func() {
 			a.statusDot(c, 8)
-			ui.Text(c, a.state.Connection.Label).SingleLine().FontSize(12.5).TextColor(p.muted).Grow(1).MinWidth(0).Tooltip(a.state.Connection.Label)
+			ui.Text(c, a.state.Connection.Label).SingleLine().FontSize(a.size(12.5)).TextColor(p.muted).Grow(1).MinWidth(0).Tooltip(a.state.Connection.Label)
 			if current.Enabled {
-				if ui.Button(c, "Reconnect").Padding(4, 12).Clicked() {
+				if ui.Button(c, "Reconnect").Padding(a.px(4), a.px(12)).Clicked() {
 					a.do("connect", nil)
 				}
-				if ui.Button(c, "Switch off").Padding(4, 12).TextColor(p.danger).Clicked() {
+				if ui.Button(c, "Switch off").Padding(a.px(4), a.px(12)).TextColor(p.danger).Clicked() {
 					a.do("disable_backend", map[string]any{"backend": current.ID})
 				}
-			} else if ui.PrimaryButton(c, "Switch on").Padding(4, 12).Clicked() {
+			} else if ui.PrimaryButton(c, "Switch on").Padding(a.px(4), a.px(12)).Clicked() {
 				a.do("enable_backend", map[string]any{"backend": current.ID})
 			}
 		})
 	})
 	if f.err != "" {
-		ui.Text(c, f.err).FontSize(12.5).TextColor(p.danger)
+		ui.Text(c, f.err).FontSize(a.size(12.5)).TextColor(p.danger)
 	}
 	if f.serverNote != "" {
-		ui.Text(c, f.serverNote).FontSize(12).TextColor(p.faint)
+		ui.Text(c, f.serverNote).FontSize(a.size(12)).TextColor(p.faint)
 	}
 	if current.Network {
-		ui.Row(c).Gap(8).Children(func() {
-			if ui.Button(c, "Forget credential").Padding(5, 12).Clicked() {
+		ui.Row(c).Gap(a.px(8)).Children(func() {
+			if ui.Button(c, "Forget credential").Padding(a.px(5), a.px(12)).Clicked() {
 				a.ask("Forget the credential?", "The saved "+strings.ToLower(current.CredentialLabel)+" for "+current.Name+" is removed from this Mac.", "Forget", true, func() {
 					f.credential = ""
 					a.do("clear_credential", nil)
 				})
 			}
 			if s.ManagedLabel != nil {
-				if ui.Button(c, "Stop "+*s.ManagedLabel).Padding(5, 12).Clicked() {
+				if ui.Button(c, "Stop "+*s.ManagedLabel).Padding(a.px(5), a.px(12)).Clicked() {
 					a.do("stop_managed_server", nil)
 				}
 			}
@@ -351,11 +359,11 @@ func (a *app) appearanceSettings(c *ui.Context) {
 	s := a.settings
 	a.sectionTitle(c, "Appearance", "")
 	a.group(c, "THEME", func() {
-		ui.Row(c).Gap(10).Padding(14).Children(func() {
+		ui.Row(c).Gap(a.px(10)).Padding(a.px(14)).Children(func() {
 			for _, mode := range s.Appearances {
 				mode := mode
 				chosen := s.Appearance == mode.ID
-				card := ui.ButtonBase(c.Key(mode.ID)).Column().AlignItems(ui.Stretch).Grow(1).Basis(0).MinWidth(0).Gap(8).Padding(8).Radius(12).Border(1.5, p.line.Alpha(1.6)).Label(mode.Name)
+				card := ui.ButtonBase(c.Key(mode.ID)).Column().AlignItems(ui.Stretch).Grow(1).Basis(0).MinWidth(0).Gap(a.px(8)).Padding(a.px(8)).Radius(a.px(12)).Border(1.5, p.line.Alpha(1.6)).Label(mode.Name)
 				if chosen {
 					card.Border(1.5, p.accent)
 				} else if card.Hovered() {
@@ -363,7 +371,7 @@ func (a *app) appearanceSettings(c *ui.Context) {
 				}
 				card.Children(func() {
 					a.themePreview(c, mode.ID)
-					ui.Text(c, mode.Name).FontSize(13).FontWeight(map[bool]int{true: 600, false: 450}[chosen]).TextColor(p.text).TextAlign(ui.Center)
+					ui.Text(c, mode.Name).FontSize(a.size(13)).FontWeight(map[bool]int{true: 600, false: 450}[chosen]).TextColor(p.text).TextAlign(ui.Center)
 				})
 				if card.Clicked() {
 					a.commit(map[string]any{"appearance": mode.ID})
@@ -372,7 +380,7 @@ func (a *app) appearanceSettings(c *ui.Context) {
 		})
 	})
 	a.group(c, "TEXT SIZE", func() {
-		ui.Column(c).Padding(14).Gap(10).Children(func() {
+		ui.Column(c).Padding(a.px(14)).Gap(a.px(10)).Children(func() {
 			index := 0
 			labels := make([]string, len(s.FontSizes))
 			for i, size := range s.FontSizes {
@@ -385,7 +393,7 @@ func (a *app) appearanceSettings(c *ui.Context) {
 			if ui.Segmented(c, &chosen, labels...).Label("Text size").Changed() && chosen != index {
 				a.commit(map[string]any{"font_size": s.FontSizes[chosen].ID})
 			}
-			ui.Text(c, "Scales the transcript, the list and the composer.").FontSize(12).TextColor(p.faint)
+			ui.Text(c, "Scales the transcript, the list and the composer.").FontSize(a.size(12)).TextColor(p.faint)
 		})
 	})
 	a.group(c, "TRANSCRIPT", func() {
@@ -402,17 +410,17 @@ func (a *app) appearanceSettings(c *ui.Context) {
 func (a *app) themePreview(c *ui.Context, mode string) {
 	light, dark := lightPalette(), darkPalette()
 	draw := func(pl palette) {
-		ui.Column(c).Grow(1).Basis(0).Background(pl.bg).Padding(8).Gap(5).Children(func() {
-			ui.Box(c).Height(6).Width(40).Radius(3).Background(pl.muted.Alpha(0.5))
-			ui.Box(c).Height(6).Radius(3).Background(pl.muted.Alpha(0.3))
+		ui.Column(c).Grow(1).Basis(0).Background(pl.bg).Padding(a.px(8)).Gap(a.px(5)).Children(func() {
+			ui.Box(c).Height(a.px(6)).Width(a.px(40)).Radius(a.px(3)).Background(pl.muted.Alpha(0.5))
+			ui.Box(c).Height(a.px(6)).Radius(a.px(3)).Background(pl.muted.Alpha(0.3))
 			ui.Row(c).Children(func() {
 				ui.Spacer(c)
-				ui.Box(c).Height(10).Width(34).Radius(5).Background(pl.userBg)
+				ui.Box(c).Height(a.px(10)).Width(a.px(34)).Radius(a.px(5)).Background(pl.userBg)
 			})
-			ui.Box(c).Height(6).Width(28).Radius(3).Background(pl.accent)
+			ui.Box(c).Height(a.px(6)).Width(a.px(28)).Radius(a.px(3)).Background(pl.accent)
 		})
 	}
-	ui.Row(c).Height(70).Radius(8).Clip().Border(1, a.p.line).Children(func() {
+	ui.Row(c).Height(a.px(70)).Radius(a.px(8)).Clip().Border(1, a.p.line).Children(func() {
 		switch mode {
 		case "light":
 			draw(light)
@@ -432,7 +440,7 @@ func (a *app) advancedSettings(c *ui.Context) {
 	a.group(c, "DIAGNOSTICS", func() {
 		a.field(c, "Debug log", s.LogPath, func() {
 			ui.Spacer(c)
-			if ui.Button(c, "Clear").Padding(4, 10).Clicked() {
+			if ui.Button(c, "Clear").Padding(a.px(4), a.px(10)).Clicked() {
 				a.do("clear_log", nil)
 				a.notice = "Log cleared."
 			}
@@ -445,14 +453,14 @@ func (a *app) advancedSettings(c *ui.Context) {
 	a.group(c, "LOCAL DATA", func() {
 		a.field(c, "Session cache", a.state.CacheSummary, func() {
 			ui.Spacer(c)
-			if ui.Button(c, "Clear cache").Padding(4, 10).TextColor(p.danger).Clicked() {
+			if ui.Button(c, "Clear cache").Padding(a.px(4), a.px(10)).TextColor(p.danger).Clicked() {
 				a.ask("Clear the local cache?", "Saved transcripts and the session list on this Mac are removed. Sessions on the backend are not touched.", "Clear", true, func() {
 					a.do("clear_cache", nil)
 				})
 			}
 		})
 	})
-	ui.Text(c, "Van-Goal "+version+" · built with MyGo").FontSize(11.5).TextColor(p.faint)
+	ui.Text(c, "Van-Goal "+version+" · built with MyGo").FontSize(a.size(11.5)).TextColor(p.faint)
 }
 
 // ------------------------------------------------------------ confirmation
@@ -470,15 +478,15 @@ func (a *app) confirmDialog(c *ui.Context) {
 	open := true
 	ui.DialogBase(c, &open, func(backdrop, panel ui.Element) {
 		backdrop.Background(p.overlayBg)
-		panel.Width(380).Padding(22).Gap(10).Radius(16).Background(p.bg).Border(1, p.line).Shadow(0, 24, 64, 0, p.shadow.Alpha(2))
+		panel.Width(a.px(380)).Padding(a.px(22)).Gap(a.px(10)).Radius(a.px(16)).Background(p.bg).Border(1, p.line).Shadow(0, 24, 64, 0, p.shadow.Alpha(2))
 		panel.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Scale: 0.96}})
-		ui.Text(c, q.title).FontSize(15.5).FontWeight(650).TextColor(p.text)
-		ui.Text(c, q.body).FontSize(13).LineHeight(1.5).TextColor(p.muted)
-		ui.Row(c).Gap(8).Justify(ui.End).Margin(10, 0, 0, 0).Children(func() {
-			if ui.Button(c, "Cancel").Padding(6, 14).Clicked() {
+		ui.Text(c, q.title).FontSize(a.size(15.5)).FontWeight(650).TextColor(p.text)
+		ui.Text(c, q.body).FontSize(a.size(13)).LineHeight(1.5).TextColor(p.muted)
+		ui.Row(c).Gap(a.px(8)).Justify(ui.End).Margin(a.px(10), 0, 0, 0).Children(func() {
+			if ui.Button(c, "Cancel").Padding(a.px(6), a.px(14)).Clicked() {
 				a.confirm = nil
 			}
-			yes := ui.PrimaryButton(c, q.action).Padding(6, 14).AutoFocus()
+			yes := ui.PrimaryButton(c, q.action).Padding(a.px(6), a.px(14)).AutoFocus()
 			if q.destructive {
 				yes.Background(p.danger)
 			}

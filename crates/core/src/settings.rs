@@ -214,6 +214,12 @@ pub struct Settings {
     /// How large every font in the interface is drawn.
     #[serde(default)]
     pub font_size: FontSize,
+    /// How much the whole interface is magnified: text, padding, controls and
+    /// chrome together. Separate from [`Self::font_size`] so text can grow on
+    /// its own without inflating everything around it. `1.0` is actual size;
+    /// [`Self::set_ui_scale`] keeps it in the range the window offers.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     #[serde(default)]
     #[serde(skip_serializing)]
     pub session_token: String,
@@ -334,6 +340,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
 /// Write a file only the current user can read. Settings hold credentials, so
 /// the mode is applied at creation time rather than fixed up afterwards.
 fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
@@ -353,12 +363,19 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 9119;
 
+/// The ends of the interface-zoom ladder. The desktop window owns the steps
+/// between them; storing a value outside them is refused here so every client
+/// agrees on what a saved setting can mean.
+pub const UI_SCALE_MIN: f32 = 0.8;
+pub const UI_SCALE_MAX: f32 = 2.0;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             backend_kind: BackendKind::Hermes,
             appearance: AppearanceMode::System,
             font_size: FontSize::default(),
+            ui_scale: 1.0,
             session_token: String::new(),
             auto_connect: true,
             selected_profile: String::new(),
@@ -377,6 +394,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Set the interface zoom, refusing a value no client could have meant:
+    /// a stale file, a NaN, or a request past either end of the ladder.
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = if scale.is_finite() {
+            scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+        } else {
+            1.0
+        };
+    }
+
     fn path() -> PathBuf {
         dirs::app_dir().join("settings.json")
     }
@@ -1101,5 +1128,22 @@ mod tests {
         assert!(!with_size(1180.0, 100.0).is_plausible(), "too short");
         assert!(!with_size(50_000.0, 760.0).is_plausible(), "absurdly wide");
         assert!(!with_size(f32::NAN, 760.0).is_plausible(), "not a number");
+    }
+
+    #[test]
+    fn interface_zoom_defaults_to_actual_size_and_stays_on_its_ladder() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.ui_scale, 1.0);
+
+        settings.set_ui_scale(1.25);
+        assert_eq!(settings.ui_scale, 1.25);
+
+        settings.set_ui_scale(9.0);
+        assert_eq!(settings.ui_scale, super::UI_SCALE_MAX);
+        settings.set_ui_scale(0.1);
+        assert_eq!(settings.ui_scale, super::UI_SCALE_MIN);
+
+        settings.set_ui_scale(f32::NAN);
+        assert_eq!(settings.ui_scale, 1.0);
     }
 }

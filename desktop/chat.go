@@ -32,9 +32,9 @@ func (a *app) chat(c *ui.Context) {
 
 func (a *app) welcome(c *ui.Context) {
 	p := a.p
-	ui.Column(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).Padding(0, 32, 40, 32).Gap(10).Children(func() {
-		mark := ui.Box(c).Size(44, 44).Radius(14).Center().Background(p.accentBg)
-		mark.Children(func() { ui.Icon(c, iconSpark).FontSize(22).TextColor(p.accent) })
+	ui.Column(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).Padding(0, a.px(32), a.px(40), a.px(32)).Gap(a.px(10)).Children(func() {
+		mark := ui.Box(c).Size(a.px(44), a.px(44)).Radius(a.px(14)).Center().Background(p.accentBg)
+		mark.Children(func() { ui.Icon(c, iconSpark).FontSize(a.size(22)).TextColor(p.accent) })
 		mark.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Scale: 0.9}})
 
 		headline := "What are we working on?"
@@ -51,18 +51,18 @@ func (a *app) welcome(c *ui.Context) {
 		case a.state.Connection.State == "connecting" || a.state.Reconnecting:
 			sub = "Connecting to " + a.backendName() + "…"
 		}
-		ui.Text(c, headline).FontSize(a.size(24)).FontWeight(600).TextColor(p.text).Margin(8, 0, 0, 0).TextAlign(ui.Center)
-		ui.Text(c, sub).FontSize(a.size(14)).TextColor(p.muted).TextAlign(ui.Center).MaxWidth(460)
+		ui.Text(c, headline).FontSize(a.size(24)).FontWeight(600).TextColor(p.text).Margin(a.px(8), 0, 0, 0).TextAlign(ui.Center)
+		ui.Text(c, sub).FontSize(a.size(14)).TextColor(p.muted).TextAlign(ui.Center).MaxWidth(a.px(460))
 		if !a.state.Backend.Enabled || (a.state.Connection.State == "failed" && !a.state.Reconnecting) {
-			ui.Row(c).Gap(8).Margin(14, 0, 0, 0).Children(func() {
+			ui.Row(c).Gap(a.px(8)).Margin(a.px(14), 0, 0, 0).Children(func() {
 				if !a.state.Backend.Enabled {
-					if ui.PrimaryButton(c, "Turn on "+a.backendName()).Radius(999).Padding(8, 16).Clicked() {
+					if ui.PrimaryButton(c, "Turn on "+a.backendName()).Radius(a.px(999)).Padding(a.px(8), a.px(16)).Clicked() {
 						a.do("connect", nil)
 					}
-				} else if ui.PrimaryButton(c, "Try again").Radius(999).Padding(8, 16).Clicked() {
+				} else if ui.PrimaryButton(c, "Try again").Radius(a.px(999)).Padding(a.px(8), a.px(16)).Clicked() {
 					a.do("connect", nil)
 				}
-				if ui.Button(c, "Settings").Radius(999).Padding(8, 16).Clicked() {
+				if ui.Button(c, "Settings").Radius(a.px(999)).Padding(a.px(8), a.px(16)).Clicked() {
 					a.openSettings()
 				}
 			})
@@ -80,24 +80,24 @@ func (a *app) transcript(c *ui.Context) {
 
 	ui.Box(c).Grow(1).MinHeight(0).Children(func() {
 		ui.List(c, &a.list, len(a.messages), func(i int) {
-			ui.Row(c).Justify(ui.Center).Padding(0, 28).Children(func() {
-				ui.Column(c).Grow(1).MaxWidth(columnWidth).MinWidth(0).Children(func() {
+			ui.Row(c).Justify(ui.Center).Padding(0, a.px(28)).Children(func() {
+				ui.Column(c).Grow(1).MaxWidth(a.px(columnWidth)).MinWidth(0).Children(func() {
 					a.message(c, i)
 				})
 			})
-		}).Fill().Padding(12, 0, 28, 0).Gap(22).Justify(ui.End)
+		}).Fill().Padding(a.px(12), 0, a.px(28), 0).Gap(a.px(22)).Justify(ui.End)
 
 		// Back to the latest, when the user scrolled up from it (and only
 		// once the list has been laid out at all).
 		if _, last := a.list.Visible(); last >= 0 && !a.list.AtEnd() {
-			jump := ui.ButtonBase(c).Size(34, 34).Radius(17).Center().Label("Jump to latest").
+			jump := ui.ButtonBase(c).Size(a.px(34), a.px(34)).Radius(a.px(17)).Center().Label("Jump to latest").
 				Background(p.surface).Border(1, p.line).Shadow(0, 4, 14, 0, p.shadow).
-				Attach(ui.AnchorBottom, ui.AnchorBottom).Bottom(14)
+				Attach(ui.AnchorBottom, ui.AnchorBottom).Bottom(a.px(14))
 			jump.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Y: 8}, Exit: &ui.Motion{Opacity: 0, Y: 8}})
 			if jump.Hovered() {
 				jump.Background(p.raised)
 			}
-			jump.Children(func() { ui.Icon(c, iconArrowDown).FontSize(16).TextColor(p.muted) })
+			jump.Children(func() { ui.Icon(c, iconArrowDown).FontSize(a.size(16)).TextColor(p.muted) })
 			if jump.Clicked() {
 				a.list.ScrollToEnd()
 			}
@@ -113,15 +113,15 @@ func (a *app) message(c *ui.Context, i int) {
 	case "assistant":
 		a.assistantMessage(c, i, m)
 	default:
-		ui.Text(c, m.Content).Selectable().FontSize(a.size(12.5)).TextColor(a.p.muted).TextAlign(ui.Center).Padding(4, 0)
+		ui.Text(c, m.Content).Selectable().FontSize(a.size(12.5)).TextColor(a.p.muted).TextAlign(ui.Center).Padding(a.px(4), 0)
 	}
 }
 
 func (a *app) userMessage(c *ui.Context, m bridge.Message) {
 	p := a.p
-	ui.Column(c).AlignItems(ui.End).Gap(6).Children(func() {
+	ui.Column(c).AlignItems(ui.End).Gap(a.px(6)).Children(func() {
 		if len(m.Attachments) > 0 {
-			ui.Row(c).Gap(6).Wrap().Justify(ui.End).Children(func() {
+			ui.Row(c).Gap(a.px(6)).Wrap().Justify(ui.End).Children(func() {
 				for _, at := range m.Attachments {
 					a.fileChip(c, at.Name, at.Path, nil)
 				}
@@ -129,7 +129,7 @@ func (a *app) userMessage(c *ui.Context, m bridge.Message) {
 		}
 		if strings.TrimSpace(m.Content) != "" {
 			ui.Text(c, m.Content).Selectable().FontSize(a.size(15)).LineHeight(1.55).TextColor(p.text).
-				Padding(10, 15).Radius(18, 18, 6, 18).Background(p.userBg).MaxWidth(columnWidth * 0.78).
+				Padding(a.px(10), a.px(15)).Radius(a.px(18), a.px(18), a.px(6), a.px(18)).Background(p.userBg).MaxWidth(a.px(columnWidth * 0.78)).
 				SelectionColor(p.accent.Alpha(0.28))
 		}
 	})
@@ -137,7 +137,7 @@ func (a *app) userMessage(c *ui.Context, m bridge.Message) {
 
 func (a *app) assistantMessage(c *ui.Context, i int, m bridge.Message) {
 	last := i == len(a.messages)-1
-	ui.Column(c).Gap(10).Children(func() {
+	ui.Column(c).Gap(a.px(10)).Children(func() {
 		if len(m.Tools) > 0 && a.settings.ShowToolCalls {
 			a.toolGroup(c, m)
 		}
@@ -164,10 +164,10 @@ func (a *app) assistantMessage(c *ui.Context, i int, m bridge.Message) {
 // dots breathing, and how long it has been.
 func (a *app) thinking(c *ui.Context, m bridge.Message) {
 	p := a.p
-	ui.Row(c).Gap(10).AlignItems(ui.Center).Padding(4, 0).Children(func() {
-		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Gap(a.px(10)).AlignItems(ui.Center).Padding(a.px(4), 0).Children(func() {
+		ui.Row(c).Gap(a.px(5)).AlignItems(ui.Center).Children(func() {
 			for k := 0; k < 3; k++ {
-				dot := ui.Box(c.Key(k)).Size(6, 6).Radius(3).Background(p.muted)
+				dot := ui.Box(c.Key(k)).Size(a.px(6), a.px(6)).Radius(a.px(3)).Background(p.muted)
 				phase := dot.Loop("breathe", 1200*time.Millisecond, ui.Linear)
 				x := math.Mod(float64(phase)+1-float64(k)*0.16, 1)
 				dot.Opacity(float32(0.25 + 0.75*math.Pow(math.Sin(x*math.Pi), 2)))
@@ -187,8 +187,8 @@ func (a *app) thinking(c *ui.Context, m bridge.Message) {
 
 func (a *app) errorCard(c *ui.Context, text string) {
 	p := a.p
-	ui.Row(c).Gap(10).AlignItems(ui.Start).Padding(10, 14).Radius(12).Background(p.danger.Alpha(0.08)).Border(1, p.danger.Alpha(0.22)).Children(func() {
-		ui.Icon(c, iconWarn).FontSize(a.size(16)).TextColor(p.danger).Margin(2, 0, 0, 0)
+	ui.Row(c).Gap(a.px(10)).AlignItems(ui.Start).Padding(a.px(10), a.px(14)).Radius(a.px(12)).Background(p.danger.Alpha(0.08)).Border(1, p.danger.Alpha(0.22)).Children(func() {
+		ui.Icon(c, iconWarn).FontSize(a.size(16)).TextColor(p.danger).Margin(a.px(2), 0, 0, 0)
 		ui.Text(c, text).Selectable().FontSize(a.size(13.5)).LineHeight(1.5).TextColor(p.text).Grow(1).MinWidth(0)
 	})
 }
@@ -198,10 +198,10 @@ func (a *app) errorCard(c *ui.Context, text string) {
 // transcript reads as text rather than as a row of buttons.
 func (a *app) messageActions(c *ui.Context, m bridge.Message, last bool) {
 	p := a.p
-	row := ui.Row(c).Gap(4).AlignItems(ui.Center).Height(26).Margin(-4, 0, 0, -6)
+	row := ui.Row(c).Gap(a.px(4)).AlignItems(ui.Center).Height(a.px(26)).Margin(a.px(-4), 0, 0, a.px(-6))
 	row.Children(func() {
 		copied := time.Since(a.copied[m.ID]) < 1500*time.Millisecond
-		b := ui.ButtonBase(c).Size(26, 26).Radius(6).Center().Label("Copy").Tooltip("Copy")
+		b := ui.ButtonBase(c).Size(a.px(26), a.px(26)).Radius(a.px(6)).Center().Label("Copy").Tooltip("Copy")
 		if b.Hovered() {
 			b.Background(p.raised)
 		}
@@ -220,7 +220,7 @@ func (a *app) messageActions(c *ui.Context, m bridge.Message, last bool) {
 		if m.CompletedAt != nil && *m.CompletedAt > m.Timestamp {
 			secs := *m.CompletedAt - m.Timestamp
 			if secs >= 1 && secs < 36000 {
-				ui.Text(c, duration(secs)).FontSize(a.size(11.5)).TextColor(p.faint).Padding(0, 4)
+				ui.Text(c, duration(secs)).FontSize(a.size(11.5)).TextColor(p.faint).Padding(0, a.px(4))
 			}
 		}
 	})
@@ -235,14 +235,14 @@ func (a *app) toolGroup(c *ui.Context, m bridge.Message) {
 	p := a.p
 	open := a.expanded[m.ID]
 	running := m.Streaming && strings.TrimSpace(m.Content) == ""
-	ui.Column(c.Key("tools:" + m.ID)).Gap(6).Children(func() {
-		head := ui.ButtonBase(c).AlignSelf(ui.Start).Padding(6, 12, 6, 10).Radius(999).Gap(8).AlignItems(ui.Center).Background(p.codeBg).Border(1, p.line).Label("Tool calls")
+	ui.Column(c.Key("tools:" + m.ID)).Gap(a.px(6)).Children(func() {
+		head := ui.ButtonBase(c).AlignSelf(ui.Start).Padding(a.px(6), a.px(12), a.px(6), a.px(10)).Radius(a.px(999)).Gap(a.px(8)).AlignItems(ui.Center).Background(p.codeBg).Border(1, p.line).Label("Tool calls")
 		if head.Hovered() {
 			head.Background(p.raised)
 		}
 		head.Children(func() {
 			if running {
-				ui.Spinner(c).Size(12, 12)
+				ui.Spinner(c).Size(a.px(12), a.px(12))
 			} else {
 				ui.Icon(c, iconWrench).FontSize(a.size(13)).TextColor(p.muted)
 			}
@@ -262,7 +262,7 @@ func (a *app) toolGroup(c *ui.Context, m bridge.Message) {
 			a.expanded[m.ID] = !open
 		}
 		if open {
-			ui.Column(c).Gap(6).Padding(0, 0, 0, 12).BorderWidth(0, 0, 0, 2).BorderColor(p.line.Alpha(1.6)).
+			ui.Column(c).Gap(a.px(6)).Padding(0, 0, 0, a.px(12)).BorderWidth(0, 0, 0, 2).BorderColor(p.line.Alpha(1.6)).
 				Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Collapse: true}, Exit: &ui.Motion{Opacity: 0, Collapse: true}}).
 				Children(func() {
 					shown := m.Tools
@@ -282,13 +282,13 @@ func (a *app) toolCall(c *ui.Context, t bridge.Tool) {
 	p := a.p
 	key := "tool:" + t.ID + t.Status
 	open := a.expanded[key]
-	ui.Column(c.Key(key)).Gap(4).Children(func() {
-		head := ui.ButtonBase(c).Gap(8).AlignItems(ui.Center).Padding(3, 4).Radius(6).Label(t.Name)
+	ui.Column(c.Key(key)).Gap(a.px(4)).Children(func() {
+		head := ui.ButtonBase(c).Gap(a.px(8)).AlignItems(ui.Center).Padding(a.px(3), a.px(4)).Radius(a.px(6)).Label(t.Name)
 		if head.Hovered() {
 			head.Background(p.raised)
 		}
 		head.Children(func() {
-			ui.Box(c).Size(6, 6).Radius(3).Background(toolStatusColor(p, t.Status))
+			ui.Box(c).Size(a.px(6), a.px(6)).Radius(a.px(3)).Background(toolStatusColor(p, t.Status))
 			ui.Text(c, t.Name).SingleLine().FontSize(a.size(12.5)).FontWeight(500).TextColor(p.text).Font(monoFont())
 			if t.Status != "" {
 				ui.Text(c, t.Status).SingleLine().FontSize(a.size(11.5)).TextColor(p.faint)
@@ -302,8 +302,8 @@ func (a *app) toolCall(c *ui.Context, t bridge.Tool) {
 			if t.Truncated {
 				detail += "\n…"
 			}
-			ui.Scroll(c).MaxHeight(260).Radius(8).Background(p.codeBg).Border(1, p.line).Children(func() {
-				ui.Text(c, detail).Selectable().NoWrap().Font(monoFont()).FontSize(a.size(12)).LineHeight(1.45).TextColor(p.muted).Padding(10, 12)
+			ui.Scroll(c).MaxHeight(a.px(260)).Radius(a.px(8)).Background(p.codeBg).Border(1, p.line).Children(func() {
+				ui.Text(c, detail).Selectable().NoWrap().Font(monoFont()).FontSize(a.size(12)).LineHeight(1.45).TextColor(p.muted).Padding(a.px(10), a.px(12))
 			})
 		}
 	})
@@ -323,8 +323,8 @@ func toolStatusColor(p palette, status string) ui.Color {
 // ---------------------------------------------------------------- composer
 
 func (a *app) composerArea(c *ui.Context) {
-	ui.Row(c).Justify(ui.Center).Padding(0, 28, 18, 28).Children(func() {
-		ui.Column(c).Grow(1).MaxWidth(columnWidth).Gap(8).Children(func() {
+	ui.Row(c).Justify(ui.Center).Padding(0, a.px(28), a.px(18), a.px(28)).Children(func() {
+		ui.Column(c).Grow(1).MaxWidth(a.px(columnWidth)).Gap(a.px(8)).Children(func() {
 			if a.state.Clarify != nil {
 				a.clarifyCard(c)
 			}
@@ -340,8 +340,8 @@ func (a *app) composerArea(c *ui.Context) {
 func (a *app) composer(c *ui.Context) {
 	p := a.p
 	s := a.state
-	box := ui.Column(c).Radius(18).Background(p.surface).Border(1, p.line.Alpha(1.4)).
-		Shadow(0, 6, 24, 0, p.shadow).Shadow(0, 1, 2, 0, p.shadow.Alpha(0.6)).Padding(6, 6, 6, 6)
+	box := ui.Column(c).Radius(a.px(18)).Background(p.surface).Border(1, p.line.Alpha(1.4)).
+		Shadow(0, 6, 24, 0, p.shadow).Shadow(0, 1, 2, 0, p.shadow.Alpha(0.6)).Padding(a.px(6), a.px(6), a.px(6), a.px(6))
 	files := box.DroppedFiles()
 	if len(files) > 0 {
 		a.attachments = mergePaths(a.attachments, files)
@@ -351,7 +351,7 @@ func (a *app) composer(c *ui.Context) {
 	}
 	box.Children(func() {
 		if len(a.attachments) > 0 {
-			ui.Row(c).Gap(6).Wrap().Padding(6, 8, 2, 8).Children(func() {
+			ui.Row(c).Gap(a.px(6)).Wrap().Padding(a.px(6), a.px(8), a.px(2), a.px(8)).Children(func() {
 				for _, path := range a.attachments {
 					path := path
 					a.fileChip(c, filepath.Base(path), path, func() {
@@ -374,7 +374,7 @@ func (a *app) composer(c *ui.Context) {
 			placeholder = "Queue a follow-up…"
 		}
 		in := ui.TextArea(c.Key("composer"), &a.draft).Lines(1, 10).Placeholder(placeholder).Label("Message").
-			Background(ui.Transparent).Border(0, ui.Transparent).Padding(10, 12, 6, 12).
+			Background(ui.Transparent).Border(0, ui.Transparent).Padding(a.px(10), a.px(12), a.px(6), a.px(12)).
 			FontSize(a.size(15)).LineHeight(1.5).FocusRing(false)
 		in.OnTextKey(func(k ui.TextKey) bool {
 			if k.Key == ui.KeyEnter && k.Mods == 0 {
@@ -392,7 +392,7 @@ func (a *app) composer(c *ui.Context) {
 			a.focusDraft = false
 		}
 
-		ui.Row(c).Gap(4).AlignItems(ui.Center).Padding(2, 4, 2, 6).Children(func() {
+		ui.Row(c).Gap(a.px(4)).AlignItems(ui.Center).Padding(a.px(2), a.px(4), a.px(2), a.px(6)).Children(func() {
 			a.iconButton(c, iconPaperclip, "Attach files", a.pickFiles)
 			if s.Backend.Caps.Permissions {
 				a.permissionPicker(c)
@@ -417,7 +417,7 @@ func (a *app) sendButton(c *ui.Context) {
 	} else if s.Sending && s.Clarify == nil {
 		label = "Queue"
 	}
-	b := ui.ButtonBase(c.Key("send")).Size(34, 34).Radius(17).Center().Label(label).Tooltip(map[string]string{
+	b := ui.ButtonBase(c.Key("send")).Size(a.px(34), a.px(34)).Radius(a.px(17)).Center().Label(label).Tooltip(map[string]string{
 		"Send": "Send  ↩", "Stop": "Stop  esc", "Queue": "Queue after this reply  ↩",
 	}[label])
 	switch {
@@ -434,13 +434,13 @@ func (a *app) sendButton(c *ui.Context) {
 	b.Transition(ui.ElementTransition{Colors: true, Duration: 140 * time.Millisecond})
 	b.Children(func() {
 		if stop {
-			ui.Icon(c, iconStop).FontSize(14).TextColor(p.bg)
+			ui.Icon(c, iconStop).FontSize(a.size(14)).TextColor(p.bg)
 		} else {
 			color := ui.Hex("#ffffff")
 			if !ready {
 				color = p.faint
 			}
-			ui.Icon(c, iconArrowUp).FontSize(17).TextColor(color)
+			ui.Icon(c, iconArrowUp).FontSize(a.size(17)).TextColor(color)
 		}
 	})
 	if b.Clicked() {
@@ -480,17 +480,17 @@ func (a *app) pickFiles() {
 
 func (a *app) fileChip(c *ui.Context, name, path string, remove func()) {
 	p := a.p
-	chip := ui.Row(c.Key("chip:"+path)).Gap(6).AlignItems(ui.Center).Padding(4, 8, 4, 8).Radius(8).Background(p.codeBg).Border(1, p.line).Tooltip(path)
+	chip := ui.Row(c.Key("chip:"+path)).Gap(a.px(6)).AlignItems(ui.Center).Padding(a.px(4), a.px(8), a.px(4), a.px(8)).Radius(a.px(8)).Background(p.codeBg).Border(1, p.line).Tooltip(path)
 	chip.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Scale: 0.92}})
 	chip.Children(func() {
 		ui.Icon(c, iconFile).FontSize(a.size(13)).TextColor(p.muted)
-		ui.Text(c, name).SingleLine().MaxWidth(180).FontSize(a.size(12.5)).TextColor(p.text)
+		ui.Text(c, name).SingleLine().MaxWidth(a.px(180)).FontSize(a.size(12.5)).TextColor(p.text)
 		if remove != nil {
-			x := ui.ButtonBase(c).Size(16, 16).Radius(8).Center().Label("Remove " + name)
+			x := ui.ButtonBase(c).Size(a.px(16), a.px(16)).Radius(a.px(8)).Center().Label("Remove " + name)
 			if x.Hovered() {
 				x.Background(p.raised)
 			}
-			x.Children(func() { ui.Icon(c, iconX).FontSize(11).TextColor(p.muted) })
+			x.Children(func() { ui.Icon(c, iconX).FontSize(a.size(11)).TextColor(p.muted) })
 			if x.Clicked() {
 				remove()
 			}
@@ -503,7 +503,7 @@ func (a *app) fileChip(c *ui.Context, name, path string, remove func()) {
 func (a *app) footnote(c *ui.Context) {
 	p := a.p
 	s := a.state
-	ui.Row(c).Height(18).Justify(ui.Center).AlignItems(ui.Center).Gap(6).Children(func() {
+	ui.Row(c).Height(a.px(18)).Justify(ui.Center).AlignItems(ui.Center).Gap(a.px(6)).Children(func() {
 		switch {
 		case s.Error != nil && *s.Error != "":
 			ui.Icon(c, iconWarn).FontSize(a.size(12)).TextColor(p.warn)
@@ -519,23 +519,23 @@ func (a *app) footnote(c *ui.Context) {
 func (a *app) clarifyCard(c *ui.Context) {
 	p := a.p
 	q := a.state.Clarify
-	card := ui.Column(c.Key("clarify")).Gap(10).Padding(14, 16).Radius(14).Background(p.accentBg).Border(1, p.accent.Alpha(0.3))
+	card := ui.Column(c.Key("clarify")).Gap(a.px(10)).Padding(a.px(14), a.px(16)).Radius(a.px(14)).Background(p.accentBg).Border(1, p.accent.Alpha(0.3))
 	card.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Y: 8}, Exit: &ui.Motion{Opacity: 0, Y: 8}})
 	card.Children(func() {
-		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Gap(a.px(8)).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, iconQuestion).FontSize(a.size(15)).TextColor(p.accent)
 			ui.Text(c, a.backendName()+" is asking").FontSize(a.size(12)).FontWeight(600).TextColor(p.accent)
 			ui.Spacer(c)
-			if ui.Button(c, "Skip").Padding(3, 10).Clicked() {
+			if ui.Button(c, "Skip").Padding(a.px(3), a.px(10)).Clicked() {
 				a.do("skip_question", nil)
 			}
 		})
 		ui.Text(c, q.Question).Selectable().FontSize(a.size(14.5)).LineHeight(1.5).TextColor(p.text)
 		if len(q.Choices) > 0 {
-			ui.Row(c).Gap(8).Wrap().Children(func() {
+			ui.Row(c).Gap(a.px(8)).Wrap().Children(func() {
 				for i, choice := range q.Choices {
 					choice := choice
-					b := ui.ButtonBase(c.Key(i)).Padding(6, 12).Radius(999).Background(p.surface).Border(1, p.line.Alpha(1.6)).Gap(6).AlignItems(ui.Center).Label(choice)
+					b := ui.ButtonBase(c.Key(i)).Padding(a.px(6), a.px(12)).Radius(a.px(999)).Background(p.surface).Border(1, p.line.Alpha(1.6)).Gap(a.px(6)).AlignItems(ui.Center).Label(choice)
 					if b.Hovered() {
 						b.Border(1, p.accent)
 					}
@@ -554,10 +554,10 @@ func (a *app) clarifyCard(c *ui.Context) {
 
 func (a *app) queue(c *ui.Context) {
 	p := a.p
-	ui.Column(c.Key("queue")).Gap(2).Padding(6).Radius(14).Background(p.surface).Border(1, p.line).Children(func() {
+	ui.Column(c.Key("queue")).Gap(a.px(2)).Padding(a.px(6)).Radius(a.px(14)).Background(p.surface).Border(1, p.line).Children(func() {
 		for _, item := range a.state.Queue {
 			item := item
-			row := ui.Row(c.Key(item.ID)).Gap(8).AlignItems(ui.Center).Padding(6, 8).Radius(9)
+			row := ui.Row(c.Key(item.ID)).Gap(a.px(8)).AlignItems(ui.Center).Padding(a.px(6), a.px(8)).Radius(a.px(9))
 			row.Transition(ui.ElementTransition{Enter: &ui.Motion{Opacity: 0, Collapse: true}, Exit: &ui.Motion{Opacity: 0, Collapse: true}})
 			if row.Hovered() {
 				row.Background(p.raised)
@@ -571,18 +571,18 @@ func (a *app) queue(c *ui.Context) {
 				}
 				ui.Text(c, text).SingleLine().FontSize(a.size(13)).TextColor(p.text).Grow(1).MinWidth(0)
 				if hovered {
-					if ui.Button(c, "Send now").Padding(2, 8).Clicked() {
+					if ui.Button(c, "Send now").Padding(a.px(2), a.px(8)).Clicked() {
 						a.do("queue_send_now", map[string]any{"id": item.ID})
 					}
-					if ui.Button(c, "Edit").Padding(2, 8).Clicked() {
+					if ui.Button(c, "Edit").Padding(a.px(2), a.px(8)).Clicked() {
 						a.do("queue_edit", map[string]any{"id": item.ID})
 					}
 				}
-				x := ui.ButtonBase(c).Size(22, 22).Radius(6).Center().Label("Remove from queue")
+				x := ui.ButtonBase(c).Size(a.px(22), a.px(22)).Radius(a.px(6)).Center().Label("Remove from queue")
 				if x.Hovered() {
 					x.Background(p.selected)
 				}
-				x.Children(func() { ui.Icon(c, iconX).FontSize(12).TextColor(p.muted) })
+				x.Children(func() { ui.Icon(c, iconX).FontSize(a.size(12)).TextColor(p.muted) })
 				if x.Clicked() {
 					a.do("queue_cancel", map[string]any{"id": item.ID})
 				}
@@ -603,12 +603,12 @@ func (a *app) modelPicker(c *ui.Context) {
 	if m.Switching {
 		label = "Switching…"
 	}
-	b := ui.ButtonBase(c.Key("model")).Padding(5, 10).Radius(8).Gap(5).AlignItems(ui.Center).Label("Model")
+	b := ui.ButtonBase(c.Key("model")).Padding(a.px(5), a.px(10)).Radius(a.px(8)).Gap(a.px(5)).AlignItems(ui.Center).Label("Model").MinWidth(0).Shrink(1)
 	if b.Hovered() {
 		b.Background(p.raised)
 	}
 	b.Children(func() {
-		ui.Text(c, label).SingleLine().MaxWidth(220).FontSize(a.size(12.5)).TextColor(p.muted)
+		ui.Text(c, label).SingleLine().MaxWidth(a.px(220)).MinWidth(0).FontSize(a.size(12.5)).TextColor(p.muted)
 		ui.Icon(c, iconChevDown).FontSize(a.size(12)).TextColor(p.faint)
 	})
 	b.Menu(func(menu *ui.Menu) {
@@ -633,13 +633,13 @@ func (a *app) permissionPicker(c *ui.Context) {
 	if perm.Changing {
 		label += "…"
 	}
-	b := ui.ButtonBase(c.Key("perm")).Padding(5, 10).Radius(8).Gap(6).AlignItems(ui.Center).Label("Permissions")
+	b := ui.ButtonBase(c.Key("perm")).Padding(a.px(5), a.px(10)).Radius(a.px(8)).Gap(a.px(6)).AlignItems(ui.Center).Label("Permissions")
 	if b.Hovered() {
 		b.Background(p.raised)
 	}
 	b.Children(func() {
 		ui.Icon(c, iconShield).FontSize(a.size(13)).TextColor(p.muted)
-		ui.Text(c, label).FontSize(a.size(12.5)).TextColor(p.muted)
+		ui.Text(c, label).SingleLine().FontSize(a.size(12.5)).TextColor(p.muted)
 	})
 	b.Menu(func(menu *ui.Menu) {
 		for _, opt := range []struct{ id, label string }{{"full", "Full access"}, {"ask", "Ask first"}, {"restricted", "Restricted"}} {

@@ -212,6 +212,9 @@ fn set(shared: &Arc<Shared>, value: &Value) -> Result<()> {
         settings.font_size =
             FontSize::from_id(id).ok_or_else(|| anyhow!("unknown font size {id:?}"))?;
     }
+    if let Some(scale) = value.get("ui_scale").and_then(Value::as_f64) {
+        settings.set_ui_scale(scale as f32);
+    }
     if let Some(host) = value.get("host").and_then(Value::as_str) {
         settings.backend_host = host.trim().to_string();
     }
