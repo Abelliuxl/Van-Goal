@@ -16,7 +16,8 @@ enum Backend {
   hermes('hermes', 'Hermes', 9119, false),
   opencode('opencode', 'OpenCode', 4096, false),
   mimocode('mimocode', 'MiMoCode', 4096, false),
-  openclaw('openclaw', 'OpenClaw', 18789, true);
+  openclaw('openclaw', 'OpenClaw', 18789, true),
+  xuexiaomi('xuexiaomi', '雪小米', 443, true);
 
   const Backend(this.id, this.label, this.defaultPort, this.prefersTls);
 
@@ -144,7 +145,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   String workspace = '';
 
   FontSize fontSize = FontSize.normal;
-  bool showToolCalls = true;
 
   List<SessionSummary> sessions = const [];
   List<Message> messages = const [];
@@ -283,12 +283,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     fontSize = size;
     notifyListeners();
     _core.send({'cmd': 'set_ui', 'font_size': size.id});
-  }
-
-  void setShowToolCalls(bool show) {
-    showToolCalls = show;
-    notifyListeners();
-    _core.send({'cmd': 'set_ui', 'show_tool_calls': show});
   }
 
   void dismissError() {
@@ -449,7 +443,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     credential = (event['credential'] as String?) ?? credential;
     workspace = (event['workspace'] as String?) ?? workspace;
     fontSize = FontSize.fromId(event['font_size'] as String?);
-    showToolCalls = (event['show_tool_calls'] as bool?) ?? showToolCalls;
   }
 
   /// Text that streamed further within the message that is already on screen.

@@ -34,11 +34,12 @@ void main() {
     expect(Backend.fromId('claudecode'), Backend.openclaw);
   });
 
-  test('only OpenClaw expects TLS by default', () {
-    // It is the one backend normally reached over the public internet; the
-    // others default to a loopback server.
+  test('OpenClaw and XueXiaoMi expect TLS by default', () {
+    // Both are normally reached over the public internet rather than a
+    // loopback server, so HTTPS/WSS is the sane default for them.
+    const tlsByDefault = {Backend.openclaw, Backend.xuexiaomi};
     for (final backend in Backend.values) {
-      expect(backend.prefersTls, backend == Backend.openclaw);
+      expect(backend.prefersTls, tlsByDefault.contains(backend));
     }
   });
 }

@@ -968,9 +968,11 @@ fn parse_kind(id: &str) -> Result<BackendKind> {
         "opencode" => Ok(BackendKind::OpenCode),
         "mimocode" => Ok(BackendKind::MiMoCode),
         "openclaw" => Ok(BackendKind::OpenClaw),
-        other => Err(anyhow!(
-            "{other} runs as a local process and is not available on mobile"
+        "xuexiaomi" => Ok(BackendKind::XueXiaoMi),
+        "codex" | "claudecode" | "pi" => Err(anyhow!(
+            "{id} runs as a local process and is not available on mobile"
         )),
+        other => Err(anyhow!("unknown backend {other}")),
     }
 }
 
@@ -1235,7 +1237,7 @@ mod tests {
     /// on, so they are rejected at the edge.
     #[test]
     fn only_the_network_backends_are_offered_on_mobile() {
-        for id in ["hermes", "opencode", "mimocode", "openclaw"] {
+        for id in ["hermes", "opencode", "mimocode", "openclaw", "xuexiaomi"] {
             assert!(parse_kind(id).is_ok(), "{id} should be available");
         }
         for id in ["codex", "claudecode", "pi"] {
