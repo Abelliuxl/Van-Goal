@@ -15,20 +15,22 @@ and what is the smallest thing the client can do to show it faithfully".
 
 ```
 crates/core        no UI of any kind — protocols, models, settings, markdown
-crates/desktop     the macOS + Windows client (GPUI) ─┐
-crates/mobile      the C ABI a phone links against   ├─ two consumers of core
-app/               the Flutter client                 ─┘
+crates/desktop     the C ABI the desktop window loads    ─┐
+desktop/           the desktop window (Go, MyGo)          │
+crates/mobile      the C ABI a phone links against       ├─ two consumers of core
+app/               the Flutter client                     ─┘
 ```
 
 | Crate | What it owns |
 | --- | --- |
-| `core::agent` | The seven adapters (Hermes, OpenCode, MiMoCode, Codex CLI, Claude Code, Pi, OpenClaw) behind one `Backend` facade, plus the rules they all share |
+| `core::agent` | The eight adapters (Hermes, OpenCode, MiMoCode, Codex CLI, Claude Code, Pi, OpenClaw, 雪小米) behind one `Backend` facade, plus the rules they all share |
 | `core::models` | `AgentEvent` (what an adapter emits) and `ChatMessage` / `AgentSession` (what a frontend draws) |
 | `core::chat` | `Conversation`, the folding of events into a message list, and the stream merging that keeps a two-stream reply from interleaving |
 | `core::markdown` | The block and inline parser both renderers use |
 | `core::settings` / `cache` / `secret_store` | Everything that survives a restart, in one app-data directory |
 | `core::jsonl_process` / `local_server` | Subprocess backends, and the managed local servers (`hermes serve`, `mimo serve`) |
-| `crates/desktop` | Windows, menus, GPUI views, the desktop window's own state |
+| `crates/desktop` | The desktop's C ABI (`vgd_command` / `vgd_wait` / `vgd_poll` / `vgd_free`): connection and reconnect loop, which session is on screen, where a prompt goes, the message list |
+| `desktop/` | The window, in Go: MyGo native UI, menus, the draft being typed. Loads the core through purego, without cgo |
 | `crates/mobile` | The C ABI, and the connection/reconnect/parking logic a phone needs |
 | `app` | Widgets. Dart folds no events and owns no message list |
 
@@ -80,11 +82,14 @@ have a second one and it produced one "Thinking…" bubble per event. The deskto
 
 ## Threading
 
-GPUI owns the main-thread UI executor on the desktop; a multi-threaded tokio
-runtime is installed as a GPUI global, every backend operation runs on it, and
-results are marshalled back onto the UI through entities. Backend events arrive
-on a single `futures::channel::mpsc` channel and are pumped into the state
-machine.
+On the desktop the core owns a multi-threaded tokio runtime; every backend
+operation runs on it, and the state sits behind one `std::sync::Mutex` that is
+never held across an `.await` — an async result locks again to apply itself,
+after checking it still belongs to the view that asked for it. Each event
+stream gets a channel and an epoch of its own, so a stream that was replaced
+cannot change the state. The Go side waits in `vgd_wait` on a goroutine, polls
+what changed (the small state, the messages only when their structure changed,
+deltas otherwise) and hands it to MyGo's main thread with `Window.Update`.
 
 The mobile bridge owns its own two-worker tokio runtime, because Dart has
 neither. Every `vg_` call returns immediately; a command is queued onto the

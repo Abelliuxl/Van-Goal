@@ -1,47 +1,27 @@
 [package]
-name = "van-goal"
-description = "Van-Goal — a native desktop client for local and remote coding agents, built with GPUI"
+name = "van-goal-desktop"
+description = "C ABI over van-goal-core for the MyGo desktop client: owns the connection, the session state machine and the message list, so the Go side only draws."
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "VanGoal"
-path = "src/main.rs"
+[lib]
+name = "van_goal_desktop"
+# `cdylib` is what the Go client loads (libvan_goal_desktop.dylib / .dll);
+# `lib` keeps the crate usable from Rust tests.
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 van-goal-core = { path = "../core" }
 
-gpui.workspace = true
 tokio.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
-
-# Native open panel for composer attachments.
-rfd.workspace = true
-# Grapheme segmentation for the composer's cursor movement.
-unicode-segmentation.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-# Windows-only system-tray support. Keeping this target-specific prevents any
-# tray code or Windows dependencies from entering the macOS and mobile builds.
-tray-icon = "0.25.1"
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(windows)'.build-dependencies]
-# Embed the Van-Goal icon in VanGoal.exe so Explorer and the taskbar do not use
-# the generic executable icon.
-winresource = "0.1.31"
 
 [dev-dependencies]
 # See the `testing` feature in crates/core: it keeps the test suite off the
 # developer's real app-data directory.
 van-goal-core = { path = "../core", features = ["testing"] }
-# `test-support` exposes gpui's TestAppContext/TestPlatform so the editor's
-# EntityInputHandler (macOS IME) paths can be driven in unit tests.
-gpui = { workspace = true, features = ["test-support"] }

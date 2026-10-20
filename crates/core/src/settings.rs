@@ -101,10 +101,11 @@ pub enum BackendKind {
     Pi,
     OpenClaw,
     MiMoCode,
+    XueXiaoMi,
 }
 
 impl BackendKind {
-    pub const ALL: [BackendKind; 7] = [
+    pub const ALL: [BackendKind; 8] = [
         BackendKind::Hermes,
         BackendKind::OpenCode,
         BackendKind::MiMoCode,
@@ -112,6 +113,7 @@ impl BackendKind {
         BackendKind::ClaudeCode,
         BackendKind::Pi,
         BackendKind::OpenClaw,
+        BackendKind::XueXiaoMi,
     ];
 
     pub fn id(&self) -> &'static str {
@@ -123,6 +125,7 @@ impl BackendKind {
             BackendKind::Pi => "pi",
             BackendKind::OpenClaw => "openclaw",
             BackendKind::MiMoCode => "mimocode",
+            BackendKind::XueXiaoMi => "xuexiaomi",
         }
     }
 
@@ -135,6 +138,7 @@ impl BackendKind {
             BackendKind::Pi => "Pi",
             BackendKind::OpenClaw => "OpenClaw",
             BackendKind::MiMoCode => "MiMoCode",
+            BackendKind::XueXiaoMi => "雪小米",
         }
     }
 
@@ -143,6 +147,7 @@ impl BackendKind {
             BackendKind::Hermes => 9119,
             BackendKind::OpenCode | BackendKind::MiMoCode => 4096,
             BackendKind::OpenClaw => 18789,
+            BackendKind::XueXiaoMi => 443,
             BackendKind::Codex | BackendKind::ClaudeCode | BackendKind::Pi => 0,
         }
     }
@@ -154,6 +159,7 @@ impl BackendKind {
                 | BackendKind::OpenCode
                 | BackendKind::OpenClaw
                 | BackendKind::MiMoCode
+                | BackendKind::XueXiaoMi
         )
     }
 
@@ -170,13 +176,16 @@ impl BackendKind {
             BackendKind::Codex => "Runs codex app-server locally using its JSON-RPC protocol.",
             BackendKind::ClaudeCode => "Runs Claude Code locally using bidirectional stream-json.",
             BackendKind::Pi => "Runs Pi locally in RPC mode over JSONL.",
+            BackendKind::XueXiaoMi => {
+                "Connects to the 雪小米 gateway over HTTPS, with its WeChat, Feishu and iMessage conversations."
+            }
         }
     }
 
     pub fn credential_label(&self) -> &'static str {
         match self {
             BackendKind::Hermes => "Session token",
-            BackendKind::OpenClaw => "Gateway token",
+            BackendKind::OpenClaw | BackendKind::XueXiaoMi => "Gateway token",
             _ => "Server password (optional)",
         }
     }

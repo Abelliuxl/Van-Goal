@@ -3,6 +3,8 @@
 Build/
 *.log
 .zcode/
+# Local agent session files, not part of the project.
+.claude/
 
 # Flutter / Dart
 /app/build/
