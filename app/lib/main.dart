@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import 'markdown.dart';
 import 'state.dart';
-import 'tools.dart';
 import 'waiting.dart';
 
 void main() {
@@ -112,19 +111,44 @@ class _ChatPageState extends State<ChatPage> {
   /// Follow the newest message. A chat log reads from the bottom, so that is
   /// where new content should appear — unless the reader has scrolled up, in
   /// which case they stay where they are.
+  ///
+  /// A turn ending swaps a streaming plain-text bubble for parsed markdown
+  /// blocks, which can change its height a lot in one frame — a heading or a
+  /// code block is taller than the line of text it replaces. The frame that
+  /// lays out the new height is the one this callback runs after, but the
+  /// jump inside it can itself grow the list (loading more of a long reply
+  /// into view), which only settles on the frame after that. Chasing the
+  /// bottom for a second frame is what keeps that from reading as "the new
+  /// message doesn't show until I scroll".
   void _onChanged() {
     if (!mounted) {
       return;
     }
     setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) => _followToBottom());
+  }
+
+  void _followToBottom() {
+    if (!mounted || !_scroll.hasClients) {
+      return;
+    }
+    final position = _scroll.position;
+    final atBottom = position.pixels >= position.maxScrollExtent - 80;
+    if (!atBottom && !_app.sending) {
+      return;
+    }
+    _scroll.jumpTo(position.maxScrollExtent);
+    // The jump above used this frame's maxScrollExtent, which may already be
+    // stale if that same frame changed the content's height. One more frame
+    // settles it without looping forever: by the second jump the extent is
+    // unchanged from the first, so the loop stops itself.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) {
+      if (!mounted || !_scroll.hasClients) {
         return;
       }
-      final position = _scroll.position;
-      final atBottom = position.pixels >= position.maxScrollExtent - 80;
-      if (atBottom || _app.sending) {
-        _scroll.jumpTo(position.maxScrollExtent);
+      final settled = _scroll.position.maxScrollExtent;
+      if (settled != position.maxScrollExtent) {
+        _scroll.jumpTo(settled);
       }
     });
   }
@@ -271,7 +295,6 @@ class _Transcript extends StatelessWidget {
       itemBuilder: (context, index) => _Bubble(
         key: ValueKey(messages[index].id),
         message: messages[index],
-        showToolCalls: app.showToolCalls,
       ),
     );
   }
@@ -325,22 +348,16 @@ class _EmptyState extends StatelessWidget {
 }
 
 class _Bubble extends StatelessWidget {
-  const _Bubble({
-    super.key,
-    required this.message,
-    required this.showToolCalls,
-  });
+  const _Bubble({super.key, required this.message});
 
   final Message message;
-  final bool showToolCalls;
 
   @override
   Widget build(BuildContext context) {
     final isUser = message.fromUser;
-    final tools = message.tools;
     // A turn that has only run tools so far is working, not empty: as long as
     // the message is streaming and has no text, the dots show there is more
-    // coming, whether or not a tool call has already been recorded.
+    // coming. Tool activity itself is not drawn on mobile — only the reply.
     final waiting = message.streaming && message.text.isEmpty;
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -359,10 +376,6 @@ class _Bubble extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (showToolCalls && tools.isNotEmpty) ...[
-              ToolCallsView(tools: tools),
-              if (!waiting || message.text.isNotEmpty) const SizedBox(height: 8),
-            ],
             if (waiting)
               const WaitingDots()
             else if (message.text.isNotEmpty)
@@ -812,7 +825,6 @@ class _SettingsSheetState extends State<_SettingsSheet> {
     text: _app.credential,
   );
   late FontSize _fontSize = _app.fontSize;
-  late bool _showToolCalls = _app.showToolCalls;
 
   @override
   void dispose() {
@@ -956,23 +968,6 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                 }
                 setState(() => _fontSize = size);
                 _app.setFontSize(size);
-              },
-            ),
-            const SizedBox(height: 6),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              value: _showToolCalls,
-              title: const Text(
-                'Show tool calls',
-                style: TextStyle(fontSize: 14),
-              ),
-              subtitle: const Text(
-                'Off draws only the replies, with the tool calls a turn ran left out.',
-                style: TextStyle(fontSize: 11, color: _inkFaint),
-              ),
-              onChanged: (value) {
-                setState(() => _showToolCalls = value);
-                _app.setShowToolCalls(value);
               },
             ),
             const SizedBox(height: 8),
