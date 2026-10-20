@@ -1,8 +1,8 @@
 # Working in this repository
 
-Van-Goal is a client for coding agents: macOS and Windows desktop apps (GPUI)
-and an Android app (Flutter), all drawing on one Rust core that speaks seven
-agent protocols. The backend stays the runtime, the model gateway, the tool
+Van-Goal is a client for coding agents: a desktop app whose window is drawn by
+MyGo (Go, `desktop/`) and an Android app (Flutter), both drawing on one Rust
+core that speaks eight agent protocols. The backend stays the runtime, the model gateway, the tool
 executor and the owner of every session. The client translates a protocol into
 one event model and draws it. [docs/architecture.md](docs/architecture.md) is
 the full picture; [docs/sessions.md](docs/sessions.md) and
@@ -13,7 +13,8 @@ subtly wrong.
 
 ```
 crates/core        protocols, models, settings, markdown — no UI of any kind
-crates/desktop     the macOS and Windows clients (GPUI)
+crates/desktop     the C ABI the desktop window loads: connection, sessions, messages
+desktop/           the desktop window, in Go with MyGo; folds nothing, decides nothing
 crates/mobile      the C ABI the Flutter app links against
 app/               the Flutter client
 assets/            the app icon
@@ -63,8 +64,9 @@ Anything a second frontend would have to get right belongs in core: the
 conversation folding (`chat::Conversation`), the markdown parser, the session
 filter (`agent::session_scope`), settings.
 
-**A frontend does not fold events into messages.** Both clients hand their
-message list to `chat::Conversation` and draw what it gives back. The mobile
+**A frontend does not fold events into messages.** Both bridges hand their
+message list to `chat::Conversation`, and the Go and Dart sides draw what the
+bridge reports. The mobile
 client once had its own version and it produced one "Thinking…" bubble per event
 plus a spinner that never stopped.
 
@@ -128,24 +130,25 @@ cargo fmt --all
 cd app && flutter test && flutter analyze     # needs Scripts/android_env.sh sourced
 ```
 
-Desktop:
+Desktop (MyGo needs Go 1.27 and builds with `CGO_ENABLED=0`; an older `go`
+fetches the toolchain through `GOTOOLCHAIN`):
 
 ```bash
 export SDKROOT="$(xcrun --show-sdk-path)"     # ring's C build needs it
-xcodebuild -downloadComponent MetalToolchain  # Xcode 26+ ships it separately
-cargo run --release -p van-goal
+export GOTOOLCHAIN=go1.27.3 CGO_ENABLED=0
+cargo build -p van-goal-desktop               # the core, target/debug/libvan_goal_desktop.dylib
+(cd desktop && go run .)                      # VAN_GOAL_DATA_DIR=dir runs on throwaway settings
+(cd desktop && go vet ./... && go test ./...) # the view, headless, against the real core
 Scripts/package_app.sh                        # -> Build/VanGoal.app
 ```
 
-Windows desktop (PowerShell; needs the MSVC C++ build tools, Windows SDK, and
-CMake):
+`VG_SNAPSHOTS=dir go test` writes what each test drew as PNGs, which is how the
+design is checked without a screen. `crates/desktop/examples/xuexiaomi_e2e.rs`
+and `desktop/live_test.go` run the bridge and the window against a live 雪小米
+gateway (`VG_XXM_URL`, `VG_XXM_TOKEN_FILE`); each run creates a session there.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File Scripts/package_windows.ps1
-```
-
-The portable x64 zip is written under
-`Build/VanGoal-windows-x86_64-<version>.zip`.
+The Windows desktop has not been ported to MyGo yet:
+`Scripts/package_windows.ps1` still describes the GPUI build.
 
 Android (the toolchain installs without `sudo`, into the user's own directories):
 
@@ -193,3 +196,14 @@ downgrade** over an install made with `--build-number`. Pass a higher one:
   between switching and the gateway confirming the subscription is where another
   session's traffic gets in — the live session id is cleared for exactly that
   window, on both clients.
+* **Every event stream has an epoch** (`crates/desktop`, `connection_epoch`). A
+  replaced adapter still reports its old socket closing, and without the epoch
+  that `Disconnected` lands after the new stream's `Connected` and marks a
+  healthy connection down.
+* **The composer's draft is the core's to clear.** The window sends the text
+  and keeps it until the core answers `clear` (taken) or `restore` (given back,
+  with the reason). A prompt that could not be delivered is taken back out of
+  the transcript and returned, in front of whatever was typed since.
+* **雪小米 has no event socket.** A turn's reply streams on the response to the
+  `POST api/chat` that started it; channel conversations (WeChat, Feishu,
+  iMessage) are read-only snapshots that a prompt continues as a new session.

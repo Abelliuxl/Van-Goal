@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Package the release binary into a local VanGoal.app bundle.
+# Package the desktop app into a local VanGoal.app bundle: the Rust core as a
+# dylib (crates/desktop) and the MyGo window as a Go binary (desktop/).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -27,21 +28,33 @@ PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 VERSION="$(cargo metadata --no-deps --format-version 1 | "$PYTHON_BIN" -c '
 import json, sys
 packages = json.load(sys.stdin)["packages"]
-app = next(p for p in packages if p["name"] == "van-goal")
+app = next(p for p in packages if p["name"] == "van-goal-desktop")
 print(app["version"])
 ')"
 BUILD_DIR="Build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 
-echo "Building release binary..."
-cargo build --release -p van-goal
+echo "Building the core..."
+cargo build --release -p van-goal-desktop
+
+# MyGo needs Go 1.27 and no cgo. An older Go fetches the right toolchain.
+GO_BIN="$(command -v go || true)"
+if [ -z "$GO_BIN" ] && [ -x /opt/homebrew/bin/go ]; then GO_BIN=/opt/homebrew/bin/go; fi
+if [ -z "$GO_BIN" ]; then GO_BIN="$(ls -d /opt/homebrew/Cellar/go/*/bin/go 2>/dev/null | tail -1)"; fi
+if [ -z "$GO_BIN" ]; then echo "Go is not installed (https://go.dev/dl/)" >&2; exit 1; fi
+export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.27.3}" CGO_ENABLED=0
+
+echo "Building the window..."
+(cd desktop && "$GO_BIN" build -trimpath -tags mygo_noinspector \
+    -ldflags "-s -w -X github.com/egoist/mygo.production=1" -o "../target/release/$APP_NAME" .)
 
 echo "Creating $APP_DIR..."
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
 cp target/release/$APP_NAME "$CONTENTS/MacOS/$APP_NAME"
+cp target/release/libvan_goal_desktop.dylib "$CONTENTS/Resources/"
 
 # Compile the macOS app icon and asset catalog into the bundle.
 xcrun actool \

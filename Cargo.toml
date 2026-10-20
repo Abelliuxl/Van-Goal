@@ -12,10 +12,6 @@ license = "MIT"
 repository = "https://github.com/Abelliuxl/Van-Goal"
 
 [workspace.dependencies]
-# UI, desktop only.
-gpui = "0.2.2"
-rfd = "0.15"
-
 # Async runtime for backend transports (HTTP, WebSocket, SSE, subprocesses).
 tokio = { version = "1.47", features = [
     "rt-multi-thread",
@@ -41,7 +37,6 @@ anyhow = "1"
 
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
-unicode-segmentation = "1"
 base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
