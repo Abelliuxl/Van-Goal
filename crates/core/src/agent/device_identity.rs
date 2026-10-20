@@ -182,13 +182,18 @@ fn base64_url(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_auth_payload, device_token_account};
+    use super::{device_auth_payload, device_token_account, OPENCLAW_PLATFORM};
 
     #[test]
     fn device_auth_matches_openclaw_v3_wire_format() {
+        // The platform field names the client's own OS, so the test states
+        // the shape without claiming this build runs on a particular one.
+        let expected = format!(
+            "v3|device|gateway-client|backend|operator|operator.read,operator.write,operator.approvals|1234|token|nonce|{OPENCLAW_PLATFORM}|desktop"
+        );
         assert_eq!(
             device_auth_payload("device", "nonce", 1234, "token"),
-            "v3|device|gateway-client|backend|operator|operator.read,operator.write,operator.approvals|1234|token|nonce|darwin|desktop"
+            expected
         );
     }
 

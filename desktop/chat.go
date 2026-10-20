@@ -384,7 +384,7 @@ func (a *app) composer(c *ui.Context) {
 			return false
 		})
 		in.OnPaste(func(text string) bool {
-			// A pasted file path list from Finder becomes attachments.
+			// A pasted file path list from the file manager becomes attachments.
 			return false
 		})
 		if a.focusDraft {
@@ -417,9 +417,17 @@ func (a *app) sendButton(c *ui.Context) {
 	} else if s.Sending && s.Clarify == nil {
 		label = "Queue"
 	}
-	b := ui.ButtonBase(c.Key("send")).Size(a.px(34), a.px(34)).Radius(a.px(17)).Center().Label(label).Tooltip(map[string]string{
-		"Send": "Send  ↩", "Stop": "Stop  esc", "Queue": "Queue after this reply  ↩",
-	}[label])
+	hint := map[string]string{
+		"Send": "Send", "Stop": "Stop", "Queue": "Queue after this reply",
+	}[label]
+	if stop {
+		hint += "  Esc"
+	} else if isMac() {
+		hint += "  ↩"
+	} else {
+		hint += "  Enter"
+	}
+	b := ui.ButtonBase(c.Key("send")).Size(a.px(34), a.px(34)).Radius(a.px(17)).Center().Label(label).Tooltip(hint)
 	switch {
 	case stop:
 		b.Background(p.text)
@@ -509,9 +517,9 @@ func (a *app) footnote(c *ui.Context) {
 			ui.Icon(c, iconWarn).FontSize(a.size(12)).TextColor(p.warn)
 			ui.Text(c, *s.Error).SingleLine().Selectable().FontSize(a.size(12)).TextColor(p.warn).MinWidth(0).Shrink(1).Tooltip(*s.Error)
 		case s.Sending:
-			ui.Text(c, "↩ to queue a follow-up · esc to stop").FontSize(a.size(11.5)).TextColor(p.faint)
+			ui.Text(c, queueHint()).FontSize(a.size(11.5)).TextColor(p.faint)
 		default:
-			ui.Text(c, "↩ to send · ⇧↩ for a new line").FontSize(a.size(11.5)).TextColor(p.faint)
+			ui.Text(c, sendHint()).FontSize(a.size(11.5)).TextColor(p.faint)
 		}
 	})
 }

@@ -266,7 +266,7 @@ func (a *app) agentSettings(c *ui.Context) {
 		}
 		if !current.Network || s.ManagedWorkspace {
 			a.field(c, "Workspace", "The directory the agent works in.", func() {
-				a.input(c, "workspace", &f.workspace, "~/Projects/…", false, func() {
+				a.input(c, "workspace", &f.workspace, workspacePlaceholder(), false, func() {
 					a.commit(map[string]any{"workspace": f.workspace})
 					a.do("apply_workspace", nil)
 				})
@@ -316,7 +316,7 @@ func (a *app) agentSettings(c *ui.Context) {
 	if current.Network {
 		ui.Row(c).Gap(a.px(8)).Children(func() {
 			if ui.Button(c, "Forget credential").Padding(a.px(5), a.px(12)).Clicked() {
-				a.ask("Forget the credential?", "The saved "+strings.ToLower(current.CredentialLabel)+" for "+current.Name+" is removed from this Mac.", "Forget", true, func() {
+				a.ask("Forget the credential?", "The saved "+strings.ToLower(current.CredentialLabel)+" for "+current.Name+" is removed from "+thisComputer()+".", "Forget", true, func() {
 					f.credential = ""
 					a.do("clear_credential", nil)
 				})
@@ -454,7 +454,7 @@ func (a *app) advancedSettings(c *ui.Context) {
 		a.field(c, "Session cache", a.state.CacheSummary, func() {
 			ui.Spacer(c)
 			if ui.Button(c, "Clear cache").Padding(a.px(4), a.px(10)).TextColor(p.danger).Clicked() {
-				a.ask("Clear the local cache?", "Saved transcripts and the session list on this Mac are removed. Sessions on the backend are not touched.", "Clear", true, func() {
+				a.ask("Clear the local cache?", "Saved transcripts and the session list on "+thisComputer()+" are removed. Sessions on the backend are not touched.", "Clear", true, func() {
 					a.do("clear_cache", nil)
 				})
 			}

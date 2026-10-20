@@ -12,7 +12,8 @@ struct StoredSecrets {
 }
 
 /// App-local storage for OpenClaw device identity and paired-device tokens.
-/// The file is readable only by the current macOS user and never touches Keychain.
+/// The file is readable only by the current user and never touches a system
+/// keychain.
 pub struct LocalSecretStore {
     path: PathBuf,
 }

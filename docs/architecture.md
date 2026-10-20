@@ -159,6 +159,9 @@ forgotten:
   it.
 * Xcode 26+ ships the Metal shader compiler separately:
   `xcodebuild -downloadComponent MetalToolchain`.
-* The Windows desktop build needs the MSVC C++ build tools, a Windows SDK, and
-  CMake. `Scripts/package_windows.ps1` creates a portable x64 zip from a release
-  build.
+* The Windows desktop builds with either Rust toolchain (MSVC or GNU). The
+  window is native MyGo UI, so there is no WebView2 runtime to install.
+  `Scripts/package_windows.ps1` puts `VanGoal.exe`, `van_goal_desktop.dll` and
+  `AppIcon.png` in one folder, embeds the icon and manifest into the exe when
+  mingw-w64's `windres` is available, and writes a portable x64 zip from a
+  release build.

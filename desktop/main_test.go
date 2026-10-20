@@ -89,12 +89,29 @@ func TestTheSidebarHidesAndComesBack(t *testing.T) {
 	tt.Key(ui.Cmd, ui.KeyB)
 	tt.Frame()
 	if a.sidebarOpen || tt.HasText("Chats") {
-		t.Fatal("⌘B did not hide the sidebar")
+		t.Fatalf("%s did not hide the sidebar", shortcut("B"))
 	}
 	tt.Key(ui.Cmd, ui.KeyB)
 	tt.Frame()
 	if !a.sidebarOpen || !tt.HasText("Chats") {
-		t.Fatal("⌘B did not bring the sidebar back")
+		t.Fatalf("%s did not bring the sidebar back", shortcut("B"))
+	}
+}
+
+// A window with a hidden title bar draws its controls at the top-right on
+// Windows. The header has to stop before them: ending at its own padding
+// would put the refresh button under Close.
+func TestTheHeaderKeepsClearOfTheWindowControls(t *testing.T) {
+	a := started(t)
+	tt := ui.NewTester(a.view, 1180, 780)
+	const controls = 138 // minimize, maximize, close at 46 DIPs each
+	tt.SetTitleBar(ui.TitleBar{Height: 32, Right: controls})
+	rect, ok := tt.Find("Refresh  " + shortcut("R"))
+	if !ok {
+		t.Fatalf("refresh button missing: %q", tt.Texts())
+	}
+	if right := rect.X + rect.W; right > 1180-controls {
+		t.Errorf("refresh ends at %.0f, under the window controls starting at %d", right, 1180-controls)
 	}
 }
 
