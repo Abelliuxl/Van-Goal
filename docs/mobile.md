@@ -102,6 +102,39 @@ desktop's "multiply every design size by one number".
 phone, they take more room than the reply they belong to. Off draws the replies
 alone.
 
+## Phone and tablet layout
+
+One Android package adapts to the app window's current logical width through
+`LayoutBuilder`, including split-screen and freely resized windows:
+
+| Available width | Layout |
+| --- | --- |
+| Below 840 logical pixels | A single conversation with the session list in a drawer |
+| 840 and above | A permanent 280-pixel session sidebar beside the conversation |
+
+The conversation and composer share a centered column capped at 820 logical
+pixels. Bubbles use that column's constraints rather than the full display
+width. Extremely narrow windows put secondary toolbar actions in a menu. The
+composer can scroll within 60% of the pane's available height when attachments
+or a keyboard leave little room. Empty-state content is scrollable too.
+
+The conversation pane retains its widget identity, text controller and scroll
+controller when the sidebar appears or disappears. The sidebar uses the same
+session-list component as the drawer, but selecting a session there does not
+pop a route. This is a presentation change; the Rust session/event model is
+shared and unchanged.
+
+Settings use a centered dialog capped at 560 pixels in windows at least 600
+pixels wide, and a bottom sheet on smaller windows. Image previews fit the
+message column and their zoom dialog is capped at 1000 pixels. Ctrl+Enter and
+Cmd+Enter send from an external keyboard; ordinary Enter remains a newline.
+The Android activity is explicitly resizable and does not lock orientation.
+
+Reference: [Flutter's adaptive layout approach](https://docs.flutter.dev/ui/adaptive-responsive/general).
+Functional verification of rotation, resizing, keyboard interaction, drafts and
+session switching is handed to the user; do not run UI/device tests without
+their explicit request.
+
 ## Images and files on Android
 
 雪小米 supports six attachments per message, with an 8 MB limit per supported

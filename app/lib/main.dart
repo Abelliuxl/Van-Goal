@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'markdown.dart';
 import 'state.dart';
@@ -21,6 +22,11 @@ const _accent = Color(0xFF4F8CFF);
 
 const _body = TextStyle(fontSize: 15, height: 1.45, color: _ink);
 const _mono = 'monospace';
+
+// Window widths, in logical pixels: these also apply to tablet split-screen.
+const _sidebarBreakpoint = 840.0;
+const _sidebarWidth = 280.0;
+const _conversationWidth = 820.0;
 
 class VanGoalApp extends StatefulWidget {
   const VanGoalApp({super.key});
@@ -92,6 +98,7 @@ class _ChatPageState extends State<ChatPage> {
   final _app = AppState.instance;
   final _composer = TextEditingController();
   final _scroll = ScrollController();
+  final _conversationPaneKey = GlobalKey();
 
   @override
   void initState() {
@@ -172,98 +179,205 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    final offline = _app.link != LinkState.online;
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: _panel,
-        surfaceTintColor: Colors.transparent,
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _app.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 16),
-            ),
-            // The state is the part that has to survive a narrow header: at the
-            // larger text sizes a long backend name pushed it off the end and
-            // left "connec…", which reads as either "connecting" or
-            // "connected". The name is allowed to shorten instead.
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _linkState(_app),
-                  maxLines: 1,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: _app.link == LinkState.online ? _accent : _inkFaint,
-                  ),
-                ),
-                Flexible(
-                  child: Text(
-                    ' · ${_app.backend.label}',
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.enter, control: true): _send,
+        const SingleActivator(LogicalKeyboardKey.enter, meta: true): _send,
+      },
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final wide = constraints.maxWidth >= _sidebarBreakpoint;
+          final smallToolbar = constraints.maxWidth < 360;
+          return Scaffold(
+            appBar: AppBar(
+              backgroundColor: _panel,
+              surfaceTintColor: Colors.transparent,
+              automaticallyImplyLeading: !wide,
+              leadingWidth: wide ? _sidebarWidth : null,
+              leading: wide
+                  ? const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 20),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Van-Goal',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    )
+                  : null,
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _app.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11, color: _inkFaint),
+                    style: const TextStyle(fontSize: 16),
                   ),
-                ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _linkState(_app),
+                        maxLines: 1,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _app.link == LinkState.online
+                              ? _accent
+                              : _inkFaint,
+                        ),
+                      ),
+                      Flexible(
+                        child: Text(
+                          ' · ${_app.backend.label}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: _inkFaint,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              actions: [
+                if (!wide)
+                  IconButton(
+                    tooltip: 'New chat',
+                    onPressed: _app.newChat,
+                    icon: const Icon(Icons.add_comment_outlined),
+                  ),
+                if (smallToolbar)
+                  PopupMenuButton<String>(
+                    tooltip: 'More',
+                    onSelected: (action) {
+                      switch (action) {
+                        case 'connect':
+                          _app.retry();
+                        case 'refresh':
+                          _app.refreshAll();
+                        case 'settings':
+                          _openSettings(context);
+                      }
+                    },
+                    itemBuilder: (_) => [
+                      if (_app.link != LinkState.online)
+                        const PopupMenuItem(
+                          value: 'connect',
+                          child: Text('Reconnect'),
+                        ),
+                      const PopupMenuItem(
+                        value: 'refresh',
+                        child: Text('Refresh'),
+                      ),
+                      const PopupMenuItem(
+                        value: 'settings',
+                        child: Text('Settings'),
+                      ),
+                    ],
+                  )
+                else ...[
+                  if (_app.link != LinkState.online)
+                    IconButton(
+                      tooltip: 'Reconnect',
+                      onPressed: _app.retry,
+                      icon: Icon(
+                        Icons.sync,
+                        color: _app.link == LinkState.connecting
+                            ? _inkFaint
+                            : _accent,
+                      ),
+                    ),
+                  IconButton(
+                    tooltip: 'Refresh',
+                    onPressed: _app.refreshAll,
+                    icon: _app.refreshing
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh),
+                  ),
+                  IconButton(
+                    tooltip: 'Settings',
+                    onPressed: () => _openSettings(context),
+                    icon: const Icon(Icons.settings_outlined),
+                  ),
+                ],
               ],
             ),
-          ],
-        ),
-        actions: [
-          // Reconnecting is otherwise a trip through Settings, which is a long
-          // way to go for something the app does to itself several times a day.
-          if (offline)
-            IconButton(
-              tooltip: 'Reconnect',
-              onPressed: _app.retry,
-              icon: Icon(
-                Icons.sync,
-                color: _app.link == LinkState.connecting ? _inkFaint : _accent,
+            drawer: wide ? null : _SessionDrawer(app: _app),
+            body: SafeArea(
+              top: false,
+              bottom: false,
+              child: Row(
+                children: [
+                  if (wide)
+                    SizedBox(
+                      width: _sidebarWidth,
+                      child: DecoratedBox(
+                        decoration: const BoxDecoration(
+                          color: _panel,
+                          border: Border(right: BorderSide(color: _line)),
+                        ),
+                        child: _SessionPanel(app: _app, permanent: true),
+                      ),
+                    ),
+                  Expanded(
+                    key: _conversationPaneKey,
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: _conversationWidth,
+                        ),
+                        child: LayoutBuilder(
+                          builder: (context, pane) => Column(
+                            children: [
+                              if (_app.error != null)
+                                _ErrorBanner(
+                                  message: _app.error!,
+                                  onDismiss: _app.dismissError,
+                                ),
+                              Expanded(
+                                child: _Transcript(
+                                  app: _app,
+                                  controller: _scroll,
+                                ),
+                              ),
+                              if (_app.clarifyQuestion != null)
+                                _ClarifyCard(app: _app),
+                              ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  maxHeight: pane.maxHeight * 0.6,
+                                ),
+                                child: SingleChildScrollView(
+                                  reverse: true,
+                                  child: _Composer(
+                                    controller: _composer,
+                                    app: _app,
+                                    onSend: _send,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-          IconButton(
-            tooltip: 'New chat',
-            onPressed: _app.newChat,
-            icon: const Icon(Icons.add_comment_outlined),
-          ),
-          // Refreshes the session list and the open conversation from the
-          // backend. Opening the session list is the drawer's job — the system
-          // menu button on the left already does that, and a second button for
-          // it on this side was one more icon doing nothing.
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: _app.refreshAll,
-            icon: _app.refreshing
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh),
-          ),
-          IconButton(
-            tooltip: 'Settings',
-            onPressed: () => _openSettings(context),
-            icon: const Icon(Icons.settings_outlined),
-          ),
-        ],
-      ),
-      drawer: _SessionDrawer(app: _app),
-      body: Column(
-        children: [
-          if (_app.error != null)
-            _ErrorBanner(message: _app.error!, onDismiss: _app.dismissError),
-          Expanded(
-            child: _Transcript(app: _app, controller: _scroll),
-          ),
-          if (_app.clarifyQuestion != null) _ClarifyCard(app: _app),
-          _Composer(controller: _composer, app: _app, onSend: _send),
-        ],
+          );
+        },
       ),
     );
   }
@@ -325,31 +439,33 @@ class _EmptyState extends StatelessWidget {
         'Could not connect. Check the address and the token in Settings.',
     };
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              'Van-Goal',
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: _inkSoft, height: 1.5),
-            ),
-            if (app.link == LinkState.failed ||
-                app.link == LinkState.offline) ...[
-              const SizedBox(height: 18),
-              FilledButton.tonalIcon(
-                onPressed: app.retry,
-                icon: const Icon(Icons.sync, size: 18),
-                label: const Text('Reconnect'),
+      child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Van-Goal',
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
               ),
+              const SizedBox(height: 10),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: _inkSoft, height: 1.5),
+              ),
+              if (app.link == LinkState.failed ||
+                  app.link == LinkState.offline) ...[
+                const SizedBox(height: 18),
+                FilledButton.tonalIcon(
+                  onPressed: app.retry,
+                  icon: const Icon(Icons.sync, size: 18),
+                  label: const Text('Reconnect'),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
@@ -368,34 +484,36 @@ class _Bubble extends StatelessWidget {
     // the message is streaming and has no text, the dots show there is more
     // coming. Tool activity itself is not drawn on mobile — only the reply.
     final waiting = message.streaming && message.text.isEmpty;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.86,
-        ),
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: isUser ? const Color(0xFF2C3B58) : _raised,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: _line),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final item in message.attachments)
-              AttachmentView(
-                key: ValueKey(item.path),
-                item: item,
-                load: AppState.instance.loadAttachment,
-              ),
-            if (waiting)
-              const WaitingDots()
-            else if (message.text.isNotEmpty)
-              _MarkdownView(message: message),
-          ],
+    return LayoutBuilder(
+      builder: (context, constraints) => Align(
+        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          constraints: BoxConstraints(
+            maxWidth: constraints.maxWidth * (isUser ? 0.86 : 1),
+          ),
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: isUser ? const Color(0xFF2C3B58) : _raised,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: _line),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final item in message.attachments)
+                AttachmentView(
+                  key: ValueKey(item.path),
+                  item: item,
+                  load: AppState.instance.loadAttachment,
+                ),
+              if (waiting)
+                const WaitingDots()
+              else if (message.text.isNotEmpty)
+                _MarkdownView(message: message),
+            ],
+          ),
         ),
       ),
     );
@@ -782,104 +900,142 @@ class _Composer extends StatelessWidget {
 
 class _SessionDrawer extends StatelessWidget {
   const _SessionDrawer({required this.app});
-
   final AppState app;
 
   @override
-  Widget build(BuildContext context) {
-    return Drawer(
-      backgroundColor: _panel,
-      child: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-              child: Text(
-                'Sessions',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600,
-                  color: _ink,
-                ),
+  Widget build(BuildContext context) => Drawer(
+    backgroundColor: _panel,
+    child: _SessionPanel(app: app, onSelect: () => Navigator.of(context).pop()),
+  );
+}
+
+/// The same session list lives in the phone drawer and tablet sidebar. Only
+/// the drawer closes a route when a session is selected.
+class _SessionPanel extends StatelessWidget {
+  const _SessionPanel({
+    required this.app,
+    this.permanent = false,
+    this.onSelect,
+  });
+  final AppState app;
+  final bool permanent;
+  final VoidCallback? onSelect;
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+    top: !permanent,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (permanent)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+            child: SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                onPressed: app.newChat,
+                icon: const Icon(Icons.add_comment_outlined, size: 18),
+                label: const Text('New chat'),
               ),
             ),
-            const Divider(height: 1, color: _line),
-            Expanded(
-              // Pulling the list down refreshes it, the way every list on a
-              // phone behaves; the refresh button in the appbar does the same
-              // for when the drawer is closed.
-              child: RefreshIndicator(
-                onRefresh: app.refreshAll,
-                backgroundColor: _panel,
-                color: _accent,
-                child: app.sessions.isEmpty
-                    ? ListView(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        children: const [
-                          Padding(
-                            padding: EdgeInsets.all(16),
-                            child: Text(
-                              'No sessions yet.',
-                              style: TextStyle(color: _inkFaint),
-                            ),
-                          ),
-                        ],
-                      )
-                    : ListView.builder(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        itemCount: app.sessions.length,
-                        itemBuilder: (context, index) {
-                          final session = app.sessions[index];
-                          return ListTile(
-                            selected: session.id == app.sessionId,
-                            selectedTileColor: _accent.withValues(alpha: 0.12),
-                            title: Text(
-                              session.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 14),
-                            ),
-                            subtitle: session.model == null
-                                ? null
-                                : Text(
-                                    session.model!,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      color: _inkFaint,
-                                    ),
-                                  ),
-                            onTap: () {
-                              Navigator.of(context).pop();
-                              app.openSession(session.id);
-                            },
-                          );
-                        },
-                      ),
-              ),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: Text(
+            'Sessions',
+            style: TextStyle(
+              fontSize: permanent ? 13 : 17,
+              fontWeight: FontWeight.w600,
+              color: permanent ? _inkSoft : _ink,
             ),
-          ],
+          ),
         ),
-      ),
-    );
-  }
+        const Divider(height: 1, color: _line),
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: app.refreshAll,
+            backgroundColor: _panel,
+            color: _accent,
+            child: app.sessions.isEmpty
+                ? ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: const [
+                      Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text(
+                          'No sessions yet.',
+                          style: TextStyle(color: _inkFaint),
+                        ),
+                      ),
+                    ],
+                  )
+                : ListView.builder(
+                    key: const PageStorageKey('session-list'),
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    itemCount: app.sessions.length,
+                    itemBuilder: (context, index) {
+                      final session = app.sessions[index];
+                      return ListTile(
+                        selected: session.id == app.sessionId,
+                        selectedTileColor: _accent.withValues(alpha: 0.12),
+                        title: Text(
+                          session.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                        subtitle: session.model == null
+                            ? null
+                            : Text(
+                                session.model!,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: _inkFaint,
+                                ),
+                              ),
+                        onTap: () {
+                          onSelect?.call();
+                          app.openSession(session.id);
+                        },
+                      );
+                    },
+                  ),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 /// Connection settings. A sheet rather than a page: it is filled in once and
 /// then rarely looked at.
 void _openSettings(BuildContext context) {
-  showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: _panel,
-    builder: (context) => const _SettingsSheet(),
-  );
+  if (MediaQuery.sizeOf(context).width >= 600) {
+    showDialog<void>(
+      context: context,
+      builder: (_) => const Dialog(
+        backgroundColor: _panel,
+        constraints: BoxConstraints(maxWidth: 560),
+        child: _SettingsSheet(inDialog: true),
+      ),
+    );
+  } else {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: const BoxConstraints(maxWidth: 560),
+      backgroundColor: _panel,
+      builder: (_) => const _SettingsSheet(),
+    );
+  }
 }
 
 class _SettingsSheet extends StatefulWidget {
-  const _SettingsSheet();
+  const _SettingsSheet({this.inDialog = false});
+  final bool inDialog;
 
   @override
   State<_SettingsSheet> createState() => _SettingsSheetState();
@@ -914,7 +1070,9 @@ class _SettingsSheetState extends State<_SettingsSheet> {
         left: 20,
         right: 20,
         top: 20,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+        bottom:
+            (widget.inDialog ? 0 : MediaQuery.viewInsetsOf(context).bottom) +
+            20,
       ),
       child: SingleChildScrollView(
         child: Column(
@@ -986,8 +1144,10 @@ class _SettingsSheetState extends State<_SettingsSheet> {
               ),
             ),
             const SizedBox(height: 22),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
+            Wrap(
+              alignment: WrapAlignment.end,
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 if (connected)
                   TextButton(
@@ -997,12 +1157,10 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                     },
                     child: const Text('Disconnect'),
                   ),
-                const Spacer(),
                 TextButton(
                   onPressed: () => Navigator.of(context).pop(),
                   child: const Text('Cancel'),
                 ),
-                const SizedBox(width: 8),
                 FilledButton(
                   onPressed: () {
                     _app.host = _host.text.trim();

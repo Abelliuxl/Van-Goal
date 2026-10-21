@@ -99,44 +99,67 @@ class _AttachmentViewState extends State<AttachmentView> {
                   );
                 }
                 final path = result.data!;
-                return InkWell(
-                  onTap: compact
-                      ? null
-                      : () => showDialog<void>(
-                          context: context,
-                          builder: (context) => Dialog(
-                            child: Stack(
-                              children: [
-                                InteractiveViewer(
-                                  child: Image.file(
-                                    File(path),
-                                    cacheWidth: 2000,
-                                    fit: BoxFit.contain,
+                return LayoutBuilder(
+                  builder: (context, constraints) {
+                    final previewWidth = constraints.maxWidth
+                        .clamp(0.0, compact ? 120.0 : 420.0)
+                        .toDouble();
+                    return InkWell(
+                      onTap: compact
+                          ? null
+                          : () => showDialog<void>(
+                              context: context,
+                              builder: (context) => Dialog(
+                                insetPadding: const EdgeInsets.all(16),
+                                constraints: const BoxConstraints(
+                                  maxWidth: 1000,
+                                ),
+                                child: SizedBox(
+                                  width: double.infinity,
+                                  height:
+                                      MediaQuery.sizeOf(context).height * 0.8,
+                                  child: Stack(
+                                    children: [
+                                      Positioned.fill(
+                                        child: InteractiveViewer(
+                                          child: Center(
+                                            child: Image.file(
+                                              File(path),
+                                              cacheWidth: 2000,
+                                              fit: BoxFit.contain,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      Positioned(
+                                        right: 0,
+                                        top: 0,
+                                        child: IconButton(
+                                          onPressed: () =>
+                                              Navigator.pop(context),
+                                          icon: const Icon(Icons.close),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                                Positioned(
-                                  right: 0,
-                                  top: 0,
-                                  child: IconButton(
-                                    onPressed: () => Navigator.pop(context),
-                                    icon: const Icon(Icons.close),
-                                  ),
-                                ),
-                              ],
+                              ),
                             ),
-                          ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.file(
+                          File(path),
+                          width: previewWidth,
+                          height: compact
+                              ? 70
+                              : (previewWidth * 0.65).clamp(0, 260).toDouble(),
+                          cacheWidth: 960,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, _, _) => const Text('无法预览此图片'),
                         ),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.file(
-                      File(path),
-                      width: compact ? 120 : 260,
-                      height: compact ? 70 : 180,
-                      cacheWidth: 960,
-                      fit: BoxFit.contain,
-                      errorBuilder: (_, _, _) => const Text('无法预览此图片'),
-                    ),
-                  ),
+                      ),
+                    );
+                  },
                 );
               },
             ),

@@ -25,6 +25,7 @@ Van-Goal is a thin, fast frontend: the selected agent backend stays the runtime,
 - **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, and a native menu with Command shortcuts on macOS and Ctrl shortcuts on Windows (N / R / B / , / + / − / 0).
 - **雪小米 attachments** — send images as multimodal input, upload documents, paste screenshots or copied files, preview images, and save files returned by the agent. Saving starts in your Downloads folder. Up to six attachments per message: 8 MB per image and 24 MB per other file.
 - **Android files** — pick images or documents, insert keyboard images, preview returned images, and save received files to `Download/Van-Goal`. Unsent text and attachments return to the composer when delivery fails.
+- **Phones and tablets** — one Android app adapts to the current window: a session drawer on narrow screens, a permanent sidebar on wide screens, with constrained chat, settings and image-preview widths.
 
 ## Build
 
