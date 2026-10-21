@@ -27,9 +27,13 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use van_goal_core::agent::Backend;
+use van_goal_core::cache::SessionCacheStore;
 use van_goal_core::chat::{Conversation, ConversationChange};
 use van_goal_core::markdown::{self, MarkdownBlock};
-use van_goal_core::models::{AgentEvent, BackendConfig, ChatMessage, MessageRole, SessionIDs};
+use van_goal_core::models::{
+    AgentEvent, BackendConfig, CachedState, ChatMessage, ComposerAttachment, MessageRole,
+    SessionIDs,
+};
 use van_goal_core::settings::{BackendKind, FontSize, SavedSession, Settings};
 
 /// The one connection the app has. Flutter has a single foreground client, so a
@@ -118,6 +122,9 @@ struct OpenSession {
     /// back must not lose the tool calls of the turn that just ran: the backend
     /// reports a turn as text alone (see [`Conversation::merge_transcript`]).
     parked: BTreeMap<String, Conversation>,
+    backend_id: String,
+    archive: CachedState,
+    writer: Option<std::sync::mpsc::Sender<CachedState>>,
 }
 
 /// How many sessions' worth of messages to keep while the user is elsewhere.
@@ -126,6 +133,30 @@ struct OpenSession {
 const PARKED_LIMIT: usize = 8;
 
 impl OpenSession {
+    fn record_history(&mut self) {
+        if self.writer.is_none() {
+            return;
+        }
+        for (id, conversation) in &self.parked {
+            if id.starts_with("__draft:") {
+                continue;
+            }
+            self.archive.messages_by_session_id.insert(
+                format!("{}::{id}", self.backend_id),
+                conversation.messages().to_vec(),
+            );
+        }
+        if let Some(id) = self.key() {
+            self.archive.messages_by_session_id.insert(
+                format!("{}::{id}", self.backend_id),
+                self.conversation.messages().to_vec(),
+            );
+        }
+        if let Some(writer) = &self.writer {
+            let _ = writer.send(self.archive.clone());
+        }
+    }
+
     /// The key a conversation is filed under: whichever id is known.
     fn key(&self) -> Option<String> {
         self.stored_id.clone().or_else(|| self.live_id.clone())
@@ -142,8 +173,12 @@ impl OpenSession {
     /// Put the conversation on screen away and bring back the one for `id`, if
     /// this client has seen it before.
     fn switch_to(&mut self, id: Option<&str>) -> u64 {
+        self.record_history();
         self.generation = self.generation.wrapping_add(1);
-        if let Some(key) = self.key() {
+        if let Some(key) = self.key().or_else(|| {
+            (!self.conversation.messages().is_empty())
+                .then(|| format!("__draft:{}", self.generation))
+        }) {
             let parked = std::mem::take(&mut self.conversation);
             self.parked.insert(key, parked);
             while self.parked.len() > PARKED_LIMIT {
@@ -155,6 +190,19 @@ impl OpenSession {
             }
         }
         self.conversation = id.and_then(|id| self.parked.remove(id)).unwrap_or_default();
+        if self.conversation.messages().is_empty() {
+            if let Some(messages) = id.and_then(|id| {
+                self.archive
+                    .messages_by_session_id
+                    .get(&format!("{}::{id}", self.backend_id))
+            }) {
+                let mut messages = messages.clone();
+                for message in &mut messages {
+                    message.is_streaming = false;
+                }
+                self.conversation.set_transcript(messages);
+            }
+        }
         self.generation
     }
 
@@ -426,7 +474,20 @@ impl Client {
             Some("new_session") => self.new_session().map(|()| None),
             Some("send") => {
                 let body = required(&value, "text")?;
-                self.send(body);
+                let attachments = value
+                    .get("attachments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                    .map(ComposerAttachment::new)
+                    .collect();
+                self.send(body, attachments)?;
+                Ok(None)
+            }
+            Some("load_attachment") => {
+                self.load_attachment(required(&value, "source")?, required(&value, "request_id")?)?;
                 Ok(None)
             }
             Some("interrupt") => self.interrupt().map(|()| None),
@@ -458,6 +519,21 @@ impl Client {
     /// after this object already exists.
     fn report_settings(&self) -> Result<Value> {
         let settings = Settings::load();
+        {
+            let mut open = self.open.lock().unwrap();
+            open.backend_id = settings.backend_kind.id().to_string();
+            if open.writer.is_none() {
+                let store = SessionCacheStore::new();
+                open.archive = store.load();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    while let Ok(state) = receiver.recv() {
+                        store.save_blocking(state);
+                    }
+                });
+                open.writer = Some(sender);
+            }
+        }
         let payload = settings_payload(&settings);
         *self.settings.lock().unwrap() = settings;
         self.push(payload.clone());
@@ -476,6 +552,16 @@ impl Client {
             Some(id) => parse_kind(id)?,
             None => return Err(anyhow!("configure needs a backend")),
         };
+        {
+            let mut open = self.open.lock().unwrap();
+            if open.backend_id != kind.id() {
+                open.switch_to(None);
+                open.parked.clear();
+                open.live_id = None;
+                open.stored_id = None;
+                open.backend_id = kind.id().to_string();
+            }
+        }
         {
             let mut settings = self.settings.lock().unwrap();
             settings.backend_kind = kind;
@@ -681,6 +767,9 @@ impl Client {
                     }
                     // Drain the backend's events for as long as the stream lives.
                     while let Some(event) = receiver.next().await {
+                        if current.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
                         apply(&events, &open, event);
                     }
                     // The stream ending is only worth reporting if this is still
@@ -823,82 +912,125 @@ impl Client {
 
     // ------------------------------------------------------------------ turn
 
-    fn send(&self, body: String) {
-        // The prompt goes into the message list here, not in the frontend: the
-        // next snapshot replaces what Dart holds, and a message only the
-        // frontend drew would be the one that disappeared.
-        {
-            let mut open = self.open.lock().unwrap();
-            open.conversation.begin_turn_with(&body);
+    fn send(&self, body: String, attachments: Vec<ComposerAttachment>) -> Result<()> {
+        if !attachments.is_empty() && self.kind() != BackendKind::XueXiaoMi {
+            return Err(anyhow!("File attachments on mobile require 雪小米."));
         }
+        if !self.live.load(Ordering::SeqCst) {
+            return Err(anyhow!("Connect before sending a message."));
+        }
+        let (generation, prompt_id, existing, stored) = {
+            let mut open = self.open.lock().unwrap();
+            if open.conversation.is_sending() {
+                return Err(anyhow!("Wait for the current reply before sending."));
+            }
+            open.conversation.begin_turn_with_placeholder(&body);
+            let index = open.conversation.messages().len() - 2;
+            open.conversation.messages_mut()[index].attachments = attachments.clone();
+            (
+                open.generation,
+                open.conversation.messages()[index].id.clone(),
+                open.live_id.clone(),
+                open.stored_id.clone(),
+            )
+        };
         let events = self.events.clone();
         let open = self.open.clone();
         push_transcript(&events, &open);
-
         let config = self.config();
         let backend = self.backend();
         let settings = self.settings.clone();
         self.runtime.spawn(async move {
-            let (existing, stored) = {
-                let open = open.lock().unwrap();
-                (open.live_id.clone(), open.stored_id.clone())
-            };
-            let live = match send_target(existing.as_deref(), stored.as_deref()) {
-                SendTarget::Live(live) => live,
-                // There is no live connection to the session on screen. It still
-                // exists on the backend, so resume it: creating one here is how a
-                // prompt ended up in a conversation the user had never opened,
-                // which is indistinguishable from one session's messages
-                // appearing in another.
-                SendTarget::Resume(stored) => {
-                    match backend.lock().await.resume_session(&config, &stored).await {
-                        Ok(ids) => {
-                            let mut open = open.lock().unwrap();
-                            open.live_id = Some(ids.live_id.clone());
-                            open.stored_id = ids.stored_id.clone().or(Some(stored));
-                            ids.live_id
-                        }
-                        Err(error) => {
-                            push_error(&events, format!("could not resume the session: {error}"));
-                            open.lock().unwrap().conversation.finish_turn();
-                            push_transcript(&events, &open);
-                            return;
-                        }
+            let outcome: Result<()> = async {
+                let mut backend = backend.lock().await;
+                let check_view = || -> Result<()> {
+                    if open.lock().unwrap().generation != generation {
+                        Err(anyhow!(
+                            "The conversation changed before the prompt was sent."
+                        ))
+                    } else {
+                        Ok(())
                     }
-                }
-                // A chat with no session at all: the only case that needs one
-                // created.
-                SendTarget::Create => {
-                    let created = {
-                        let mut backend = backend.lock().await;
+                };
+                check_view()?;
+                let ids = match send_target(existing.as_deref(), stored.as_deref()) {
+                    SendTarget::Live(live) => SessionIDs {
+                        live_id: live,
+                        stored_id: stored,
+                    },
+                    SendTarget::Resume(stored) => backend
+                        .resume_session(&config, &stored)
+                        .await
+                        .map_err(|e| anyhow!("could not resume the session: {e}"))?,
+                    SendTarget::Create => {
                         backend.clear_session_scope();
-                        backend.create_session(&config).await
-                    };
-                    match created {
-                        Ok(SessionIDs { live_id, stored_id }) => {
-                            let mut open = open.lock().unwrap();
-                            open.live_id = Some(live_id.clone());
-                            open.stored_id = stored_id.or_else(|| open.stored_id.take());
-                            live_id
-                        }
-                        Err(error) => {
-                            push_error(&events, format!("could not start a session: {error}"));
-                            open.lock().unwrap().conversation.finish_turn();
-                            push_transcript(&events, &open);
-                            return;
-                        }
+                        backend
+                            .create_session(&config)
+                            .await
+                            .map_err(|e| anyhow!("could not start a session: {e}"))?
                     }
+                };
+                check_view()?;
+                {
+                    let mut open = open.lock().unwrap();
+                    if open.generation != generation {
+                        return Err(anyhow!(
+                            "The conversation changed before the prompt was sent."
+                        ));
+                    }
+                    open.live_id = Some(ids.live_id.clone());
+                    open.stored_id = ids.stored_id.or_else(|| Some(ids.live_id.clone()));
+                    open.record_history();
                 }
-            };
-            // The prompt goes to this session, so this is the conversation a
-            // relaunch has to come back to.
-            remember_session(&settings, &live);
-            if let Err(error) = backend.lock().await.submit_prompt(&live, &body).await {
-                push_error(&events, format!("could not send the prompt: {error}"));
-                open.lock().unwrap().conversation.finish_turn();
-                push_transcript(&events, &open);
+                remember_session(&settings, &ids.live_id);
+                push(&events, json!({"event":"session", "id": ids.live_id}));
+                backend
+                    .submit_with_attachments(&ids.live_id, &body, &attachments)
+                    .await
+                    .map_err(|e| anyhow!("could not send the prompt: {e}"))
+            }
+            .await;
+            if let Err(error) = outcome {
+                restore_prompt(
+                    &events,
+                    &open,
+                    generation,
+                    &prompt_id,
+                    &body,
+                    &attachments,
+                    error.to_string(),
+                );
             }
         });
+        Ok(())
+    }
+
+    fn load_attachment(&self, source: String, request: String) -> Result<()> {
+        if self.kind() != BackendKind::XueXiaoMi
+            || !self
+                .open
+                .lock()
+                .unwrap()
+                .conversation
+                .messages()
+                .iter()
+                .any(|m| {
+                    m.attachments
+                        .iter()
+                        .any(|a| a.path == source && a.display_name.is_some())
+                })
+        {
+            return Err(anyhow!("That attachment is not in the open conversation."));
+        }
+        let config = self.config();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            match van_goal_core::agent::xuexiaomi::attachment_file(&config, &source).await {
+                Ok(path) => push(&events, json!({"event":"attachment_ready", "request_id":request, "source":source, "path":path})),
+                Err(error) => push(&events, json!({"event":"attachment_ready", "request_id":request, "source":source, "error":error.to_string()})),
+            }
+        });
+        Ok(())
     }
 
     fn interrupt(&self) -> Result<()> {
@@ -984,6 +1116,41 @@ fn required(value: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("command needs a {key}"))
 }
 
+/// Failed delivery returns the exact draft and files; Dart owns neither the
+/// transcript rollback nor the decision whether the backend took the prompt.
+fn restore_prompt(
+    events: &Arc<Mutex<Vec<Value>>>,
+    open: &Arc<Mutex<OpenSession>>,
+    _generation: u64,
+    prompt_id: &str,
+    text: &str,
+    attachments: &[ComposerAttachment],
+    reason: String,
+) {
+    let mut state = open.lock().unwrap();
+    fn remove(conversation: &mut Conversation, id: &str) -> bool {
+        let Some(index) = conversation.messages().iter().position(|m| m.id == id) else {
+            return false;
+        };
+        conversation.messages_mut().remove(index);
+        conversation.finish_turn();
+        true
+    }
+    let found = remove(&mut state.conversation, prompt_id)
+        || state.parked.values_mut().any(|c| remove(c, prompt_id));
+    if !found {
+        return;
+    }
+    state.record_history();
+    drop(state);
+    push_transcript(events, open);
+    push(
+        events,
+        json!({"event":"composer_restore", "text":text, "attachments":attachments.iter().map(|a| json!({"path":a.path,"name":a.name(),"remote":false})).collect::<Vec<_>>()}),
+    );
+    push_error(events, reason);
+}
+
 fn transcript(messages: &[ChatMessage]) -> Vec<Value> {
     messages
         .iter()
@@ -994,6 +1161,7 @@ fn transcript(messages: &[ChatMessage]) -> Vec<Value> {
                 "role": role_name(message.role),
                 "content": message.content,
                 "streaming": message.is_streaming,
+                "attachments": message.attachments.iter().map(|a| json!({"path": a.path, "name":a.name(), "remote":a.display_name.is_some()})).collect::<Vec<_>>(),
                 "tools": message.tool_calls.iter().map(|tool| json!({
                     "name": tool.name,
                     "status": tool.status,
@@ -1018,11 +1186,18 @@ fn role_name(role: MessageRole) -> &'static str {
 /// a [`delta`] instead, so a long reply costs one small event per poll rather
 /// than a copy of the transcript per token.
 fn push_transcript(events: &Arc<Mutex<Vec<Value>>>, open: &Arc<Mutex<OpenSession>>) {
-    let items = {
-        let open = open.lock().unwrap();
-        transcript(open.conversation.messages())
+    let (items, sending) = {
+        let mut open = open.lock().unwrap();
+        open.record_history();
+        (
+            transcript(open.conversation.messages()),
+            open.conversation.is_sending(),
+        )
     };
-    push(events, json!({ "event": "transcript", "items": items }));
+    push(
+        events,
+        json!({ "event": "transcript", "items": items, "sending": sending }),
+    );
 }
 
 /// Fold one backend event into the queue and the open-session state.
@@ -1217,6 +1392,103 @@ fn style_name(style: markdown::InlineStyle) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_events_reach_the_snapshot_without_dart_folding_them() {
+        let events = queue();
+        let open = Arc::new(Mutex::new(OpenSession::default()));
+        open.lock()
+            .unwrap()
+            .conversation
+            .begin_turn_with_placeholder("file");
+        let mut attachment = ComposerAttachment::new("/api/download?token=fixture");
+        attachment.display_name = Some("报告.pdf".into());
+        apply(&events, &open, AgentEvent::Attachment(attachment));
+        let events = events.lock().unwrap();
+        let snapshot = events.last().unwrap();
+        assert_eq!(snapshot["sending"], true);
+        assert_eq!(snapshot["items"][1]["attachments"][0]["name"], "报告.pdf");
+        assert_eq!(snapshot["items"][1]["attachments"][0]["remote"], true);
+    }
+
+    #[test]
+    fn failed_delivery_restores_files_even_after_switching_away_from_a_new_chat() {
+        let events = queue();
+        let open = Arc::new(Mutex::new(OpenSession::default()));
+        let prompt;
+        {
+            let mut state = open.lock().unwrap();
+            state.conversation.begin_turn_with_placeholder("keep this");
+            prompt = state.conversation.messages()[0].id.clone();
+            state.switch_to(Some("another"));
+            state.stored_id = Some("another".into());
+            state.conversation.begin_turn_with("other chat");
+            state.conversation.finish_turn();
+        }
+        restore_prompt(
+            &events,
+            &open,
+            0,
+            &prompt,
+            "keep this",
+            &[ComposerAttachment::new("/tmp/input.pdf")],
+            "HTTP 413".into(),
+        );
+        assert_eq!(
+            open.lock().unwrap().conversation.messages()[0].content,
+            "other chat"
+        );
+        let events = events.lock().unwrap();
+        let restored = events
+            .iter()
+            .find(|e| e["event"] == "composer_restore")
+            .unwrap();
+        assert_eq!(restored["text"], "keep this");
+        assert_eq!(restored["attachments"][0]["path"], "/tmp/input.pdf");
+        assert!(open
+            .lock()
+            .unwrap()
+            .parked
+            .values()
+            .all(|c| c.messages().is_empty() && !c.is_sending()));
+    }
+
+    #[test]
+    fn a_restarted_client_recovers_attachment_metadata_for_its_backend() {
+        let (writer, receiver) = std::sync::mpsc::channel();
+        let mut state = OpenSession {
+            backend_id: "xuexiaomi".into(),
+            stored_id: Some("same-id".into()),
+            writer: Some(writer),
+            ..Default::default()
+        };
+        state.conversation.begin_turn_with_placeholder("input");
+        state.conversation.messages_mut()[0]
+            .attachments
+            .push(ComposerAttachment::new("/private/input.png"));
+        state.conversation.finish_turn();
+        state.record_history();
+        let archived = receiver.recv().unwrap();
+        let archived: CachedState =
+            serde_json::from_slice(&serde_json::to_vec(&archived).unwrap()).unwrap();
+        let mut restarted = OpenSession {
+            backend_id: "xuexiaomi".into(),
+            archive: archived.clone(),
+            ..Default::default()
+        };
+        restarted.switch_to(Some("same-id"));
+        assert_eq!(
+            restarted.conversation.messages()[0].attachments[0].path,
+            "/private/input.png"
+        );
+        let mut another = OpenSession {
+            backend_id: "openclaw".into(),
+            archive: archived,
+            ..Default::default()
+        };
+        another.switch_to(Some("same-id"));
+        assert!(another.conversation.messages().is_empty());
+    }
 
     fn queue() -> Arc<Mutex<Vec<Value>>> {
         Arc::new(Mutex::new(Vec::new()))

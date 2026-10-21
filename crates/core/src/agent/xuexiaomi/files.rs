@@ -106,6 +106,12 @@ pub async fn attachment_bytes(
     source: &str,
     preview: bool,
 ) -> Result<Vec<u8>> {
+    let path = attachment_file(config, source).await?;
+    preview_bytes(std::fs::read(path)?, preview)
+}
+
+/// A durable local copy of a single-use gateway download, shared by frontends.
+pub async fn attachment_file(config: &BackendConfig, source: &str) -> Result<std::path::PathBuf> {
     let target = download_url(config, source)?;
     // The gateway's links expire and may be single-use. Preview and Save must
     // share one fetch, and the bytes must survive reopening the conversation.
@@ -120,8 +126,8 @@ pub async fn attachment_bytes(
     );
     let dir = crate::logger::dirs::app_dir().join("ReceivedAttachments");
     let cached = dir.join(&key);
-    if let Ok(bytes) = std::fs::read(&cached) {
-        return preview_bytes(bytes, preview);
+    if cached.is_file() {
+        return Ok(cached);
     }
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -147,8 +153,8 @@ pub async fn attachment_bytes(
     std::fs::create_dir_all(&dir)?;
     let temp = dir.join(format!("{key}.tmp"));
     std::fs::write(&temp, &bytes)?;
-    std::fs::rename(temp, cached)?;
-    preview_bytes(bytes, preview)
+    std::fs::rename(temp, &cached)?;
+    Ok(cached)
 }
 
 fn preview_bytes(bytes: Vec<u8>, preview: bool) -> Result<Vec<u8>> {

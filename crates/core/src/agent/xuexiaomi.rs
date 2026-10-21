@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod files;
-pub use files::attachment_bytes;
+pub use files::{attachment_bytes, attachment_file};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A turn can run tools for minutes; only the connect is bounded.

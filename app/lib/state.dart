@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/widgets.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'rust.dart';
+import 'files.dart';
 
 /// Which backends this app can talk to.
 ///
@@ -27,9 +29,9 @@ enum Backend {
   final bool prefersTls;
 
   static Backend fromId(String? id) => Backend.values.firstWhere(
-        (backend) => backend.id == id,
-        orElse: () => Backend.openclaw,
-      );
+    (backend) => backend.id == id,
+    orElse: () => Backend.openclaw,
+  );
 }
 
 enum LinkState { offline, connecting, online, failed }
@@ -49,9 +51,9 @@ enum FontSize {
   final double scale;
 
   static FontSize fromId(String? id) => FontSize.values.firstWhere(
-        (size) => size.id == id,
-        orElse: () => FontSize.normal,
-      );
+    (size) => size.id == id,
+    orElse: () => FontSize.normal,
+  );
 }
 
 class ToolCall {
@@ -69,6 +71,7 @@ class Message {
     required this.fromUser,
     this.streaming = false,
     List<ToolCall> tools = const [],
+    this.attachments = const [],
   }) : tools = List.of(tools);
 
   final String id;
@@ -76,6 +79,7 @@ class Message {
   bool streaming;
   List<ToolCall> tools;
   String text;
+  final List<ChatAttachment> attachments;
 
   List<Map<String, dynamic>>? _blocks;
   String? _blocksFor;
@@ -151,6 +155,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   String? sessionId;
 
   bool sending = false;
+  bool pickingFiles = false;
+  List<ChatAttachment> draftAttachments = [];
+  String? restoredDraft;
+  final Map<String, Completer<String>> _fileRequests = {};
+  final Map<String, String> _filePaths = {};
+  final Map<String, Future<String>> _fileLoads = {};
+  int _fileSequence = 0;
   String? error;
 
   String? clarifyId;
@@ -175,7 +186,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return 'Chat';
   }
 
-  bool get canSend => link == LinkState.online && !sending;
+  bool get canSend => link == LinkState.online && !sending && !pickingFiles;
 
   /// Bring the client up: name the directory the Rust side may write to, load
   /// what was saved last time, then start draining the event queue.
@@ -196,10 +207,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     // The Rust side connects on its own when the saved backend is switched on.
     _core.send({'cmd': 'settings'});
-    _ticker = Timer.periodic(
-      const Duration(milliseconds: 60),
-      (_) => _drain(),
-    );
+    _ticker = Timer.periodic(const Duration(milliseconds: 60), (_) => _drain());
   }
 
   @override
@@ -231,10 +239,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             ? Duration.zero
             : DateTime.now().difference(_backgroundedAt!);
         _backgroundedAt = null;
-        _core.send({
-          'cmd': 'ensure_connected',
-          'force': away >= _staleAfter,
-        });
+        _core.send({'cmd': 'ensure_connected', 'force': away >= _staleAfter});
       case AppLifecycleState.inactive:
         break;
     }
@@ -320,10 +325,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  void send(String text) {
+  bool send(String text) {
     final body = text.trim();
-    if (body.isEmpty || sending) {
-      return;
+    if ((body.isEmpty && draftAttachments.isEmpty) || !canSend) {
+      return false;
     }
     // The optimistic echo is not drawn here: the prompt is recorded by the
     // bridge, which owns the message list, and comes back in the snapshot that
@@ -331,7 +336,95 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     sending = true;
     error = null;
     notifyListeners();
-    _core.send({'cmd': 'send', 'text': body});
+    final reply = _core.send({
+      'cmd': 'send',
+      'text': body,
+      'attachments': draftAttachments.map((a) => a.path).toList(),
+    });
+    if (reply['ok'] != true) {
+      sending = false;
+      error = reply['error'] as String? ?? 'Could not send';
+      notifyListeners();
+      return false;
+    }
+    draftAttachments = [];
+    notifyListeners();
+    return true;
+  }
+
+  Future<void> pickFiles({bool images = false}) async {
+    if (pickingFiles) return;
+    if (draftAttachments.length >= 6) {
+      error = '每条消息最多添加 6 个附件';
+      notifyListeners();
+      return;
+    }
+    pickingFiles = true;
+    notifyListeners();
+    try {
+      final picked = await AndroidFiles.pick(
+        images: images,
+        maximum: 6 - draftAttachments.length,
+      );
+      draftAttachments = [...draftAttachments, ...picked];
+    } on Object catch (failure) {
+      error = fileError(failure);
+    }
+    pickingFiles = false;
+    notifyListeners();
+  }
+
+  Future<void> insertImage(KeyboardInsertedContent content) async {
+    try {
+      if (draftAttachments.length >= 6) throw StateError('每条消息最多添加 6 个附件');
+      final item = await AndroidFiles.importImage(content);
+      draftAttachments = [...draftAttachments, item];
+    } on Object catch (failure) {
+      error = fileError(failure);
+    }
+    notifyListeners();
+  }
+
+  void removeAttachment(ChatAttachment item) {
+    draftAttachments = draftAttachments
+        .where((a) => a.path != item.path)
+        .toList();
+    notifyListeners();
+  }
+
+  static String fileError(Object error) => error is PlatformException
+      ? error.message ?? error.code
+      : error.toString();
+
+  Future<String> loadAttachment(ChatAttachment item) {
+    if (!item.remote) return Future.value(item.path);
+    final key = '${backend.id}:$host:$port:${item.path}';
+    if (_filePaths.containsKey(key)) return Future.value(_filePaths[key]);
+    if (_fileLoads.containsKey(key)) return _fileLoads[key]!;
+    final request = 'file-${_fileSequence++}';
+    final completer = Completer<String>();
+    _fileRequests[request] = completer;
+    final reply = _core.send({
+      'cmd': 'load_attachment',
+      'source': item.path,
+      'request_id': request,
+    });
+    if (reply['ok'] != true) {
+      _fileRequests.remove(request);
+      return Future.error(reply['error'] ?? 'Could not load attachment');
+    }
+    final future = completer.future
+        .timeout(const Duration(seconds: 150))
+        .then((path) {
+          _filePaths[key] = path;
+          return path;
+        })
+        .whenComplete(() {
+          _fileRequests.remove(request);
+          _fileLoads.remove(key);
+        });
+    _fileLoads[key] = future;
+    return future;
   }
 
   void interrupt() {
@@ -380,6 +473,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         sending = event['sending'] == true;
       case 'session':
         sessionId = event['id'] as String?;
+      case 'composer_restore':
+        restoredDraft = event['text'] as String? ?? '';
+        final restored = ((event['attachments'] as List?) ?? []).map(
+          (a) => ChatAttachment.fromJson(Map<String, dynamic>.from(a as Map)),
+        );
+        final paths = draftAttachments.map((a) => a.path).toSet();
+        draftAttachments = [
+          ...restored.where((a) => !paths.contains(a.path)),
+          ...draftAttachments,
+        ];
+      case 'attachment_ready':
+        final pending = _fileRequests.remove(event['request_id']);
+        if (pending != null && !pending.isCompleted) {
+          if (event['error'] != null) {
+            pending.completeError(event['error']!);
+          } else {
+            pending.complete(event['path'] as String);
+          }
+        }
       case 'assistant':
         _applyAssistant(event);
       case 'clarify':
@@ -470,36 +582,49 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (raw is! List) {
       return const [];
     }
-    return raw.whereType<Map<String, dynamic>>().map((item) {
-      return SessionSummary(
-        id: (item['id'] as String?) ?? '',
-        title: (item['title'] as String?) ?? '(untitled)',
-        model: item['model'] as String?,
-      );
-    }).toList(growable: false);
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map((item) {
+          return SessionSummary(
+            id: (item['id'] as String?) ?? '',
+            title: (item['title'] as String?) ?? '(untitled)',
+            model: item['model'] as String?,
+          );
+        })
+        .toList(growable: false);
   }
 
   List<Message> _readTranscript(Object? raw) {
     if (raw is! List) {
       return const [];
     }
-    return raw.whereType<Map<String, dynamic>>().map((item) {
-      return Message(
-        id: (item['id'] as String?) ?? '',
-        text: (item['content'] as String?) ?? '',
-        fromUser: item['role'] == 'user',
-        streaming: item['streaming'] == true,
-        tools: [
-          for (final tool in ((item['tools'] as List?) ?? const [])
-              .whereType<Map<String, dynamic>>())
-            ToolCall(
-              name: (tool['name'] as String?) ?? 'tool',
-              status: (tool['status'] as String?) ?? '',
-              detail: (tool['detail'] as String?) ?? '',
-            ),
-        ],
-      );
-    }).toList(growable: false);
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map((item) {
+          return Message(
+            id: (item['id'] as String?) ?? '',
+            text: (item['content'] as String?) ?? '',
+            fromUser: item['role'] == 'user',
+            streaming: item['streaming'] == true,
+            tools: [
+              for (final tool
+                  in ((item['tools'] as List?) ?? const [])
+                      .whereType<Map<String, dynamic>>())
+                ToolCall(
+                  name: (tool['name'] as String?) ?? 'tool',
+                  status: (tool['status'] as String?) ?? '',
+                  detail: (tool['detail'] as String?) ?? '',
+                ),
+            ],
+            attachments: [
+              for (final item
+                  in ((item['attachments'] as List?) ?? [])
+                      .whereType<Map<String, dynamic>>())
+                ChatAttachment.fromJson(item),
+            ],
+          );
+        })
+        .toList(growable: false);
   }
 }
 

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'markdown.dart';
 import 'state.dart';
 import 'waiting.dart';
+import 'attachments.dart';
 
 void main() {
   runApp(const VanGoalApp());
@@ -71,9 +72,8 @@ class _VanGoalAppState extends State<VanGoalApp> {
       // the desktop client does it. Sizes below are therefore design sizes: none
       // of them is scaled by hand.
       builder: (context, child) => MediaQuery(
-        data: MediaQuery.of(context).copyWith(
-          textScaler: TextScaler.linear(_app.fontSize.scale),
-        ),
+        data: MediaQuery.of(context)
+            .copyWith(textScaler: TextScaler.linear(_app.fontSize.scale)),
         child: child ?? const SizedBox.shrink(),
       ),
       home: const ChatPage(),
@@ -124,6 +124,15 @@ class _ChatPageState extends State<ChatPage> {
     if (!mounted) {
       return;
     }
+    final restored = _app.restoredDraft;
+    if (restored != null) {
+      _app.restoredDraft = null;
+      if (restored.isNotEmpty) {
+        _composer.text = _composer.text.trim().isEmpty
+            ? restored
+            : '$restored\n\n${_composer.text}';
+      }
+    }
     setState(() {});
     WidgetsBinding.instance.addPostFrameCallback((_) => _followToBottom());
   }
@@ -155,11 +164,10 @@ class _ChatPageState extends State<ChatPage> {
 
   void _send() {
     final text = _composer.text;
-    if (text.trim().isEmpty) {
+    if (text.trim().isEmpty && _app.draftAttachments.isEmpty) {
       return;
     }
-    _composer.clear();
-    _app.send(text);
+    if (_app.send(text)) _composer.clear();
   }
 
   @override
@@ -213,9 +221,10 @@ class _ChatPageState extends State<ChatPage> {
             IconButton(
               tooltip: 'Reconnect',
               onPressed: _app.retry,
-              icon: Icon(Icons.sync, color: _app.link == LinkState.connecting
-                  ? _inkFaint
-                  : _accent),
+              icon: Icon(
+                Icons.sync,
+                color: _app.link == LinkState.connecting ? _inkFaint : _accent,
+              ),
             ),
           IconButton(
             tooltip: 'New chat',
@@ -249,7 +258,9 @@ class _ChatPageState extends State<ChatPage> {
         children: [
           if (_app.error != null)
             _ErrorBanner(message: _app.error!, onDismiss: _app.dismissError),
-          Expanded(child: _Transcript(app: _app, controller: _scroll)),
+          Expanded(
+            child: _Transcript(app: _app, controller: _scroll),
+          ),
           if (_app.clarifyQuestion != null) _ClarifyCard(app: _app),
           _Composer(controller: _composer, app: _app, onSend: _send),
         ],
@@ -285,17 +296,15 @@ class _Transcript extends StatelessWidget {
     if (app.messages.isEmpty && !app.sending) {
       return _EmptyState(app: app);
     }
-    // The reply gets a bubble of its own before the gateway has said anything,
-    // so a wait always has something moving on screen — see `withWaitingBubble`.
-    final messages = withWaitingBubble(app.messages, app.sending);
+    // The core includes the pending reply in its snapshot; this view draws
+    // that placeholder without assembling another message locally.
+    final messages = app.messages;
     return ListView.builder(
       controller: controller,
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
       itemCount: messages.length,
-      itemBuilder: (context, index) => _Bubble(
-        key: ValueKey(messages[index].id),
-        message: messages[index],
-      ),
+      itemBuilder: (context, index) =>
+          _Bubble(key: ValueKey(messages[index].id), message: messages[index]),
     );
   }
 }
@@ -376,6 +385,12 @@ class _Bubble extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
+            for (final item in message.attachments)
+              AttachmentView(
+                key: ValueKey(item.path),
+                item: item,
+                load: AppState.instance.loadAttachment,
+              ),
             if (waiting)
               const WaitingDots()
             else if (message.text.isNotEmpty)
@@ -407,9 +422,7 @@ class _MarkdownView extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
-      children: [
-        for (final block in blocks) _block(block),
-      ],
+      children: [for (final block in blocks) _block(block)],
     );
   }
 
@@ -426,11 +439,14 @@ class _MarkdownView extends StatelessWidget {
         return Padding(
           padding: const EdgeInsets.only(top: 10, bottom: 4),
           child: SelectableText.rich(
-            _span(block['runs'], _body.copyWith(
-              fontSize: size,
-              fontWeight: FontWeight.w600,
-              height: 1.3,
-            )),
+            _span(
+              block['runs'],
+              _body.copyWith(
+                fontSize: size,
+                fontWeight: FontWeight.w600,
+                height: 1.3,
+              ),
+            ),
           ),
         );
       case 'bullet':
@@ -520,8 +536,7 @@ class _MarkdownView extends StatelessWidget {
             TableRow(
               decoration: const BoxDecoration(color: _panel),
               children: [
-                for (final header in headers)
-                  _cell(header, bold: true),
+                for (final header in headers) _cell(header, bold: true),
               ],
             ),
             for (final row in rows.whereType<List>())
@@ -659,47 +674,105 @@ class _Composer extends StatelessWidget {
           color: _panel,
           border: Border(top: BorderSide(color: _line)),
         ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                minLines: 1,
-                maxLines: 6,
-                style: const TextStyle(fontSize: 15),
-                decoration: InputDecoration(
-                  hintText: 'Ask your agent for follow-up changes',
-                  hintStyle: const TextStyle(color: _inkFaint),
-                  filled: true,
-                  fillColor: _raised,
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 10,
-                  ),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    borderSide: const BorderSide(color: _line),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    borderSide: const BorderSide(color: _line),
-                  ),
+            if (app.draftAttachments.isNotEmpty)
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    for (final item in app.draftAttachments)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: SizedBox(
+                          width: 145,
+                          child: AttachmentView(
+                            key: ValueKey(item.path),
+                            item: item,
+                            load: app.loadAttachment,
+                            onRemove: () => app.removeAttachment(item),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
-            ),
-            const SizedBox(width: 8),
-            app.sending
-                ? IconButton.filledTonal(
-                    tooltip: 'Stop',
-                    onPressed: app.interrupt,
-                    icon: const Icon(Icons.stop_rounded),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                if (app.pickingFiles)
+                  const Padding(
+                    padding: EdgeInsets.all(12),
+                    child: SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
                   )
-                : IconButton.filled(
-                    tooltip: 'Send',
-                    onPressed: app.canSend ? onSend : null,
-                    icon: const Icon(Icons.arrow_upward_rounded),
+                else if (app.backend == Backend.xuexiaomi)
+                  PopupMenuButton<bool>(
+                    tooltip: '添加附件',
+                    icon: const Icon(Icons.add_circle_outline),
+                    onSelected: (images) => app.pickFiles(images: images),
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: true, child: Text('图片')),
+                      PopupMenuItem(value: false, child: Text('文件')),
+                    ],
                   ),
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    contentInsertionConfiguration:
+                        app.backend == Backend.xuexiaomi
+                        ? ContentInsertionConfiguration(
+                            allowedMimeTypes: const [
+                              'image/png',
+                              'image/jpeg',
+                              'image/gif',
+                              'image/webp',
+                            ],
+                            onContentInserted: app.insertImage,
+                          )
+                        : null,
+                    minLines: 1,
+                    maxLines: 6,
+                    style: const TextStyle(fontSize: 15),
+                    decoration: InputDecoration(
+                      hintText: 'Ask your agent for follow-up changes',
+                      hintStyle: const TextStyle(color: _inkFaint),
+                      filled: true,
+                      fillColor: _raised,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                        borderSide: const BorderSide(color: _line),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(20),
+                        borderSide: const BorderSide(color: _line),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                app.sending
+                    ? IconButton.filledTonal(
+                        tooltip: 'Stop',
+                        onPressed: app.interrupt,
+                        icon: const Icon(Icons.stop_rounded),
+                      )
+                    : IconButton.filled(
+                        tooltip: 'Send',
+                        onPressed: app.canSend ? onSend : null,
+                        icon: const Icon(Icons.arrow_upward_rounded),
+                      ),
+              ],
+            ),
           ],
         ),
       ),
@@ -760,8 +833,7 @@ class _SessionDrawer extends StatelessWidget {
                           final session = app.sessions[index];
                           return ListTile(
                             selected: session.id == app.sessionId,
-                            selectedTileColor:
-                                _accent.withValues(alpha: 0.12),
+                            selectedTileColor: _accent.withValues(alpha: 0.12),
                             title: Text(
                               session.title,
                               maxLines: 1,
@@ -877,7 +949,8 @@ class _SettingsSheetState extends State<_SettingsSheet> {
               controller: _host,
               decoration: const InputDecoration(
                 labelText: 'Host or URL',
-                helperText: 'A full ws:// or wss:// URL overrides host and port.',
+                helperText:
+                    'A full ws:// or wss:// URL overrides host and port.',
                 helperMaxLines: 2,
               ),
             ),

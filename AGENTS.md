@@ -9,6 +9,15 @@ the full picture; [docs/sessions.md](docs/sessions.md) and
 [docs/mobile.md](docs/mobile.md) cover the two parts that are easiest to get
 subtly wrong.
 
+## User validation preference
+
+The user performs testing. Unless they explicitly ask otherwise, do not run
+automated tests, live gateway probes, or device/UI smoke tests, and do not send
+test prompts or manipulate the phone's interface. Implement changes, build,
+package and install the requested update, then hand functional verification to
+the user. The test and probe commands below are references, not authorization
+to run them. Keep unverified behavior marked as awaiting user acceptance.
+
 ## Layout
 
 ```

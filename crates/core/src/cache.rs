@@ -49,8 +49,14 @@ impl SessionCacheStore {
     /// Serialize + write on a detached background thread; the caller returns
     /// immediately so streaming deltas never block the UI.
     pub fn save(&self, state: CachedState) {
-        let path = self.path.clone();
-        std::thread::spawn(move || match serde_json::to_vec(&state) {
+        let store = self.clone();
+        std::thread::spawn(move || store.save_blocking(state));
+    }
+
+    /// For an ordered background writer that already owns its worker thread.
+    pub fn save_blocking(&self, state: CachedState) {
+        let path = &self.path;
+        match serde_json::to_vec(&state) {
             Ok(data) => {
                 let tmp = path.with_extension("json.tmp");
                 if std::fs::write(&tmp, &data).is_ok() {
@@ -66,7 +72,7 @@ impl SessionCacheStore {
             Err(error) => {
                 global_logger().log("cache", format!("cache save failed: {error}"));
             }
-        });
+        }
     }
 
     pub fn clear(&self) {

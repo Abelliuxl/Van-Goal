@@ -102,6 +102,41 @@ desktop's "multiply every design size by one number".
 phone, they take more room than the reply they belong to. Off draws the replies
 alone.
 
+## Images and files on Android
+
+雪小米 supports six attachments per message, with an 8 MB limit per supported
+image and 24 MB per other file. The composer offers separate image and file
+pickers and accepts images inserted by the keyboard. Android's document picker
+grants access only to the selected content URIs; Kotlin copies their bytes into
+the app's private `Attachments/` directory before handing paths to Rust. This
+does not require access to the user's entire storage or photo library.
+
+`send` accepts an `attachments` array of private paths. The mobile bridge adds
+the prompt and placeholder through `Conversation`, then calls the same
+`Backend::submit_with_attachments` as the desktop. Failed delivery removes the
+unsent prompt and emits `composer_restore` with the original text and files.
+The view keeps any newer draft and puts the returned text before it. A session
+switch while delivery is pending cannot redirect the prompt to another chat.
+
+Transcript snapshots include `{path, name, remote}` attachments. Received images
+load through asynchronous `load_attachment` commands, whose `attachment_ready`
+events carry a request id and private cached path. File bytes never travel
+through large base64 FFI payloads. Previews and saving share the core's durable
+cache so they do not consume a single-use gateway link twice. Local history is
+stored through an ordered background writer in `SessionCache.json`, with keys
+qualified by backend; restarting can recover attachment metadata this client
+watched even when the gateway's history only contains text.
+
+Saving on Android 10 and newer writes to `Download/Van-Goal` through MediaStore,
+then offers to open the saved content URI. Android 7–9 uses the system Save As
+picker (starting in Downloads where the OS supports an initial location).
+No broad storage permission is added. Other mobile backends keep text-only
+sending until they have a native upload protocol.
+
+The public gateway's nginx request-body limit is independent of the app's
+8/24 MB limits; HTTP 413 still returns the unsent draft and files. See the
+measured deployment limit in [architecture.md](architecture.md#attachments).
+
 ## Building
 
 ```bash
