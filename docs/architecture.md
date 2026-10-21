@@ -47,6 +47,7 @@ a turn:
 MessageStart
 MessageDelta { text, source }   // a chunk, possibly on more than one stream
 MessageComplete(Option<String>) // the authoritative text, when the backend sends it
+Attachment(ComposerAttachment) // a file returned by the backend
 Tool(ToolCallRecord)
 TurnFailed(String) / Failed(String) / Disconnected / Connected
 SessionInfo(String) / SessionsChanged / Clarify { .. }
@@ -79,6 +80,45 @@ inside it.
 These are subtle enough that two implementations drift: the mobile client used to
 have a second one and it produced one "Thinking…" bubble per event. The desktop
 `AppState` and the mobile bridge both fold through `Conversation` now.
+
+## Attachments
+
+`Backend::submit_with_attachments` sends local agents their existing `@path`
+references. 雪小米 receives PNG/JPEG/GIF/WebP bytes as base64 `images` entries
+with `mimeType`; other files go through `POST api/upload` with `{session, name,
+data}`, then the returned server path is appended to the chat request. Validation
+happens before uploading: six files maximum, 8 MB per image, 24 MB per other file.
+The reverse proxy must also allow the base64 JSON bodies. On 2026-10-21 the
+public gateway rejected an 871 KB PNG with nginx HTTP 413; that request exceeds
+1 MB after base64 encoding. A deployment limit of 80 MB accommodates six 8 MB
+images in one chat request. A refused upload restores the composer draft and
+its attachments; the client does not silently resend or change the image.
+
+雪小米's SSE `attachment` event carries `{name, url}`. It passes the same
+session filter as text, and `Conversation` folds and deduplicates it, including
+replies with files and no text. The desktop bridge starts caching returned files
+as soon as they arrive: gateway download links may expire or be single-use, so
+preview and Save must share one fetch. The cache is in `ReceivedAttachments/`;
+clipboard images are retained in `Attachments/` so a cached transcript can still
+preview them after a restart. Downloads are limited to 256 MB and the gateway's
+own origin; redirects are refused. Preview decoding is bounded separately.
+The native Save dialog starts at the absolute `~/Downloads/<filename>` path so
+it does not open at the filesystem root when the app launches from Finder.
+
+Measured history currently contains text and `[图片]` / upload-path markers,
+without attachment metadata. Reopening merges files recorded by this client;
+it cannot recover files from a turn it never watched. Matching the transport
+markers recovers the original user text and local attachments without exposing
+upload paths for prompts sent here.
+
+The opt-in desktop bridge media check uses a caller-supplied image and text
+containing `VG_MEDIA_INPUT_OK` (it creates one real gateway session):
+
+```bash
+VG_XXM_URL=https://host:port/ VG_XXM_TOKEN_FILE=path/to/token \
+VG_XXM_IMAGE_FILE=path/to/image.png VG_XXM_ATTACHMENT_FILE=path/to/verification.txt \
+  cargo run -p van-goal-desktop --example xuexiaomi_e2e
+```
 
 ## Threading
 

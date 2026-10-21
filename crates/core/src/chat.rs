@@ -10,7 +10,9 @@
 //! * folding the events of a turn into the message list a frontend draws
 //!   ([`Conversation`]).
 
-use crate::models::{now_unix, AgentEvent, AgentSession, ChatMessage, DeltaSource, MessageRole};
+use crate::models::{
+    now_unix, AgentEvent, AgentSession, ChatMessage, ComposerAttachment, DeltaSource, MessageRole,
+};
 use std::collections::BTreeMap;
 
 /// A session is unnamed while it still carries the placeholder the client uses
@@ -210,13 +212,51 @@ impl Conversation {
                 .iter()
                 .position(|candidate| {
                     candidate.role == message.role
-                        && candidate.content.trim() == message.content.trim()
+                        && (candidate.content.trim() == message.content.trim()
+                            || (!candidate.attachments.is_empty()
+                                && message
+                                    .attachment_match_text
+                                    .as_deref()
+                                    .is_some_and(|text| candidate.content.trim() == text.trim())))
                 })
                 .map(|offset| cursor + offset);
 
             if let Some(index) = matched {
+                if message.role != MessageRole::Assistant {
+                    merged.extend(
+                        local[cursor..index]
+                            .iter()
+                            .filter(|m| {
+                                m.role == MessageRole::Assistant
+                                    && m.content.trim().is_empty()
+                                    && !m.attachments.is_empty()
+                            })
+                            .cloned(),
+                    );
+                }
+                if !local[index].attachments.is_empty() && message.attachment_match_text.is_some() {
+                    message.content = local[index].content.clone();
+                }
+                for attachment in &local[index].attachments {
+                    if !message
+                        .attachments
+                        .iter()
+                        .any(|kept| kept.path == attachment.path)
+                    {
+                        message.attachments.push(attachment.clone());
+                    }
+                }
                 if message.role == MessageRole::Assistant {
                     for candidate in &local[cursor..=index] {
+                        for attachment in &candidate.attachments {
+                            if !message
+                                .attachments
+                                .iter()
+                                .any(|kept| kept.path == attachment.path)
+                            {
+                                message.attachments.push(attachment.clone());
+                            }
+                        }
                         for call in &candidate.tool_calls {
                             if !message.tool_calls.iter().any(|kept| kept.id == call.id) {
                                 message.tool_calls.push(call.clone());
@@ -228,6 +268,18 @@ impl Conversation {
             }
             merged.push(message);
         }
+
+        // Some histories omit a reply that contained files and no text.
+        merged.extend(
+            local[cursor..]
+                .iter()
+                .filter(|m| {
+                    m.role == MessageRole::Assistant
+                        && m.content.trim().is_empty()
+                        && !m.attachments.is_empty()
+                })
+                .cloned(),
+        );
 
         self.set_transcript(merged);
     }
@@ -253,6 +305,7 @@ impl Conversation {
             AgentEvent::MessageDelta { text, source } => self.apply_delta(text, *source),
             AgentEvent::MessageComplete(text) => self.complete_message(text.as_deref()),
             AgentEvent::Tool(record) => self.append_tool_call(record),
+            AgentEvent::Attachment(attachment) => self.append_attachment(attachment),
             AgentEvent::TurnFailed(_) => {
                 self.finish_turn();
                 ConversationChange::Structure
@@ -275,6 +328,35 @@ impl Conversation {
         }
         self.messages
             .push(ChatMessage::streaming(MessageRole::Assistant));
+        ConversationChange::Structure
+    }
+
+    fn append_attachment(&mut self, attachment: &ComposerAttachment) -> ConversationChange {
+        let start = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if self.messages[start..]
+            .iter()
+            .any(|m| m.attachments.iter().any(|a| a.path == attachment.path))
+        {
+            return ConversationChange::None;
+        }
+        let index = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::Assistant && m.is_streaming);
+        let message = match index {
+            Some(index) => &mut self.messages[index],
+            None => {
+                self.messages
+                    .push(ChatMessage::streaming(MessageRole::Assistant));
+                self.messages.last_mut().unwrap()
+            }
+        };
+        message.attachments.push(attachment.clone());
         ConversationChange::Structure
     }
 
@@ -404,6 +486,46 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_only_replies_survive_completion_replay_and_history_reload() {
+        let mut conversation = Conversation::new();
+        conversation.begin_turn_with_placeholder("send a file");
+        let mut file = ComposerAttachment::new("/api/files/abc");
+        file.display_name = Some("报告.pdf".into());
+        assert_eq!(
+            conversation.apply(&AgentEvent::Attachment(file.clone())),
+            ConversationChange::Structure
+        );
+        assert_eq!(
+            conversation.apply(&AgentEvent::Attachment(file)),
+            ConversationChange::None
+        );
+        conversation.apply(&AgentEvent::MessageComplete(Some("".into())));
+        assert_eq!(conversation.messages().len(), 2);
+        assert!(!conversation.messages()[1].is_streaming);
+        assert_eq!(conversation.messages()[1].attachments.len(), 1);
+        let fetched = vec![
+            ChatMessage::new(MessageRole::User, "send a file"),
+            ChatMessage::new(MessageRole::Assistant, ""),
+        ];
+        conversation.merge_transcript(fetched);
+        assert_eq!(conversation.messages()[1].attachments[0].name(), "报告.pdf");
+        conversation.merge_transcript(vec![ChatMessage::new(MessageRole::User, "send a file")]);
+        assert_eq!(
+            conversation.messages().len(),
+            2,
+            "history must not erase a file-only reply"
+        );
+        // Deduplication is scoped to a turn, so sending the same file next
+        // turn still produces an attachment.
+        let file = conversation.messages()[1].attachments[0].clone();
+        conversation.begin_turn_with_placeholder("again");
+        assert_eq!(
+            conversation.apply(&AgentEvent::Attachment(file)),
+            ConversationChange::Structure
+        );
+    }
 
     #[test]
     fn unnamed_sessions_are_recognised() {

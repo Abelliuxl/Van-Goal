@@ -23,6 +23,7 @@ Van-Goal is a thin, fast frontend: the selected agent backend stays the runtime,
 - **Interface zoom** — View → Zoom In / Zoom Out / Actual Size (⌘+ / ⌘− / ⌘0) magnifies the whole window, text and chrome together, and the level survives a restart. It is independent of Text size, so you can enlarge type without inflating the layout around it.
 - **Comes back on its own** — a dropped connection is retried with a backoff and the open chat is re-attached; a prompt that cannot be delivered goes back to the composer with the reason, never into another chat.
 - **Native integration** — system/light/dark appearance, app-local credentials, Ed25519 device identity for OpenClaw, drag-and-drop attachments, and a native menu with Command shortcuts on macOS and Ctrl shortcuts on Windows (N / R / B / , / + / − / 0).
+- **雪小米 attachments** — send images as multimodal input, upload documents, paste screenshots or copied files, preview images, and save files returned by the agent. Saving starts in your Downloads folder. Up to six attachments per message: 8 MB per image and 24 MB per other file.
 
 ## Build
 

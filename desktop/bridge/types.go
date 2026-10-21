@@ -44,8 +44,9 @@ type Tool struct {
 }
 
 type Attachment struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Remote bool   `json:"remote"`
 }
 
 type State struct {

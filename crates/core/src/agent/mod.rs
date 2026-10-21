@@ -3,6 +3,23 @@ use crate::settings::BackendKind;
 use anyhow::Result;
 use futures::channel::mpsc::UnboundedSender;
 
+/// A local agent can resolve a path on the same computer.
+pub fn referenced_prompt(text: &str, attachments: &[ComposerAttachment]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    let list = attachments
+        .iter()
+        .map(|a| format!("- @{}", a.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        format!("Attached files:\n{list}")
+    } else {
+        format!("{text}\n\nAttached files:\n{list}")
+    }
+}
+
 pub mod cli;
 pub mod device_identity;
 pub mod hermes;
@@ -218,6 +235,22 @@ impl Backend {
             Backend::OpenClaw(b) => b.submit_prompt(session_id, text).await,
             Backend::XueXiaoMi(b) => b.submit_prompt(session_id, text).await,
         }
+    }
+
+    /// Local agents resolve paths themselves; gateways must receive the bytes.
+    pub async fn submit_with_attachments(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        attachments: &[ComposerAttachment],
+    ) -> Result<()> {
+        if let Backend::XueXiaoMi(backend) = self {
+            return backend
+                .submit_with_attachments(session_id, text, attachments)
+                .await;
+        }
+        let prompt = referenced_prompt(text, attachments);
+        self.submit_prompt(session_id, &prompt).await
     }
 
     pub async fn respond_to_interaction(&mut self, request_id: &str, answer: &str) -> Result<()> {

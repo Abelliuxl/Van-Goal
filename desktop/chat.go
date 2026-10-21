@@ -123,7 +123,7 @@ func (a *app) userMessage(c *ui.Context, m bridge.Message) {
 		if len(m.Attachments) > 0 {
 			ui.Row(c).Gap(a.px(6)).Wrap().Justify(ui.End).Children(func() {
 				for _, at := range m.Attachments {
-					a.fileChip(c, at.Name, at.Path, nil)
+					a.messageAttachment(c, at)
 				}
 			})
 		}
@@ -140,6 +140,9 @@ func (a *app) assistantMessage(c *ui.Context, i int, m bridge.Message) {
 	ui.Column(c).Gap(a.px(10)).Children(func() {
 		if len(m.Tools) > 0 && a.settings.ShowToolCalls {
 			a.toolGroup(c, m)
+		}
+		for _, at := range m.Attachments {
+			a.messageAttachment(c, at)
 		}
 		content := strings.TrimSpace(m.Content)
 		switch {
@@ -354,14 +357,17 @@ func (a *app) composer(c *ui.Context) {
 			ui.Row(c).Gap(a.px(6)).Wrap().Padding(a.px(6), a.px(8), a.px(2), a.px(8)).Children(func() {
 				for _, path := range a.attachments {
 					path := path
-					a.fileChip(c, filepath.Base(path), path, func() {
-						out := a.attachments[:0:0]
-						for _, other := range a.attachments {
-							if other != path {
-								out = append(out, other)
+					ui.Column(c.Key(path)).Gap(a.px(4)).Children(func() {
+						a.imagePreview(c, path, filepath.Base(path), false, a.px(120))
+						a.fileChip(c, filepath.Base(path), path, func() {
+							out := a.attachments[:0:0]
+							for _, other := range a.attachments {
+								if other != path {
+									out = append(out, other)
+								}
 							}
-						}
-						a.attachments = out
+							a.attachments = out
+						})
 					})
 				}
 			})
@@ -383,10 +389,7 @@ func (a *app) composer(c *ui.Context) {
 			}
 			return false
 		})
-		in.OnPaste(func(text string) bool {
-			// A pasted file path list from the file manager becomes attachments.
-			return false
-		})
+		in.OnPaste(a.pasteAttachment)
 		if a.focusDraft {
 			in.Focus()
 			a.focusDraft = false

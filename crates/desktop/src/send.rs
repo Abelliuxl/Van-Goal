@@ -22,7 +22,7 @@ use van_goal_core::models::{
 };
 
 use crate::client::{backend_config, Shared};
-use crate::state::{submitted_prompt, ComposerAction, State};
+use crate::state::{ComposerAction, State};
 
 /// How long a prompt typed while connecting waits for the connection.
 const CONNECT_WAIT: Duration = Duration::from_secs(45);
@@ -167,7 +167,7 @@ async fn deliver(
     };
 
     guard
-        .submit_prompt(&live, &submitted_prompt(text, attachments))
+        .submit_with_attachments(&live, text, attachments)
         .await
         .map_err(|error| anyhow!("Could not send the prompt: {error}"))?;
     drop(guard);

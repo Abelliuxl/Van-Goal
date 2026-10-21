@@ -27,6 +27,7 @@ pub fn handle(shared: &Arc<Shared>, epoch: u64, event: AgentEvent) {
         AgentEvent::MessageStart
             | AgentEvent::MessageDelta { .. }
             | AgentEvent::MessageComplete(_)
+            | AgentEvent::Attachment(_)
             | AgentEvent::Tool(_)
             | AgentEvent::TurnFailed(_)
             | AgentEvent::Clarify { .. }

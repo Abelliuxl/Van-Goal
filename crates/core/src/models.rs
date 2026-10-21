@@ -138,6 +138,9 @@ pub struct ModelOption {
 pub struct ComposerAttachment {
     pub id: String,
     pub path: String,
+    /// The backend's filename when `path` is a download URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl ComposerAttachment {
@@ -145,10 +148,14 @@ impl ComposerAttachment {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             path: path.into(),
+            display_name: None,
         }
     }
 
     pub fn name(&self) -> String {
+        if let Some(name) = &self.display_name {
+            return name.clone();
+        }
         std::path::Path::new(&self.path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -265,6 +272,10 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCallRecord>,
     #[serde(default)]
     pub attachments: Vec<ComposerAttachment>,
+    /// Transport-only suffixes can differ from the local prompt with files.
+    /// Used solely to recover local attachment metadata while merging history.
+    #[serde(skip)]
+    pub attachment_match_text: Option<String>,
 }
 
 impl ChatMessage {
@@ -278,6 +289,7 @@ impl ChatMessage {
             completed_at: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            attachment_match_text: None,
         }
     }
 
@@ -426,6 +438,7 @@ pub enum AgentEvent {
         source: DeltaSource,
     },
     MessageComplete(Option<String>),
+    Attachment(ComposerAttachment),
     /// The gateway's session list changed (renamed, created, finished a turn).
     /// Carries no payload: it is a hint to re-list.
     SessionsChanged,

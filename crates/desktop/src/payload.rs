@@ -98,6 +98,7 @@ fn message(message: &ChatMessage) -> Value {
         "attachments": message.attachments.iter().map(|a| json!({
             "path": a.path,
             "name": a.name(),
+            "remote": a.display_name.is_some(),
         })).collect::<Vec<_>>(),
     })
 }

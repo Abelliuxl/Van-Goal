@@ -309,23 +309,8 @@ fn estimated_tokens(messages: &[ChatMessage]) -> i64 {
     FIXED_PROMPT_TOKENS + (chars as i64) / 4
 }
 
-/// The prompt as the backend receives it: attachments are named as `@path`
-/// references, which every supported agent resolves itself.
-pub fn submitted_prompt(text: &str, attachments: &[ComposerAttachment]) -> String {
-    if attachments.is_empty() {
-        return text.to_string();
-    }
-    let list = attachments
-        .iter()
-        .map(|attachment| format!("- @{}", attachment.path))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
-        format!("Attached files:\n{list}")
-    } else {
-        format!("{text}\n\nAttached files:\n{list}")
-    }
-}
+#[cfg(test)]
+use van_goal_core::agent::referenced_prompt as submitted_prompt;
 
 /// Attachments from paths, trimmed, without empties or duplicates.
 pub fn attachments_from(paths: &[String]) -> Vec<ComposerAttachment> {

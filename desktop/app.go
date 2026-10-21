@@ -27,6 +27,8 @@ type app struct {
 	draft       string
 	attachments []string
 	focusDraft  bool
+	previews    map[string]*attachmentPreview
+	downloads   map[string]bool
 
 	// Chrome.
 	list         ui.ListState
@@ -65,6 +67,8 @@ func newApp() *app {
 		sidebarOpen: true,
 		scale:       1,
 		pxScale:     1,
+		previews:    map[string]*attachmentPreview{},
+		downloads:   map[string]bool{},
 	}
 }
 

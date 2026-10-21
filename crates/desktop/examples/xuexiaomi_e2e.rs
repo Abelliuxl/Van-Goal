@@ -28,7 +28,11 @@ fn command(value: Value) -> Value {
 
 fn ok(value: Value) -> Value {
     let reply = command(value.clone());
-    assert_eq!(reply["ok"], true, "{value} → {reply}");
+    assert_eq!(
+        reply["ok"], true,
+        "{} failed: {}",
+        value["cmd"], reply["error"]
+    );
     reply
 }
 
@@ -76,11 +80,16 @@ impl View {
                 println!("  ✓ {what} ({:.1}s)", start.elapsed().as_secs_f32());
                 return;
             }
-            assert!(
-                start.elapsed() < limit,
-                "timed out waiting for {what}; state: {}",
-                self.state
-            );
+            if start.elapsed() >= limit {
+                if self.sending() {
+                    command(json!({"cmd": "stop"}));
+                }
+                panic!(
+                    "timed out waiting for {what}; connection {}, error {}",
+                    self.connection(),
+                    self.state["error"]
+                );
+            }
             vgd_wait(500);
         }
     }
@@ -116,6 +125,111 @@ fn main() {
         v.connection() == "connected"
     });
     assert_eq!(view.state["backend"]["name"], "雪小米");
+
+    // Opt-in media check: reads only caller-supplied fixtures and creates a
+    // fresh session, without touching the user's app data or conversations.
+    if let (Ok(file), Ok(image)) = (
+        std::env::var("VG_XXM_ATTACHMENT_FILE"),
+        std::env::var("VG_XXM_IMAGE_FILE"),
+    ) {
+        ok(json!({"cmd": "new_chat"}));
+        view.until("blank media chat", Duration::from_secs(5), |v| {
+            v.messages.is_empty()
+        });
+        ok(
+            json!({"cmd": "send", "text": "不调用工具，请直接描述附图的内容。", "attachments": [image.clone()]}),
+        );
+        view.until("image prompt accepted", Duration::from_secs(5), |v| {
+            v.sending()
+        });
+        view.until("image reply finished", Duration::from_secs(120), |v| {
+            !v.sending()
+        });
+        assert!(
+            !view.messages.is_empty(),
+            "image prompt returned to composer: {}",
+            view.state["error"]
+        );
+        let image_reply = view.messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap_or("");
+        println!("image reply: {image_reply}");
+        // Transport tests assert the exact image bytes; a model's visual
+        // judgement is not an API contract.
+        assert!(
+            !image_reply.is_empty() && !image_reply.starts_with("Error:"),
+            "image turn failed"
+        );
+        ok(
+            json!({"cmd": "send", "text": "这是客户端附件自检。请读取附带文本中的校验码，然后将该文本复制为 vg-received.txt 并通过发送文件工具作为附件返回。不要仅返回路径或 Markdown 链接。", "attachments": [file, image]}),
+        );
+        view.until("media prompt accepted", Duration::from_secs(5), |v| {
+            v.sending()
+        });
+        view.until("media reply finished", Duration::from_secs(240), |v| {
+            !v.sending()
+        });
+        let text = view
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("media reply: {text}");
+        assert!(
+            text.contains("VG_MEDIA_INPUT_OK"),
+            "backend did not read uploaded file"
+        );
+        let attachments: Vec<Value> = view
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["attachments"].as_array().into_iter().flatten().cloned())
+            .collect();
+        assert!(!attachments.is_empty(), "no attachment event received");
+        let attachment = &attachments[0];
+        let preview = ok(json!({"cmd": "read_attachment", "source": attachment["path"]}));
+        assert!(preview["data"].as_str().is_some_and(|s| !s.is_empty()));
+        let destination = dir.join("received.txt");
+        ok(
+            json!({"cmd": "download_attachment", "source": attachment["path"], "destination": destination}),
+        );
+        assert!(std::fs::read_to_string(&destination)
+            .unwrap()
+            .contains("VG_MEDIA_INPUT_OK"));
+        println!("  ✓ uploaded file, multimodal image, streamed attachment, downloaded bytes");
+        let id = view.state["selected"]["id"].clone();
+        let previous_id = view.messages.last().unwrap()["id"].clone();
+        ok(json!({"cmd": "new_chat"}));
+        view.until("blank again", Duration::from_secs(5), |v| {
+            v.messages.is_empty()
+        });
+        ok(json!({"cmd": "open_session", "id": id}));
+        view.until(
+            "attachment restored from history",
+            Duration::from_secs(30),
+            |v| {
+                v.messages.last().is_some_and(|m| m["id"] != previous_id)
+                    && v.messages.iter().any(|m| {
+                        m["role"] == "assistant"
+                            && m["attachments"].as_array().is_some_and(|a| !a.is_empty())
+                    })
+            },
+        );
+        assert!(
+            view.messages.iter().any(|m| m["role"] == "user"
+                && m["attachments"].as_array().is_some_and(|a| a.len() == 2)),
+            "sent attachment metadata did not survive the server history merge"
+        );
+        ok(
+            json!({"cmd": "download_attachment", "source": attachment["path"], "destination": destination}),
+        );
+        ok(json!({"cmd": "disconnect"}));
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("media check passed — created session {id}");
+        return;
+    }
 
     println!("2. sessions");
     view.until("sessions listed", Duration::from_secs(30), |v| {

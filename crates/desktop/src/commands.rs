@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
 use van_goal_core::agent::openclaw;
@@ -94,6 +95,74 @@ pub fn dispatch(shared: &Arc<Shared>, name: &str, value: &Value) -> Result<Optio
                 attachments_from(&strings(value, "attachments")),
             );
             Ok(None)
+        }
+        "paste_image" => {
+            let data = string(value, "data")?;
+            if data.len() > 12 * 1024 * 1024 {
+                return Err(anyhow!("Image exceeds 8 MB"));
+            }
+            let bytes = STANDARD.decode(data)?;
+            if bytes.len() > 8 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err(anyhow!("Paste a PNG image up to 8 MB."));
+            }
+            let dir = van_goal_core::logger::dirs::app_dir().join("Attachments");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!(
+                "Clipboard-{}.png",
+                van_goal_core::models::ComposerAttachment::new("").id
+            ));
+            std::fs::write(&path, bytes)?;
+            Ok(Some(json!({"path": path})))
+        }
+        // Called on a Go worker, never the window thread. Keep network work
+        // off the state lock so streaming and switching sessions stay live.
+        "read_attachment" | "download_attachment" => {
+            let source = string(value, "source")?;
+            let config = {
+                let state = shared.lock();
+                if state.kind() != BackendKind::XueXiaoMi
+                    || !state
+                        .conversation
+                        .messages()
+                        .iter()
+                        .any(|m| m.attachments.iter().any(|a| a.path == source))
+                {
+                    return Err(anyhow!(
+                        "That attachment is no longer in the open conversation."
+                    ));
+                }
+                crate::client::backend_config(&state.settings)
+            };
+            let bytes =
+                shared
+                    .handle
+                    .block_on(van_goal_core::agent::xuexiaomi::attachment_bytes(
+                        &config,
+                        &source,
+                        name == "read_attachment",
+                    ))?;
+            if name == "read_attachment" {
+                return Ok(Some(json!({"data": STANDARD.encode(bytes)})));
+            }
+            let path = std::path::PathBuf::from(string(value, "destination")?);
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("Choose a destination folder."))?;
+            // A failed download never truncates an existing user file.
+            let temp = parent.join(format!(
+                ".van-goal-{}.download",
+                van_goal_core::models::ComposerAttachment::new("").id
+            ));
+            let result = (|| -> Result<()> {
+                std::fs::write(&temp, bytes)?;
+                std::fs::rename(&temp, &path)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result?;
+            Ok(Some(json!({"path": path})))
         }
         "stop" => {
             crate::send::stop(shared);

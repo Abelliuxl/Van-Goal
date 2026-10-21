@@ -41,6 +41,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod files;
+pub use files::attachment_bytes;
+
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A turn can run tools for minutes; only the connect is bounded.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -220,6 +223,15 @@ impl XueXiaoMiBackend {
     }
 
     pub async fn submit_prompt(&mut self, session_id: &str, text: &str) -> Result<()> {
+        self.submit_with_attachments(session_id, text, &[]).await
+    }
+
+    pub async fn submit_with_attachments(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        attachments: &[ComposerAttachment],
+    ) -> Result<()> {
         let config = self.config()?.clone();
         let events = self
             .shared()
@@ -227,16 +239,55 @@ impl XueXiaoMiBackend {
             .clone()
             .ok_or_else(|| anyhow!("雪小米 is not connected."))?;
 
+        // Validate every file before uploading any of them or continuing a snapshot.
+        let prepared = files::prepare(attachments)?;
         // A channel conversation is a snapshot; it takes new prompts as a
         // writable copy, continued once and reused after that.
         let target = self.writable_session(&config, session_id).await?;
+
+        let mut images = Vec::new();
+        let mut paths = Vec::new();
+        for file in prepared {
+            if let Some(mime) = file.mime {
+                images.push(serde_json::json!({ "data": file.data, "mimeType": mime }));
+            } else {
+                let uploaded = self
+                    .post(
+                        &config,
+                        "api/upload",
+                        serde_json::json!({
+                            "session": target, "name": file.name, "data": file.data,
+                        }),
+                    )
+                    .await?;
+                paths.push(
+                    uploaded
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            anyhow!("The gateway did not return the uploaded file's path.")
+                        })?
+                        .to_string(),
+                );
+            }
+        }
+        let mut message = if text.is_empty() && !attachments.is_empty() {
+            "（见附件）".to_string()
+        } else {
+            text.to_string()
+        };
+        if !paths.is_empty() {
+            message.push_str(&format!("\n\n[附件：{}]", paths.join("、")));
+        }
 
         let request = self
             .stream_http
             .post(url(&config, "api/chat"))
             .json(&serde_json::json!({
                 "session": target,
-                "message": text,
+                "message": message,
+                "images": images,
                 "stream": true,
             }));
         let response = authorized(request, &config)
@@ -250,7 +301,13 @@ impl XueXiaoMiBackend {
         let _ = events.unbounded_send(AgentEvent::MessageStart);
         let shared = self.shared.clone();
         let key = session_id.to_string();
-        let task = tokio::spawn(stream_turn(response, events, shared.clone(), key.clone()));
+        let task = tokio::spawn(stream_turn(
+            response,
+            events,
+            shared.clone(),
+            key.clone(),
+            config,
+        ));
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(previous) = guard.running.insert(key, task) {
             previous.abort();
@@ -336,6 +393,7 @@ async fn stream_turn(
     events: UnboundedSender<AgentEvent>,
     shared: Arc<Mutex<Shared>>,
     session: String,
+    config: BackendConfig,
 ) {
     let mut body = response.bytes_stream();
     let mut parser = SseParser::default();
@@ -360,6 +418,15 @@ async fn stream_turn(
                     AgentEvent::MessageComplete(_) | AgentEvent::TurnFailed(_)
                 );
                 if on_screen(&shared, &session) {
+                    if let AgentEvent::Attachment(attachment) = &event {
+                        let config = config.clone();
+                        let source = attachment.path.clone();
+                        // Keep short-lived, single-use links usable after this
+                        // turn. A preview or Save joins the same cached fetch.
+                        tokio::spawn(async move {
+                            let _ = attachment_bytes(&config, &source, false).await;
+                        });
+                    }
                     let _ = events.unbounded_send(event);
                 }
                 if last {
@@ -452,6 +519,7 @@ fn event_from_frame(frame: &SseFrame) -> Option<AgentEvent> {
             source: DeltaSource::EventStream,
         }),
         "done" => Some(AgentEvent::MessageComplete(text.map(str::to_string))),
+        "attachment" => files::from_row(&payload).map(AgentEvent::Attachment),
         "error" => Some(AgentEvent::TurnFailed(
             payload
                 .get("error")
@@ -522,6 +590,38 @@ fn message_from_row(row: &serde_json::Value) -> Option<ChatMessage> {
         text.to_string()
     };
     let mut message = ChatMessage::new(role, text);
+    if role == MessageRole::User {
+        // History only retains text markers, not the image bytes or upload
+        // metadata. Match the original prompt to recover what this client kept.
+        let mut plain = message.content.trim_end();
+        while let Some(rest) = plain.strip_suffix("\n[图片]") {
+            plain = rest.trim_end();
+        }
+        if plain.ends_with(']') {
+            if let Some((prefix, note)) = plain.rsplit_once("\n\n[附件：") {
+                if note[..note.len() - 1]
+                    .split('、')
+                    .all(|path| path.starts_with("uploads/"))
+                {
+                    plain = prefix;
+                }
+            }
+        }
+        if plain != message.content {
+            message.attachment_match_text = Some(if plain == "（见附件）" {
+                "".into()
+            } else {
+                plain.to_string()
+            });
+        }
+    }
+    message.attachments = row
+        .get("attachments")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(files::from_row)
+        .collect();
     if let Some(timestamp) = iso_seconds(row.get("timestamp")) {
         message.timestamp = timestamp;
         message.completed_at = Some(timestamp);
@@ -597,6 +697,167 @@ async fn error_from(response: reqwest::Response) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn files_upload_and_images_arrive_as_bytes_in_the_chat_request() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = BackendConfig {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            credential: "fixture".into(),
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(index) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&raw[..index]).to_lowercase();
+                        let length = header
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length: "))
+                            .map(|n| n.parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        assert!(header.contains("authorization: bearer fixture"));
+                        break (index + 4, length);
+                    }
+                };
+                while raw.len() < header_end + length {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let header = String::from_utf8_lossy(&raw[..header_end]);
+                let body = &raw[header_end..header_end + length];
+                let response = match step {
+                    0 => {
+                        assert!(header.starts_with("GET /api/status "));
+                        "{\"model\":\"fixture\"}".to_string()
+                    }
+                    1 => {
+                        assert!(header.starts_with("POST /api/upload "));
+                        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+                        assert_eq!(value["name"], "input.txt");
+                        assert_eq!(
+                            STANDARD.decode(value["data"].as_str().unwrap()).unwrap(),
+                            b"input bytes"
+                        );
+                        "{\"path\":\"uploads/session/input.txt\"}".to_string()
+                    }
+                    _ => {
+                        assert!(header.starts_with("POST /api/chat "));
+                        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+                        assert_eq!(
+                            value["message"],
+                            "inspect\n\n[附件：uploads/session/input.txt]"
+                        );
+                        assert_eq!(value["images"][0]["mimeType"], "image/png");
+                        assert_eq!(
+                            STANDARD
+                                .decode(value["images"][0]["data"].as_str().unwrap())
+                                .unwrap(),
+                            b"\x89PNG\r\n\x1a\nfixture"
+                        );
+                        "event: attachment\ndata: {\"url\":\"/api/download?token=fixture\",\"name\":\"result.txt\"}\n\nevent: done\ndata: {\"text\":\"ok\"}\n\n".to_string()
+                    }
+                };
+                let kind = if step == 2 {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("vg-wire-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.txt"), b"input bytes").unwrap();
+        std::fs::write(dir.join("picture.png"), b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        let mut backend = XueXiaoMiBackend::new();
+        backend.connect(config.clone(), sender).await.unwrap();
+        let session = backend.create_session(&config).await.unwrap();
+        backend
+            .submit_with_attachments(
+                &session.live_id,
+                "inspect",
+                &[
+                    ComposerAttachment::new(dir.join("input.txt").to_string_lossy()),
+                    ComposerAttachment::new(dir.join("picture.png").to_string_lossy()),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut attachment = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), receiver.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AgentEvent::Attachment(a) = &event {
+                assert_eq!(a.name(), "result.txt");
+                attachment = true;
+            }
+            if matches!(event, AgentEvent::MessageComplete(_)) {
+                break;
+            }
+        }
+        assert!(attachment);
+        server.await.unwrap();
+        backend.disconnect();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attachment_events_and_history_keep_the_filename_and_download_url() {
+        let payload = serde_json::json!({"name": "报告.pdf", "url": "/api/files/report"});
+        let event = event_from_frame(&SseFrame {
+            event: "attachment".into(),
+            data: payload.to_string(),
+        })
+        .unwrap();
+        assert!(
+            matches!(event, AgentEvent::Attachment(a) if a.name() == "报告.pdf" && a.path == "/api/files/report")
+        );
+        let message = message_from_row(
+            &serde_json::json!({"role": "assistant", "text": "", "attachments": [payload]}),
+        )
+        .unwrap();
+        assert_eq!(message.attachments.len(), 1);
+        assert!(!message.is_empty_shell());
+    }
+
+    #[test]
+    fn history_recovers_local_files_and_images_without_showing_upload_paths() {
+        let mut conversation = crate::chat::Conversation::new();
+        conversation.begin_turn_with_placeholder("inspect");
+        conversation.messages_mut()[0].attachments = vec![
+            ComposerAttachment::new("/tmp/report.pdf"),
+            ComposerAttachment::new("/tmp/picture.png"),
+        ];
+        conversation.complete_message(Some("done"));
+        let fetched = message_from_row(&serde_json::json!({"role": "user", "text": "inspect\n\n[附件：uploads/session/123-report.pdf]\n[图片]"})).unwrap();
+        conversation.merge_transcript(vec![
+            fetched,
+            ChatMessage::new(MessageRole::Assistant, "done"),
+        ]);
+        assert_eq!(conversation.messages()[0].content, "inspect");
+        assert_eq!(conversation.messages()[0].attachments.len(), 2);
+        // An unfamiliar history message keeps exactly what the backend sent.
+        let text = "other\n[图片]";
+        conversation.merge_transcript(vec![message_from_row(
+            &serde_json::json!({"role": "user", "text": text}),
+        )
+        .unwrap()]);
+        assert_eq!(conversation.messages()[0].content, text);
+    }
 
     /// A chunk boundary can fall inside a frame, and inside a character: the
     /// stream measured from the gateway sends CJK text eight bytes at a time.
