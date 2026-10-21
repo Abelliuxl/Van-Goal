@@ -333,43 +333,46 @@ class _ChatPageState extends State<ChatPage> {
                     ),
                   Expanded(
                     key: _conversationPaneKey,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(
-                          maxWidth: _conversationWidth,
-                        ),
-                        child: LayoutBuilder(
-                          builder: (context, pane) => Column(
-                            children: [
-                              if (_app.error != null)
-                                _ErrorBanner(
-                                  message: _app.error!,
-                                  onDismiss: _app.dismissError,
+                    child: LayoutBuilder(
+                      builder: (context, pane) => Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (_app.error != null)
+                            _ErrorBanner(
+                              message: _app.error!,
+                              onDismiss: _app.dismissError,
+                            ),
+                          Expanded(
+                            child: Center(
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxWidth: _conversationWidth,
                                 ),
-                              Expanded(
                                 child: _Transcript(
                                   app: _app,
                                   controller: _scroll,
                                 ),
                               ),
-                              if (_app.clarifyQuestion != null)
-                                _ClarifyCard(app: _app),
-                              ConstrainedBox(
-                                constraints: BoxConstraints(
-                                  maxHeight: pane.maxHeight * 0.6,
-                                ),
-                                child: SingleChildScrollView(
-                                  reverse: true,
-                                  child: _Composer(
-                                    controller: _composer,
-                                    app: _app,
-                                    onSend: _send,
-                                  ),
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
+                          if (_app.clarifyQuestion != null)
+                            _ClarifyCard(app: _app),
+                          // The editor uses the entire conversation pane. Only
+                          // the transcript is capped for comfortable reading.
+                          ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxHeight: pane.maxHeight * 0.6,
+                            ),
+                            child: SingleChildScrollView(
+                              reverse: true,
+                              child: _Composer(
+                                controller: _composer,
+                                app: _app,
+                                onSend: _send,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),

@@ -112,9 +112,10 @@ One Android package adapts to the app window's current logical width through
 | Below 840 logical pixels | A single conversation with the session list in a drawer |
 | 840 and above | A permanent 280-pixel session sidebar beside the conversation |
 
-The conversation and composer share a centered column capped at 820 logical
-pixels. Bubbles use that column's constraints rather than the full display
-width. Extremely narrow windows put secondary toolbar actions in a menu. The
+The transcript uses a centered column capped at 820 logical pixels, while the
+composer fills the conversation pane beside the sidebar, retaining its normal
+edge padding. Bubbles use the transcript column's constraints rather than the full
+display width. Extremely narrow windows put secondary toolbar actions in a menu. The
 composer can scroll within 60% of the pane's available height when attachments
 or a keyboard leave little room. Empty-state content is scrollable too.
 
