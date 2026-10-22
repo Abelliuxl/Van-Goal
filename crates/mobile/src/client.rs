@@ -472,6 +472,14 @@ impl Client {
                 Ok(None)
             }
             Some("new_session") => self.new_session().map(|()| None),
+            Some("select_model") => {
+                self.select_model(Some(required(&value, "model")?), None)?;
+                Ok(None)
+            }
+            Some("set_thinking") => {
+                self.select_model(None, Some(required(&value, "thinking")?))?;
+                Ok(None)
+            }
             Some("send") => {
                 let body = required(&value, "text")?;
                 let attachments = value
@@ -688,6 +696,7 @@ impl Client {
         let wanted = self.wanted.clone();
         let current = self.generation.clone();
         let saved = saved_session(&self.settings);
+        let settings = self.settings.clone();
 
         self.runtime.spawn(async move {
             let mut attempt = 0usize;
@@ -704,6 +713,13 @@ impl Client {
                 );
 
                 let (sender, mut receiver) = unbounded::<AgentEvent>();
+                let preference = settings
+                    .lock()
+                    .unwrap()
+                    .xuexiaomi_models
+                    .get(&config.base_url)
+                    .cloned();
+                backend.lock().await.restore_model_preference(preference);
                 let opened = match tokio::time::timeout(
                     ATTEMPT_TIMEOUT,
                     establish(&backend, &config, sender),
@@ -769,6 +785,21 @@ impl Client {
                     while let Some(event) = receiver.next().await {
                         if current.load(Ordering::SeqCst) != generation {
                             return;
+                        }
+                        if let AgentEvent::ModelSelection {
+                            session_id: None,
+                            selection,
+                        } = &event
+                        {
+                            let mut settings = settings.lock().unwrap();
+                            let preference = selection.preference();
+                            if settings.xuexiaomi_models.get(&config.base_url) != Some(&preference)
+                            {
+                                settings
+                                    .xuexiaomi_models
+                                    .insert(config.base_url.clone(), preference);
+                                settings.save();
+                            }
                         }
                         apply(&events, &open, event);
                     }
@@ -1053,6 +1084,26 @@ impl Client {
         Ok(())
     }
 
+    fn select_model(&self, model: Option<String>, thinking: Option<String>) -> Result<()> {
+        if self.kind() != BackendKind::XueXiaoMi || !self.live.load(Ordering::SeqCst) {
+            return Err(anyhow!("Connect to 雪小米 before selecting a model."));
+        }
+        let backend = self.backend();
+        let events = self.events.clone();
+        let current = self.generation.clone();
+        let generation = current.load(Ordering::SeqCst);
+        self.runtime.spawn(async move {
+            let mut backend = backend.lock().await;
+            if current.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if let Err(error) = backend.select_model(model.as_deref(), thinking.as_deref()) {
+                push_error(&events, error.to_string());
+            }
+        });
+        Ok(())
+    }
+
     fn answer(&self, request_id: String, answer: String) {
         let backend = self.backend();
         let events = self.events.clone();
@@ -1203,6 +1254,24 @@ fn push_transcript(events: &Arc<Mutex<Vec<Value>>>, open: &Arc<Mutex<OpenSession
 /// Fold one backend event into the queue and the open-session state.
 fn apply(events: &Arc<Mutex<Vec<Value>>>, open: &Arc<Mutex<OpenSession>>, event: AgentEvent) {
     match event {
+        AgentEvent::ModelSelection {
+            session_id,
+            selection,
+        } => {
+            if session_id
+                .as_deref()
+                .is_some_and(|id| open.lock().unwrap().stored_id.as_deref() != Some(id))
+            {
+                return;
+            }
+            push(
+                events,
+                json!({
+                    "event": "model_selection", "selection": selection,
+                    "thinking_options": selection.thinking_options(),
+                }),
+            );
+        }
         AgentEvent::Connected => push(
             events,
             json!({ "event": "connection", "state": "connected" }),

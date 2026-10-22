@@ -133,6 +133,86 @@ pub struct ModelOption {
     pub model: String,
 }
 
+/// Gateway-advertised models and reasoning capabilities, shared by both views.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayModel {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default = "default_thinking_levels", rename = "thinkingLevels")]
+    pub thinking_levels: Vec<String>,
+    #[serde(default, rename = "thinkingLevelMap")]
+    pub thinking_level_map: std::collections::HashMap<String, Option<String>>,
+}
+
+fn default_thinking_levels() -> Vec<String> {
+    vec!["off".into()]
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelPreference {
+    pub model: String,
+    pub thinking: String,
+    /// A changed gateway default takes precedence over an old saved choice,
+    /// matching the gateway's own web client.
+    pub defaults: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelSelection {
+    pub models: Vec<GatewayModel>,
+    pub model: String,
+    pub thinking: String,
+    pub defaults: serde_json::Value,
+}
+
+impl ModelSelection {
+    pub fn preference(&self) -> ModelPreference {
+        ModelPreference {
+            model: self.model.clone(),
+            thinking: self.thinking.clone(),
+            defaults: self.defaults.clone(),
+        }
+    }
+
+    pub fn thinking_options(&self) -> Vec<ThinkingOption> {
+        let Some(model) = self.models.iter().find(|m| m.id == self.model) else {
+            return Vec::new();
+        };
+        model
+            .thinking_levels
+            .iter()
+            .map(|id| {
+                let name = match id.as_str() {
+                    "off" => "关闭",
+                    "minimal" => "最低",
+                    "low" => "低",
+                    "medium" => "中",
+                    "high" => "高",
+                    "xhigh" => "超高",
+                    "max" => "最高",
+                    other => other,
+                };
+                let label = match model.thinking_level_map.get(id).and_then(|v| v.as_deref()) {
+                    Some(actual) if actual != id => format!("{name}（上游按 {actual} 处理）"),
+                    _ => name.to_string(),
+                };
+                ThinkingOption {
+                    id: id.clone(),
+                    label,
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ThinkingOption {
+    pub id: String,
+    pub label: String,
+}
+
 /// Files attached to the composer or a message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComposerAttachment {
@@ -431,6 +511,11 @@ pub enum DeltaSource {
 #[derive(Clone, Debug)]
 pub enum AgentEvent {
     Connected,
+    ModelSelection {
+        /// Session options only update the view still showing that session.
+        session_id: Option<String>,
+        selection: ModelSelection,
+    },
     SessionInfo(String),
     MessageStart,
     MessageDelta {

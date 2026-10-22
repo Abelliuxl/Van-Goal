@@ -142,12 +142,27 @@ fn caps(caps: BackendCaps) -> Value {
 fn view_state(state: &State) -> Value {
     let kind = state.kind();
     let usage = state.context_usage();
-    let groups = model_groups(&state.models, &state.current_provider, &state.current_model);
+    let groups = if kind == van_goal_core::settings::BackendKind::Hermes {
+        model_groups(&state.models, &state.current_provider, &state.current_model)
+    } else {
+        Vec::new()
+    };
     let selected_model = state
         .selected
         .as_ref()
         .and_then(|session| session.model.clone())
         .filter(|model| !model.trim().is_empty());
+    let model_name = if kind == van_goal_core::settings::BackendKind::XueXiaoMi {
+        state
+            .gateway_model
+            .as_ref()
+            .map(|s| s.model.clone())
+            .or(selected_model.clone())
+    } else if state.current_model.is_empty() {
+        selected_model.clone()
+    } else {
+        Some(state.current_model.clone())
+    };
     json!({
         "backend": {
             "id": kind.id(),
@@ -179,10 +194,12 @@ fn view_state(state: &State) -> Value {
             "ratio": usage.ratio(),
         },
         "model": {
-            "name": if state.current_model.is_empty() { selected_model.clone() } else { Some(state.current_model.clone()) },
+            "name": model_name,
             "session_model": selected_model,
             "provider": state.current_provider,
             "switching": state.switching_model,
+            "gateway": if kind == van_goal_core::settings::BackendKind::XueXiaoMi { state.gateway_model.as_ref() } else { None },
+            "thinking_options": state.gateway_model.as_ref().map(|s| s.thinking_options()).unwrap_or_default(),
             "groups": groups.iter().map(|(provider, models)| json!({
                 "provider": provider,
                 "models": models.iter().map(|m| m.model.clone()).collect::<Vec<_>>(),

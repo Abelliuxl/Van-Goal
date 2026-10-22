@@ -122,6 +122,7 @@ impl Backend {
                     | BackendCaps::SESSION_RESUME
                     | BackendCaps::INTERRUPT
                     | BackendCaps::ATTACHMENTS
+                    | BackendCaps::MODEL_SELECTION
             }
             Backend::OpenClaw(_) => {
                 BackendCaps::SESSION_HISTORY
@@ -131,6 +132,19 @@ impl Backend {
                     | BackendCaps::TOOL_EVENTS
                     | BackendCaps::ATTACHMENTS
             }
+        }
+    }
+
+    pub fn restore_model_preference(&mut self, preference: Option<ModelPreference>) {
+        if let Backend::XueXiaoMi(backend) = self {
+            backend.restore_model_preference(preference);
+        }
+    }
+
+    pub fn select_model(&mut self, model: Option<&str>, thinking: Option<&str>) -> Result<()> {
+        match self {
+            Backend::XueXiaoMi(backend) => backend.select_model(model, thinking),
+            _ => anyhow::bail!("This backend does not offer gateway model selection."),
         }
     }
 

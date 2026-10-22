@@ -189,6 +189,10 @@ pub fn dispatch(shared: &Arc<Shared>, name: &str, value: &Value) -> Result<Optio
             Ok(None)
         }
         "select_model" => {
+            if shared.lock().kind() == BackendKind::XueXiaoMi {
+                gateway_model(shared, Some(string(value, "model")?), None);
+                return Ok(None);
+            }
             crate::hermes::select_model(
                 shared,
                 ModelOption {
@@ -196,6 +200,10 @@ pub fn dispatch(shared: &Arc<Shared>, name: &str, value: &Value) -> Result<Optio
                     model: string(value, "model")?,
                 },
             );
+            Ok(None)
+        }
+        "set_thinking" => {
+            gateway_model(shared, None, Some(string(value, "thinking")?));
             Ok(None)
         }
         "set_permission" => {
@@ -341,6 +349,35 @@ fn set(shared: &Arc<Shared>, value: &Value) -> Result<()> {
     settings.save();
     state.settings_changed();
     Ok(())
+}
+
+fn gateway_model(shared: &Arc<Shared>, model: Option<String>, thinking: Option<String>) {
+    let (backend, epoch) = {
+        let mut state = shared.lock();
+        if state.kind() != BackendKind::XueXiaoMi || !state.transport_ready {
+            return;
+        }
+        state.switching_model = true;
+        state.changed();
+        (state.backend.clone(), state.connection_epoch)
+    };
+    let task = shared.clone();
+    shared.spawn(async move {
+        let mut backend = backend.lock().await;
+        if task.lock().connection_epoch != epoch {
+            return;
+        }
+        let result = backend.select_model(model.as_deref(), thinking.as_deref());
+        let mut state = task.lock();
+        if state.connection_epoch != epoch {
+            return;
+        }
+        state.switching_model = false;
+        match result {
+            Ok(()) => state.changed(),
+            Err(error) => state.error(error.to_string()),
+        }
+    });
 }
 
 fn kind(value: &Value) -> Result<BackendKind> {

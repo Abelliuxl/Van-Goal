@@ -798,6 +798,83 @@ class _Composer extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (app.backend == Backend.xuexiaomi &&
+                app.gatewayModels.isNotEmpty)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Wrap(
+                  spacing: 8,
+                  children: [
+                    PopupMenuButton<String>(
+                      tooltip: '切换模型',
+                      enabled: app.canSelectModel,
+                      initialValue: app.selectedModel,
+                      onSelected: app.selectModel,
+                      itemBuilder: (_) => [
+                        for (final model in app.gatewayModels)
+                          CheckedPopupMenuItem(
+                            value: model.id,
+                            checked: model.id == app.selectedModel,
+                            child: Text(model.name),
+                          ),
+                      ],
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                app.gatewayModels
+                                    .firstWhere(
+                                      (m) => m.id == app.selectedModel,
+                                      orElse: () => app.gatewayModels.first,
+                                    )
+                                    .name,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: _inkSoft,
+                                ),
+                              ),
+                            ),
+                            const Icon(
+                              Icons.expand_more,
+                              size: 16,
+                              color: _inkFaint,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (app.thinkingOptions.isNotEmpty)
+                      PopupMenuButton<String>(
+                        tooltip: '思考强度',
+                        enabled: app.canSelectModel,
+                        initialValue: app.selectedThinking,
+                        onSelected: app.selectThinking,
+                        itemBuilder: (_) => [
+                          for (final option in app.thinkingOptions)
+                            CheckedPopupMenuItem(
+                              value: option.id,
+                              checked: option.id == app.selectedThinking,
+                              child: Text(option.label),
+                            ),
+                        ],
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(
+                            '思考 · ${app.thinkingOptions.firstWhere((o) => o.id == app.selectedThinking, orElse: () => app.thinkingOptions.first).label} ▾',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: _inkSoft,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             if (app.draftAttachments.isNotEmpty)
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,

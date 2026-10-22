@@ -73,6 +73,7 @@ pub struct State {
     pub current_provider: String,
     pub current_model: String,
     pub switching_model: bool,
+    pub gateway_model: Option<van_goal_core::models::ModelSelection>,
     pub context_window: i64,
     pub permission_mode: PermissionMode,
     pub changing_permission: bool,

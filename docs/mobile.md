@@ -173,6 +173,12 @@ measured deployment limit in [architecture.md](architecture.md#attachments).
 
 ## Building
 
+雪小米's composer shows model and thinking menus above the editor. Their
+catalog, current values and thinking labels come from the shared Rust adapter;
+Dart only draws them and sends `select_model` / `set_thinking` commands. Menus
+are enabled while connected. Choices apply to the next message and are saved
+per gateway; opening an existing session restores its reported options.
+
 ```bash
 Scripts/setup_android_toolchain.sh   # JDK, Flutter, Android SDK + NDK, Rust targets
 Scripts/build_android.sh             # cross-compile the core, then package the APK

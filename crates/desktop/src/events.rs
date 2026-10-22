@@ -38,6 +38,29 @@ pub fn handle(shared: &Arc<Shared>, epoch: u64, event: AgentEvent) {
     }
 
     match event {
+        AgentEvent::ModelSelection {
+            session_id,
+            selection,
+        } => {
+            if state.backend_id() != "xuexiaomi"
+                || session_id
+                    .as_deref()
+                    .is_some_and(|id| state.stored_id.as_deref() != Some(id))
+            {
+                return;
+            }
+            if session_id.is_none() {
+                let url = state.settings.active_backend_url();
+                let preference = selection.preference();
+                if state.settings.xuexiaomi_models.get(&url) != Some(&preference) {
+                    state.settings.xuexiaomi_models.insert(url, preference);
+                    state.settings.save();
+                }
+            }
+            state.gateway_model = Some(selection);
+            state.switching_model = false;
+            state.changed();
+        }
         AgentEvent::Connected => {
             state.transport_ready = true;
             state.gateway_connecting = false;

@@ -112,6 +112,18 @@ class SessionSummary {
   final String? model;
 }
 
+class GatewayModel {
+  const GatewayModel(this.id, this.name);
+  final String id;
+  final String name;
+}
+
+class ThinkingOption {
+  const ThinkingOption(this.id, this.label);
+  final String id;
+  final String label;
+}
+
 /// Everything the UI draws, fed by the event queue in `crates/mobile`.
 ///
 /// The message list is not assembled here. It arrives as a snapshot from the
@@ -149,6 +161,26 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   String workspace = '';
 
   FontSize fontSize = FontSize.normal;
+  List<GatewayModel> gatewayModels = const [];
+  List<ThinkingOption> thinkingOptions = const [];
+  String selectedModel = '';
+  String selectedThinking = '';
+
+  bool get canSelectModel =>
+      backend == Backend.xuexiaomi && link == LinkState.online;
+
+  void selectModel(String model) =>
+      _selectOption({'cmd': 'select_model', 'model': model});
+  void selectThinking(String thinking) =>
+      _selectOption({'cmd': 'set_thinking', 'thinking': thinking});
+
+  void _selectOption(Map<String, dynamic> command) {
+    final reply = _core.send(command);
+    if (reply['ok'] != true) {
+      error = reply['error'] as String?;
+      notifyListeners();
+    }
+  }
 
   List<SessionSummary> sessions = const [];
   List<Message> messages = const [];
@@ -459,6 +491,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   void _apply(Map<String, dynamic> event) {
     switch (event['event']) {
+      case 'model_selection':
+        final selection = event['selection'] as Map<String, dynamic>;
+        gatewayModels = [
+          for (final item in selection['models'] as List)
+            GatewayModel(
+              item['id'] as String,
+              (item['name'] as String).replaceFirst(
+                RegExp(r'\s*\([^)]*\)\s*$'),
+                '',
+              ),
+            ),
+        ];
+        selectedModel = selection['model'] as String;
+        selectedThinking = selection['thinking'] as String;
+        thinkingOptions = [
+          for (final item in event['thinking_options'] as List)
+            ThinkingOption(item['id'] as String, item['label'] as String),
+        ];
       case 'connection':
         _applyConnection(event);
       case 'settings':
@@ -548,7 +598,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void _applySettings(Map<String, dynamic> event) {
-    backend = Backend.fromId(event['backend'] as String?);
+    final nextBackend = Backend.fromId(event['backend'] as String?);
+    if (backend != nextBackend) {
+      gatewayModels = const [];
+      thinkingOptions = const [];
+      selectedModel = '';
+      selectedThinking = '';
+    }
+    backend = nextBackend;
     host = (event['host'] as String?) ?? host;
     port = (event['port'] as num?)?.toInt() ?? port;
     useTls = (event['use_tls'] as bool?) ?? useTls;

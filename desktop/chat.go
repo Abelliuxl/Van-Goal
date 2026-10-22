@@ -401,8 +401,11 @@ func (a *app) composer(c *ui.Context) {
 				a.permissionPicker(c)
 			}
 			ui.Spacer(c)
-			if s.Backend.Caps.Models && len(s.Model.Groups) > 0 {
+			if s.Backend.Caps.Models && (len(s.Model.Groups) > 0 || s.Model.Gateway != nil) {
 				a.modelPicker(c)
+			}
+			if s.Backend.ID == "xuexiaomi" && s.Model.Gateway != nil {
+				a.thinkingPicker(c)
 			}
 			a.sendButton(c)
 		})
@@ -611,10 +614,19 @@ func (a *app) modelPicker(c *ui.Context) {
 	if m.Name != nil && *m.Name != "" {
 		label = *m.Name
 	}
+	if m.Gateway != nil {
+		label = m.Gateway.Model
+		for _, option := range m.Gateway.Models {
+			if option.ID == m.Gateway.Model {
+				label = shortGatewayModelName(option.Name)
+			}
+		}
+	}
 	if m.Switching {
 		label = "Switching…"
 	}
 	b := ui.ButtonBase(c.Key("model")).Padding(a.px(5), a.px(10)).Radius(a.px(8)).Gap(a.px(5)).AlignItems(ui.Center).Label("Model").MinWidth(0).Shrink(1)
+	b.Disabled(m.Switching || m.Gateway != nil && a.state.Connection.State != "connected")
 	if b.Hovered() {
 		b.Background(p.raised)
 	}
@@ -623,6 +635,14 @@ func (a *app) modelPicker(c *ui.Context) {
 		ui.Icon(c, iconChevDown).FontSize(a.size(12)).TextColor(p.faint)
 	})
 	b.Menu(func(menu *ui.Menu) {
+		if m.Gateway != nil {
+			for _, option := range m.Gateway.Models {
+				if menu.Item(shortGatewayModelName(option.Name)).Checked(option.ID == m.Gateway.Model).Chosen() {
+					a.do("select_model", map[string]any{"model": option.ID})
+				}
+			}
+			return
+		}
 		for _, g := range m.Groups {
 			g := g
 			menu.Submenu(g.Provider, func(sub *ui.Menu) {
@@ -633,6 +653,39 @@ func (a *app) modelPicker(c *ui.Context) {
 					}
 				}
 			})
+		}
+	})
+}
+
+func shortGatewayModelName(name string) string {
+	if i := strings.LastIndex(name, " ("); i >= 0 && strings.HasSuffix(name, ")") {
+		return name[:i]
+	}
+	return name
+}
+
+func (a *app) thinkingPicker(c *ui.Context) {
+	m := a.state.Model
+	label := m.Gateway.Thinking
+	for _, option := range m.ThinkingOptions {
+		if option.ID == m.Gateway.Thinking {
+			label = option.Label
+		}
+	}
+	b := ui.ButtonBase(c.Key("thinking-level")).Padding(a.px(5), a.px(10)).Radius(a.px(8)).Gap(a.px(5)).AlignItems(ui.Center).Label("思考强度").MinWidth(0).Shrink(1)
+	b.Disabled(m.Switching || a.state.Connection.State != "connected")
+	if b.Hovered() {
+		b.Background(a.p.raised)
+	}
+	b.Children(func() {
+		ui.Text(c, "思考 · "+label).SingleLine().MaxWidth(a.px(150)).MinWidth(0).FontSize(a.size(12.5)).TextColor(a.p.muted)
+		ui.Icon(c, iconChevDown).FontSize(a.size(12)).TextColor(a.p.faint)
+	})
+	b.Menu(func(menu *ui.Menu) {
+		for _, option := range m.ThinkingOptions {
+			if menu.Item(option.Label).Checked(option.ID == m.Gateway.Thinking).Chosen() {
+				a.do("set_thinking", map[string]any{"thinking": option.ID})
+			}
 		}
 	})
 }

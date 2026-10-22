@@ -123,11 +123,29 @@ type Context struct {
 }
 
 type Model struct {
-	Name         *string      `json:"name"`
-	SessionModel *string      `json:"session_model"`
-	Provider     string       `json:"provider"`
-	Switching    bool         `json:"switching"`
-	Groups       []ModelGroup `json:"groups"`
+	Name            *string                `json:"name"`
+	SessionModel    *string                `json:"session_model"`
+	Provider        string                 `json:"provider"`
+	Switching       bool                   `json:"switching"`
+	Groups          []ModelGroup           `json:"groups"`
+	Gateway         *GatewayModelSelection `json:"gateway"`
+	ThinkingOptions []ThinkingOption       `json:"thinking_options"`
+}
+
+type GatewayModelSelection struct {
+	Models   []GatewayModel `json:"models"`
+	Model    string         `json:"model"`
+	Thinking string         `json:"thinking"`
+}
+
+type GatewayModel struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type ThinkingOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
 type ModelGroup struct {

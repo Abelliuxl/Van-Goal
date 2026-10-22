@@ -263,6 +263,9 @@ pub struct Settings {
     /// and looks like messages landing in the wrong chat.
     #[serde(default)]
     pub last_session: Option<SavedSession>,
+    /// Model choices are local to each 雪小米 gateway, never global defaults.
+    #[serde(default)]
+    pub xuexiaomi_models: std::collections::HashMap<String, crate::models::ModelPreference>,
 }
 
 /// The session a client had open, and the backend that issued its key. A
@@ -411,6 +414,7 @@ impl Default for Settings {
             show_tool_calls: true,
             window: None,
             last_session: None,
+            xuexiaomi_models: std::collections::HashMap::new(),
         }
     }
 }

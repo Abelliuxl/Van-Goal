@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod files;
+mod options;
 pub use files::{attachment_bytes, attachment_file};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,6 +72,9 @@ pub struct XueXiaoMiBackend {
     stream_http: reqwest::Client,
     config: Option<BackendConfig>,
     shared: Arc<Mutex<Shared>>,
+    model_preference: Option<ModelPreference>,
+    model_selection: Option<ModelSelection>,
+    session_models: HashMap<String, (String, Option<String>)>,
 }
 
 impl Default for XueXiaoMiBackend {
@@ -93,6 +97,9 @@ impl XueXiaoMiBackend {
                 .unwrap_or_default(),
             config: None,
             shared: Arc::new(Mutex::new(Shared::default())),
+            model_preference: None,
+            model_selection: None,
+            session_models: HashMap::new(),
         }
     }
 
@@ -141,9 +148,11 @@ impl XueXiaoMiBackend {
     ) -> Result<()> {
         self.disconnect();
         self.probe(&config).await?;
+        self.load_models(&config).await?;
         self.config = Some(config);
         let _ = events.unbounded_send(AgentEvent::Connected);
         self.shared().events = Some(events);
+        self.emit_model_selection(None);
         Ok(())
     }
 
@@ -196,6 +205,18 @@ impl XueXiaoMiBackend {
             .and_then(|rows| rows.as_array())
             .cloned()
             .unwrap_or_default();
+        if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
+            self.session_models.insert(
+                session_id.to_string(),
+                (
+                    model.to_string(),
+                    value
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                ),
+            );
+        }
         Ok(rows.iter().filter_map(message_from_row).collect())
     }
 
@@ -212,10 +233,18 @@ impl XueXiaoMiBackend {
 
     pub async fn resume_session(
         &mut self,
-        _config: &BackendConfig,
+        config: &BackendConfig,
         session_id: &str,
     ) -> Result<SessionIDs> {
+        // Mobile reconnects can resume before fetching history. Rehydrate the
+        // session's options too, rather than silently reverting to defaults.
+        if !self.session_models.contains_key(session_id) {
+            self.messages(config, session_id).await?;
+        }
         self.shared().active = Some(session_id.to_string());
+        // History is fetched before resume by both bridges. Only resuming
+        // applies its options; background history refreshes never change them.
+        self.restore_session_model(session_id);
         Ok(SessionIDs {
             live_id: session_id.to_string(),
             stored_id: Some(session_id.to_string()),
@@ -281,21 +310,26 @@ impl XueXiaoMiBackend {
             message.push_str(&format!("\n\n[附件：{}]", paths.join("、")));
         }
 
-        let request = self
-            .stream_http
-            .post(url(&config, "api/chat"))
-            .json(&serde_json::json!({
-                "session": target,
-                "message": message,
-                "images": images,
-                "stream": true,
-            }));
+        let mut body = serde_json::json!({
+            "session": target, "message": message, "images": images, "stream": true,
+        });
+        if let Some(selection) = &self.model_selection {
+            body["model"] = selection.model.clone().into();
+            body["thinking"] = selection.thinking.clone().into();
+        }
+        let request = self.stream_http.post(url(&config, "api/chat")).json(&body);
         let response = authorized(request, &config)
             .header("Accept", "text/event-stream")
             .send()
             .await?;
         if !response.status().is_success() {
             return Err(error_from(response).await);
+        }
+        if let Some(selection) = &self.model_selection {
+            self.session_models.insert(
+                session_id.to_string(),
+                (selection.model.clone(), Some(selection.thinking.clone())),
+            );
         }
 
         let _ = events.unbounded_send(AgentEvent::MessageStart);
@@ -373,6 +407,10 @@ impl XueXiaoMiBackend {
 
     pub fn clear_session_scope(&mut self) {
         self.shared().active = None;
+        // A stale resume can finish just as the view moves to a blank chat.
+        // Echo the actual options so the blank composer's next request and
+        // the values it displays still agree.
+        self.emit_model_selection(None);
     }
 
     pub fn disconnect(&mut self) {
@@ -384,6 +422,8 @@ impl XueXiaoMiBackend {
         shared.active = None;
         drop(shared);
         self.config = None;
+        self.model_selection = None;
+        self.session_models.clear();
     }
 }
 

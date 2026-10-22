@@ -181,6 +181,13 @@ pub async fn ensure_stream(
         (backend_config(&state.settings), sender)
     };
     let epoch = shared.lock().connection_epoch;
+    let preference = shared
+        .lock()
+        .settings
+        .xuexiaomi_models
+        .get(&config.base_url)
+        .cloned();
+    backend.restore_model_preference(preference);
     let result = backend.connect(config, sender).await;
 
     let mut state = shared.lock();
@@ -323,6 +330,7 @@ pub fn switch_backend(shared: &Arc<Shared>, kind: BackendKind) {
         let backend = Backend::make(kind);
         state.caps = backend.capabilities();
         state.backend = Arc::new(tokio::sync::Mutex::new(backend));
+        state.gateway_model = None;
 
         state.transport_ready = false;
         state.gateway_connecting = false;

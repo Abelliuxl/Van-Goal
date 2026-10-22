@@ -40,6 +40,17 @@ is ever violated.
 
 ## The event model
 
+雪小米 advertises its model IDs, names, thinking levels, upstream level mappings
+and defaults through `GET api/models`. The adapter loads that catalog on connect
+and sends the chosen `model` and `thinking` on each `POST api/chat`; changing a
+choice never mutates the gateway's global settings. `ModelSelection` events feed
+both frontends, with per-gateway preferences in `Settings::xuexiaomi_models`.
+Changed gateway defaults supersede saved choices, matching the web client.
+History metadata restores a resumed session's choices; session-tagged selection
+events are ignored once the user has switched away. Background history refreshes
+do not override a choice waiting for the next prompt. Thinking menus only offer
+the selected model's advertised levels and disclose any upstream remapping.
+
 Every adapter translates its protocol into `AgentEvent`. The variants that carry
 a turn:
 

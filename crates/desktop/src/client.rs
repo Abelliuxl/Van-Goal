@@ -185,6 +185,7 @@ impl Client {
             current_provider: String::new(),
             current_model: String::new(),
             switching_model: false,
+            gateway_model: None,
             context_window: hermes_config::DEFAULT_CONTEXT_WINDOW,
             permission_mode: PermissionMode::FullAccess,
             changing_permission: false,
